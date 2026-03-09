@@ -114,11 +114,13 @@ class FactorizedOperator(OperatorBase):
         self,
         mp: nn.Module,
         mb: nn.Module,
+        mp_context_lifter: Optional[nn.Module] = None,
         product_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = boxtimes_timewise,
     ):
         super().__init__()
         self.mp = mp
         self.mb = mb
+        self.mp_context_lifter = mp_context_lifter
         self.product_fn = product_fn
 
     def reset(self) -> None:
@@ -126,9 +128,25 @@ class FactorizedOperator(OperatorBase):
             self.mp.reset()
         if hasattr(self.mb, "reset"):
             self.mb.reset()
+        if self.mp_context_lifter is not None and hasattr(self.mp_context_lifter, "reset"):
+            self.mp_context_lifter.reset()
 
     def forward(self, w: torch.Tensor, z: Optional[torch.Tensor] = None) -> torch.Tensor:
-        v = self.mp(w)
+        if self.mp_context_lifter is None:
+            w_mp = w
+        else:
+            if z is None:
+                raise ValueError("z must be provided when mp_context_lifter is enabled.")
+            w_bt = as_bt(w)
+            z_lift = self.mp_context_lifter(z)
+            z_lift_bt = as_bt(z_lift)
+            if w_bt.shape[:2] != z_lift_bt.shape[:2]:
+                raise ValueError(
+                    "w and lifted z must share leading dims. "
+                    f"Got w{tuple(w_bt.shape)} vs z_lift{tuple(z_lift_bt.shape)}"
+                )
+            w_mp = torch.cat([w_bt, z_lift_bt], dim=-1)
+        v = self.mp(w_mp)
         A = self.mb(w, z) if z is not None else self.mb(w)
         return self.product_fn(A, v)
 
@@ -192,14 +210,16 @@ class PBController(nn.Module):
         self.state = PBState(x_tm1=x_init, u_tm1=u_init, w0=w0, has_prev=False)
         self.operator.reset()
 
-    def _compute_w_t(self, x_t: torch.Tensor, t
-    : Optional[int] = None) -> torch.Tensor:
+    def _compute_w_t(self, x_t: torch.Tensor, t: Optional[int] = None) -> torch.Tensor:
         assert self.state is not None
         if not self.state.has_prev:
             return self.state.w0
         x_tm1 = self.state.x_tm1
         u_tm1 = self.state.u_tm1
-        x_nom = self.plant.nominal_dynamics(x_tm1, u_tm1, t)
+        # Reconstruct disturbance for transition (t-1 -> t):
+        #   x_t = f_{t-1}(x_{t-1}, u_{t-1}) + w_t
+        t_prev = None if t is None else (t - 1)
+        x_nom = self.plant.nominal_dynamics(x_tm1, u_tm1, t_prev)
         return x_t - x_nom
 
     def forward_step(

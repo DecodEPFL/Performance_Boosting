@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=1024)
     parser.add_argument("--test_batch", type=int, default=2048)
     parser.add_argument("--horizon", type=int, default=80)
-    parser.add_argument("--epochs", type=int, default=12000)
+    parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--eval_every", type=int, default=5)
