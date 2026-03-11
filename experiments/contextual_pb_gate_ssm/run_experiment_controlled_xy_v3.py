@@ -938,8 +938,9 @@ def train_controller(
 
     # Warm-start from a previously trained state (e.g. disturbance_only → context)
     if warm_start_state is not None:
-        controller.load_state_dict(warm_start_state)
-        print(f"[{mode}] warm-started from provided checkpoint.")
+        missing, unexpected = controller.load_state_dict(warm_start_state, strict=False)
+        print(f"[{mode}] warm-started from provided checkpoint "
+              f"(missing={len(missing)}, unexpected={len(unexpected)}).")
 
     # AdamW with separate LRs for SSM (operator.mp) and MLP operator (operator.mb + rest)
     mp_param_ids = {id(p) for p in controller.operator.mp.parameters()}
