@@ -23,18 +23,20 @@ def build_factorized_controller(
     *,
     nominal_plant,
     mp,
-    mb,
+    mb=None,
     u_dim: int,
     detach_state: bool = False,
     u_nominal: Callable | None = None,
     mp_context_lifter=None,
+    mp_only: bool = False,
 ) -> PBController:
     """
     Assemble PBController from nominal plant + factorized operators.
 
     This is a thin convenience wrapper with explicit defaults.
+    Set mp_only=True to bypass M_b entirely (mb may be None in that case).
     """
-    op = FactorizedOperator(mp=mp, mb=mb, mp_context_lifter=mp_context_lifter)
+    op = FactorizedOperator(mp=mp, mb=mb, mp_context_lifter=mp_context_lifter, mp_only=mp_only)
     return PBController(
         plant=nominal_plant,
         operator=op,

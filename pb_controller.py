@@ -108,25 +108,34 @@ class TimewiseMatVec(nn.Module):
 
 
 class FactorizedOperator(OperatorBase):
-    """M(w,z) = M_p(w) X M_b(w,z) with configurable product X."""
+    """M(w,z) = M_p(w) X M_b(w,z) with configurable product X.
+
+    When mp_only=True the M_b branch is skipped entirely and the operator
+    reduces to u = M_p(w) (or M_p([w, lift(z)]) when mp_context_lifter is
+    set).  In this mode mb may be None and M_p must already output (B,T,nu).
+    """
 
     def __init__(
         self,
         mp: nn.Module,
-        mb: nn.Module,
+        mb: Optional[nn.Module] = None,
         mp_context_lifter: Optional[nn.Module] = None,
         product_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = boxtimes_timewise,
+        mp_only: bool = False,
     ):
         super().__init__()
+        if not mp_only and mb is None:
+            raise ValueError("mb must be provided when mp_only=False.")
         self.mp = mp
         self.mb = mb
         self.mp_context_lifter = mp_context_lifter
         self.product_fn = product_fn
+        self.mp_only = mp_only
 
     def reset(self) -> None:
         if hasattr(self.mp, "reset"):
             self.mp.reset()
-        if hasattr(self.mb, "reset"):
+        if self.mb is not None and hasattr(self.mb, "reset"):
             self.mb.reset()
         if self.mp_context_lifter is not None and hasattr(self.mp_context_lifter, "reset"):
             self.mp_context_lifter.reset()
@@ -147,6 +156,8 @@ class FactorizedOperator(OperatorBase):
                 )
             w_mp = torch.cat([w_bt, z_lift_bt], dim=-1)
         v = self.mp(w_mp)
+        if self.mp_only:
+            return v
         A = self.mb(w, z) if z is not None else self.mb(w)
         return self.product_fn(A, v)
 
