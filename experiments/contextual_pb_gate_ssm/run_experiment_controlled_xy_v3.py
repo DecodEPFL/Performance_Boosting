@@ -47,6 +47,7 @@ class ScenarioBatch:
     switch_age: torch.Tensor
     process_noise: torch.Tensor
     pair_id: torch.Tensor
+    is_adversarial: torch.Tensor  # bool (B,): True if episode has a late adversarial switch
 
     def to(self, device: torch.device) -> "ScenarioBatch":
         return ScenarioBatch(
@@ -59,6 +60,7 @@ class ScenarioBatch:
             switch_age=self.switch_age.to(device),
             process_noise=self.process_noise.to(device),
             pair_id=self.pair_id.to(device),
+            is_adversarial=self.is_adversarial.to(device),
         )
 
 
@@ -93,16 +95,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--val_batch", type=int, default=512)
     parser.add_argument("--test_batch", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=250)
-    parser.add_argument("--disturbance_only_epochs", type=int, default=5)
+    parser.add_argument("--disturbance_only_epochs", type=int, default=250)
     parser.add_argument("--eval_every", type=int, default=10)
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--lr_min", type=float, default=2e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--run_id", type=str, default="")
+    parser.add_argument("--plot_only", type=str, default="",
+                        help="Path to an existing run directory. Loads saved controller weights "
+                             "and config, skips training, and re-runs evaluation + all plots.")
     parser.add_argument("--no_show_plots", action="store_true")
+    parser.add_argument("--warm_start", dest="warm_start", action="store_true",
+                        help="Warm-start the context variant from the disturbance_only checkpoint.")
+    parser.add_argument("--no_warm_start", dest="warm_start", action="store_false")
+    parser.set_defaults(warm_start=False)
 
     # Geometry and dynamics.
     parser.add_argument("--horizon", type=int, default=160)
+    parser.add_argument("--plot_horizon", type=int, default=200,
+                        help="Extended horizon for plots only. After --horizon steps the PB "
+                             "correction is set to zero and the nominal plant is simulated forward. "
+                             "Defaults to --horizon (no extension).")
+    parser.add_argument("--use_plot_horizon", dest="use_plot_horizon", action="store_true")
+    parser.add_argument("--no_plot_horizon", dest="use_plot_horizon", action="store_false")
+    parser.set_defaults(use_plot_horizon=True)
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--pre_kp", type=float, default=0.32)
     parser.add_argument("--pre_kd", type=float, default=0.80)
@@ -164,7 +180,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "vs. full factorized M_b⊠M_p with context (+ lifting if enabled). "
                              "Skips nominal-only and matched-param M_p-only+context variants.")
     parser.add_argument("--no_simple_comparison", dest="simple_comparison", action="store_false")
-    parser.set_defaults(simple_comparison=False)
+    parser.set_defaults(simple_comparison=True)
     parser.add_argument("--context_mode", type=str, default="minimal",
                         choices=["full", "minimal"],
                         help="Context feature set fed to the PB operator. "
@@ -178,20 +194,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mp_context_hidden_dim", type=int, default=24)
     parser.add_argument("--mp_context_decay_law", type=str, default="finite", choices=["exp", "poly", "finite"])
     parser.add_argument("--mp_context_decay_rate", type=float, default=0.04)
-    parser.add_argument("--mp_context_decay_power", type=float, default=0.53)
+    parser.add_argument("--mp_context_decay_power", type=float, default=0.73)
     parser.add_argument("--mp_context_decay_horizon", type=int, default=140)
     parser.add_argument("--mp_context_lp_p", type=float, default=2.0)
     parser.add_argument("--mp_context_scale", type=float, default=0.25)
 
+    parser.add_argument("--w0_clip", type=float, default=0.15,
+                        help="Clip value for w_0=x_0 fed to the operator at t=0.")
+    parser.add_argument("--use_w0_clip", dest="use_w0_clip", action="store_true",
+                        help="Enable w_0 clipping (default on).")
+    parser.add_argument("--no_w0_clip", dest="use_w0_clip", action="store_false",
+                        help="Disable w_0 clipping.")
+    parser.set_defaults(use_w0_clip=False)
+
     # Loss.
-    parser.add_argument("--goal_stage_weight", type=float, default=4.2)
-    parser.add_argument("--goal_terminal_weight", type=float, default=60.0)
+    parser.add_argument("--goal_stage_weight", type=float, default=5.2)
+    parser.add_argument("--goal_terminal_weight", type=float, default=64.0)
     parser.add_argument("--wall_track_weight", type=float, default=24.0)
     parser.add_argument("--wall_collision_weight", type=float, default=120.0)
-    parser.add_argument("--control_weight", type=float, default=0.05)
+    parser.add_argument("--control_weight", type=float, default=6.05)
     parser.add_argument("--corridor_weight", type=float, default=10.0)
     parser.add_argument("--collision_sharpness", type=float, default=14.0)
     parser.add_argument("--corridor_sharpness", type=float, default=12.0)
+    parser.add_argument("--terminal_vel_weight", type=float, default=4.0,
+                        help="Weight on ||v_T||^2 terminal velocity penalty.")
+    parser.add_argument("--use_terminal_vel", dest="use_terminal_vel", action="store_true")
+    parser.add_argument("--no_terminal_vel", dest="use_terminal_vel", action="store_false")
+    parser.set_defaults(use_terminal_vel=True)
     parser.add_argument("--sample_traj_count", type=int, default=4)
     return parser.parse_args(argv)
 
@@ -243,14 +272,14 @@ def find_matched_ssm_d_model(
 def variant_specs(args=None) -> list[tuple[str, str]]:
     if args is not None and getattr(args, "simple_comparison", False):
         return [
-            ("disturbance_only", "PB+SSM: M_p only (no context)"),
-            ("context", "PB+SSM: factorized M_b x M_p + lift"),
+            ("disturbance_only", "PB+SSM: no context"),
+            ("context", "PB+SSM: factorized M_b x M_p"),
         ]
     return [
         ("nominal", "Nominal only"),
-        ("disturbance_only", "PB+SSM: disturbance only"),
-        ("context", "PB+SSM: factorized M_b x M_p + lift"),
-        ("mp_only_context", "PB+SSM: M_p-only + lift (matched params)"),
+        ("disturbance_only", "PB+SSM: no context"),
+        ("context", "PB+SSM: factorized M_b x M_p"),
+        ("mp_only_context", "PB+SSM: M_p-only (matched params)"),
     ]
 
 
@@ -343,14 +372,16 @@ def sample_switching_gate(
         last_level = level
         t += dwell
     # Late adversarial switch: 30% chance of one final change close to freeze
+    is_adversarial = False
     if rng.random() < 0.30 and freeze_step > 6:
         late_t = int(rng.integers(max(t - 6, 0), freeze_step))
         late_level = float(rng.uniform(-amp, amp))
         if abs(late_level - last_level) < 0.25 * amp:
             late_level = float(rng.uniform(-amp, amp))
         gate[late_t:freeze_step] = late_level
+        is_adversarial = True
     gate[freeze_step:] = gate[freeze_step - 1]
-    return gate
+    return gate, is_adversarial
 
 
 def sample_paired_process_noise(
@@ -413,27 +444,31 @@ def sample_batch(
     goals = []
     gates = []
     pair_ids = []
+    adv_flags = []
 
     for pair_idx in range(base_count):
         start_x = float(rng.uniform(float(args.start_x_min), float(args.start_x_max)))
         start_y = float(rng.uniform(-float(args.start_y_max), float(args.start_y_max)))
-        gate = sample_switching_gate(args, rng, freeze_step)
+        gate, is_adv = sample_switching_gate(args, rng, freeze_step)
 
         if paired:
             starts.extend([[start_x, start_y], [start_x, start_y]])
             goals.extend([[0.0, 0.0], [0.0, 0.0]])
             gates.extend([gate, -gate])
             pair_ids.extend([pair_idx, pair_idx])
+            adv_flags.extend([is_adv, is_adv])
         else:
             starts.append([start_x, start_y])
             goals.append([0.0, 0.0])
             gates.append(gate)
             pair_ids.append(pair_idx)
+            adv_flags.append(is_adv)
 
     starts_np = np.asarray(starts, dtype=np.float32)
     goals_np = np.asarray(goals, dtype=np.float32)
     gates_np = np.stack(gates, axis=0).astype(np.float32)
     pair_ids_np = np.asarray(pair_ids, dtype=np.int64)
+    adv_np = np.asarray(adv_flags, dtype=bool)
     noise_np = sample_paired_process_noise(args=args, rng=rng, batch_size=batch_size, paired=paired)
 
     if shuffle:
@@ -442,6 +477,7 @@ def sample_batch(
         goals_np = goals_np[order]
         gates_np = gates_np[order]
         pair_ids_np = pair_ids_np[order]
+        adv_np = adv_np[order]
         noise_np = noise_np[order]
 
     gate_v_np, gate_ema_np, gate_slow_ema_np, switch_age_np = build_gate_features(gates_np, float(args.context_ema_alpha))
@@ -456,6 +492,7 @@ def sample_batch(
         switch_age=torch.from_numpy(switch_age_np),
         process_noise=torch.from_numpy(noise_np),
         pair_id=torch.from_numpy(pair_ids_np),
+        is_adversarial=torch.from_numpy(adv_np),
     )
 
 
@@ -684,13 +721,16 @@ def rollout_pb_variant(
         def context_fn(x_t: torch.Tensor, t: int) -> torch.Tensor:
             return build_context(args=args, batch=batch, x_t=x_t, t=t, expected_cross_index=expected_cross_index, training=training)
 
+    w0_operator = x0
+    if getattr(args, "use_w0_clip", True):
+        w0_operator = x0.clamp(-float(args.w0_clip), float(args.w0_clip))
     result = rollout_pb(
         controller=controller,
         plant_true=plant_true,
         x0=x0,
         horizon=int(args.horizon),
         context_fn=context_fn,
-        w0=x0,
+        w0=w0_operator,
         process_noise_seq=batch.process_noise,
     )
     return RolloutArtifacts(x_seq=result.x_seq, u_seq=result.u_seq, w_seq=result.w_seq)
@@ -779,11 +819,17 @@ def compute_loss(
     ) / float(args.corridor_sharpness)
     corridor_cost = float(args.corridor_weight) * corridor_soft.mean(dim=1)
 
-    total_per = goal_stage + goal_term + wall_track + wall_collision + control_cost + corridor_cost
+    vel_term = torch.zeros_like(goal_term)
+    if getattr(args, "use_terminal_vel", True):
+        vel_final = rollout.x_seq[:, -1, 2:]  # (B, 2) final velocity
+        vel_term = float(args.terminal_vel_weight) * torch.sum(vel_final.square(), dim=-1)
+
+    total_per = goal_stage + goal_term + vel_term + wall_track + wall_collision + control_cost + corridor_cost
     parts = {
         "loss_total": to_python_float(total_per.mean()),
         "loss_goal_stage": to_python_float(goal_stage.mean()),
         "loss_goal_term": to_python_float(goal_term.mean()),
+        "loss_terminal_vel": to_python_float(vel_term.mean()),
         "loss_wall_track": to_python_float(wall_track.mean()),
         "loss_wall_collision": to_python_float(wall_collision.mean()),
         "loss_control": to_python_float(control_cost.mean()),
@@ -1148,7 +1194,7 @@ def plot_wall_style_summary(
     ax1.set_ylabel("y position", fontsize=12)
     ax1.set_xlim(-0.15, max(float(args.start_x_max), start_x) + 0.15)
     ax1.set_ylim(-float(args.corridor_limit) - 0.1, float(args.corridor_limit) + 0.1)
-    ax1.legend(loc="upper right", ncol=2)
+    ax1.legend(loc="best", ncol=2)
 
     ax2 = fig.add_subplot(gs[1, 0])
     bar_labels = [labels[mode] for mode, _ in variant_order]
@@ -1169,7 +1215,7 @@ def plot_wall_style_summary(
         fontweight="bold",
     )
     ax3.axhline(float(args.gate_half_width), color="red", linestyle="--", label="Safe bound")
-    ax3.legend(loc="upper right")
+    ax3.legend(loc="best")
     y_offset = max(0.03, 0.05 * max(avg_miss + [float(args.gate_half_width)]))
     for idx, value in enumerate(avg_miss):
         ax3.text(idx, value + y_offset, f"{value:.2f}", ha="center", fontweight="bold")
@@ -1203,7 +1249,7 @@ def plot_wall_style_summary(
     ax4.set_title("Gate Switching Over Time For One Representative Episode", fontsize=14, fontweight="bold")
     ax4.set_xlabel("time step", fontsize=12)
     ax4.set_ylabel("lateral position / gate center", fontsize=12)
-    ax4.legend(loc="upper right", ncol=2)
+    ax4.legend(loc="best", ncol=2)
 
     plt.tight_layout()
     fig.savefig(run_dir / "wall_style_summary.png", bbox_inches="tight")
@@ -1236,7 +1282,7 @@ def plot_loss_curves(
     ax.set_title("Training / validation loss")
     ax.set_xlabel("epoch")
     ax.set_ylabel("loss")
-    ax.legend(loc="upper right")
+    ax.legend(loc="best")
     fig.tight_layout()
     fig.savefig(run_dir / "loss_curves.png", bbox_inches="tight")
     if show_plots:
@@ -1268,7 +1314,7 @@ def plot_control_magnitude(
     ax.set_title("Control magnitude over time")
     ax.set_xlabel("time step")
     ax.set_ylabel(r"$\|u_t\|_2$")
-    ax.legend(loc="upper right")
+    ax.legend(loc="best")
     fig.tight_layout()
     fig.savefig(run_dir / "control_magnitude_over_time.png", bbox_inches="tight")
     if show_plots:
@@ -1332,7 +1378,7 @@ def plot_trajectory_samples(
         ax.set_ylabel("y")
         ax.set_xlim(-0.25, float(args.start_x_max) + 0.15)
         ax.set_ylim(-float(args.corridor_limit) - 0.15, float(args.corridor_limit) + 0.15)
-        ax.legend(loc="upper right")
+        ax.legend(loc="best")
 
     for ax in axes_flat[n:]:
         ax.axis("off")
@@ -1452,7 +1498,7 @@ def plot_waiting_behavior(
                       label=f"gate-dwell window ({dwell_min} steps)")
         ax_in.set_ylabel(ylabel)
         ax_in.set_title(title, fontweight="bold")
-        ax_in.legend(fontsize=9, loc="upper left")
+        ax_in.legend(fontsize=9, loc="best")
         _style(ax_in)
 
     # ── Panel 1: forward speed |vx| — primary "waiting" signal ───────────────
@@ -1483,7 +1529,7 @@ def plot_waiting_behavior(
                    linestyle=":", label=f"gate half-width {args.gate_half_width:.2f}")
     ax_err.set_ylabel(r"$|y - g_t|$  gate error")
     ax_err.set_title("|y \u2212 gate| around wall crossing", fontweight="bold")
-    ax_err.legend(fontsize=9, loc="upper left")
+    ax_err.legend(fontsize=9, loc="best")
     _style(ax_err)
 
     # ── Panels 4 & 5: individual example trajectories ────────────────────────
@@ -1521,7 +1567,7 @@ def plot_waiting_behavior(
         ax_ex.set_ylabel("y position")
         ax_ex.set_title(title, fontweight="bold", fontsize=10)
         ax_ex.scatter([], [], color="#fbbf24", s=22, label="gate switch event")
-        ax_ex.legend(fontsize=8, loc="upper right")
+        ax_ex.legend(fontsize=8, loc="best")
 
     fig.suptitle(
         "Waiting-behaviour analysis: does the controller hold back after a recent gate switch?",
@@ -1644,7 +1690,7 @@ def _animate_one_sample(
         path_effects=[pe.withStroke(linewidth=2, foreground="#0f172a")],
     )
 
-    ax_arena.legend(loc="upper right", fontsize=8.5, facecolor="#1e293b",
+    ax_arena.legend(loc="best", fontsize=8.5, facecolor="#1e293b",
                     edgecolor="#475569", labelcolor="#e2e8f0", framealpha=0.85)
     ax_arena.set_title(
         f"Gate-Crossing Navigation — Sample #{sample_idx}",
@@ -1672,7 +1718,7 @@ def _animate_one_sample(
     ax_time.set_xlabel("time step")
     ax_time.set_ylabel("y / gate center")
     ax_time.set_title("Lateral position over time", fontsize=11, fontweight="bold")
-    ax_time.legend(loc="upper right", fontsize=8, facecolor="#1e293b",
+    ax_time.legend(loc="best", fontsize=8, facecolor="#1e293b",
                    edgecolor="#475569", labelcolor="#e2e8f0", framealpha=0.85)
 
     # ── update function (closed over per-sample data) ─────────────────────────
@@ -1762,6 +1808,53 @@ def animate_rollout(
         )
 
 
+def animate_adversarial_sample(
+    *,
+    args: argparse.Namespace,
+    run_dir: Path,
+    variant_order: list[tuple[str, str]],
+    test_batch: ScenarioBatch,
+    test_metrics: dict[str, dict],
+    show_plots: bool,
+) -> None:
+    """Render an animated GIF for one adversarial episode (late gate switch)."""
+    adv_mask = test_batch.is_adversarial.numpy().astype(bool)
+    adv_indices = np.where(adv_mask)[0]
+    if len(adv_indices) == 0:
+        print("  No adversarial episodes found — skipping adversarial animation.")
+        return
+
+    plt = get_plt(show_plots)
+    setup_plot_style(plt)
+
+    # Pick the adversarial sample with the best (lowest) final position error
+    # for the first available context variant, so the GIF shows informative behaviour.
+    primary_mode = next(
+        (m for m, _ in variant_order if m in ("context", "mp_only_context", "disturbance_only")),
+        variant_order[0][0],
+    )
+    x_seq = test_metrics[primary_mode]["rollout"]["x_seq"]  # (B, T, 4)
+    goal = test_batch.goal  # (B, 2)
+    pos_final = x_seq[adv_indices, -1, :2]  # (n_adv, 2)
+    goal_adv = goal[adv_indices, :2]
+    err = torch.norm(pos_final - goal_adv.to(pos_final.device), dim=-1)
+    best_local = int(err.argmin().item())
+    sample_idx = int(adv_indices[best_local])
+
+    print(f"\nRendering adversarial animation for sample #{sample_idx}…")
+    _animate_one_sample(
+        plt=plt,
+        args=args,
+        run_dir=run_dir,
+        variant_order=variant_order,
+        test_batch=test_batch,
+        test_metrics=test_metrics,
+        sample_idx=sample_idx,
+        file_tag=f"adversarial_idx{sample_idx}",
+        show_plots=show_plots,
+    )
+
+
 def plot_adversarial_switching(
     *,
     args: argparse.Namespace,
@@ -1782,17 +1875,10 @@ def plot_adversarial_switching(
     labels = {mode: label for mode, label in variant_order}
 
     gate_np   = test_batch.gate_y.numpy()           # (B, T)
-    sw_age    = test_batch.switch_age.numpy()        # (B, T)
     B, T      = gate_np.shape
-    dwell_min = int(args.gate_dwell_min)
 
-    # Use "context" rollout cross indices as the reference crossing step.
-    ref_mode = "context" if "context" in test_metrics else variant_order[-1][0]
-    ci_np = test_metrics[ref_mode]["rollout"]["cross_idx"].numpy().astype(int)
-    ci_np = np.clip(ci_np, 0, T - 1)
-    age_at_cross = sw_age[np.arange(B), ci_np]      # (B,)
-
-    adv_mask  = age_at_cross <= dwell_min            # adversarial: recently switched
+    # Use the ground-truth adversarial flag stored during batch generation.
+    adv_mask    = test_batch.is_adversarial.numpy().astype(bool)  # (B,)
     stable_mask = ~adv_mask
     n_adv, n_stable = int(adv_mask.sum()), int(stable_mask.sum())
 
@@ -1832,7 +1918,7 @@ def plot_adversarial_switching(
     ax_bar.set_ylabel("Success rate (%)")
     ax_bar.set_title("Success rate: adversarial vs. stable gate", fontweight="bold")
     ax_bar.set_ylim(0, 108)
-    ax_bar.legend(fontsize=8)
+    ax_bar.legend(fontsize=8, loc="best")
 
     # Panel 2: distribution of |cross_error| for adversarial episodes
     err_data, bar_labels_adv = [], []
@@ -1861,13 +1947,17 @@ def plot_adversarial_switching(
     ax_err_adv.set_ylabel(r"$|y_{t^\star} - g_{t^\star}|$")
     ax_err_adv.set_title(f"|Cross error| under adversarial switching (n={n_adv})",
                           fontweight="bold")
-    ax_err_adv.legend(fontsize=8)
+    ax_err_adv.legend(fontsize=8, loc="best")
 
     # Panel 3: example top-down trajectories for the 3 hardest adversarial episodes
     # (smallest switch_age => most recent switch)
+    ref_mode = "context" if "context" in test_metrics else variant_order[-1][0]
+    ci_np = test_metrics[ref_mode]["rollout"]["cross_idx"].numpy().astype(int)
+    ci_np = np.clip(ci_np, 0, T - 1)
+
     adv_indices = np.where(adv_mask)[0]
     if len(adv_indices) > 0:
-        adv_indices = adv_indices[np.argsort(age_at_cross[adv_indices])][:3]
+        adv_indices = adv_indices[:3]  # just take first 3 adversarial episodes
         for idx in adv_indices:
             ci = int(ci_np[idx])
             gate_center = float(gate_np[idx, ci])
@@ -1891,20 +1981,183 @@ def plot_adversarial_switching(
         ax_traj.set_ylim(-float(args.corridor_limit) - 0.1, float(args.corridor_limit) + 0.1)
         ax_traj.set_xlabel("x position")
         ax_traj.set_ylabel("y position")
-        ax_traj.set_title("Trajectories: 3 hardest adversarial episodes\n"
-                          "(smallest switch_age at crossing)", fontweight="bold")
-        ax_traj.legend(loc="upper right", fontsize=8)
+        ax_traj.set_title("Trajectories: adversarial episodes", fontweight="bold")
+        ax_traj.legend(loc="best", fontsize=8)
     else:
         ax_traj.text(0.5, 0.5, "No adversarial episodes found",
                      ha="center", va="center", transform=ax_traj.transAxes)
 
     fig.suptitle(
-        f"Adversarial gate switching analysis  "
-        f"(adversarial = switch_age \u2264 {dwell_min} at crossing)",
+        f"Adversarial gate switching analysis  (n_adv={n_adv}, n_stable={n_stable})",
         fontsize=13, fontweight="bold",
     )
     fig.tight_layout()
     fig.savefig(run_dir / "adversarial_switching.png", bbox_inches="tight")
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_sample_trajectory(
+    *,
+    args: argparse.Namespace,
+    run_dir: Path,
+    variant_order: list[tuple[str, str]],
+    test_batch: ScenarioBatch,
+    test_metrics: dict[str, dict],
+    expected_cross_index: int,
+    show_plots: bool = False,
+    sample_idx: int = 0,
+) -> None:
+    """
+    Two-panel paper figure for a single episode:
+      Left  – top-down view (x vs y): trajectory per variant + wall + gate gap.
+      Right – time series: y_t and gate band g_t±h vs step, with t_freeze and t_cross marked.
+    Variants are overlaid in their canonical colours.
+    """
+    import matplotlib
+    try:
+        matplotlib.use("Agg")
+    except Exception:
+        pass
+    from matplotlib import pyplot as plt
+    from matplotlib.collections import LineCollection
+    from matplotlib.lines import Line2D
+
+    setup_plot_style(plt)
+    colors = variant_colors()
+    labels = {mode: label for mode, label in variant_order}
+    h = float(args.gate_half_width)
+    wall_x = float(args.wall_x)
+    T = int(args.horizon)
+    T_plot = int(args.plot_horizon) if getattr(args, "use_plot_horizon", True) and getattr(args, "plot_horizon", None) else T
+    T_plot = max(T_plot, T)
+    freeze_step = max(1, expected_cross_index - int(args.gate_settle_steps))
+    steps = np.arange(T_plot)
+
+    # Gate schedule for the selected episode — extend with frozen value past horizon
+    gate_np_ctrl = test_batch.gate_y[sample_idx].numpy()  # (T,)
+    gate_np = np.concatenate([gate_np_ctrl,
+                               np.full(T_plot - T, gate_np_ctrl[-1])]) if T_plot > T else gate_np_ctrl
+
+    # Helper: extend a trajectory past the control horizon using zero-input nominal dynamics
+    nominal_plant_ext = DoubleIntegratorNominal(
+        dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd)
+    )
+
+    def extend_traj(xy: np.ndarray) -> np.ndarray:
+        """xy: (T, 2) — extend to (T_plot, 2) with u=0 nominal rollout."""
+        if T_plot <= T:
+            return xy
+        x = torch.tensor(xy[-1], dtype=torch.float32).view(1, 1, 2)
+        # Pad velocity to 4-D state — assume zero velocity at T (conservative)
+        x4 = torch.zeros(1, 1, 4, dtype=torch.float32)
+        x4[..., :2] = x
+        tail = [xy[-1]]
+        u_zero = torch.zeros(1, 1, 2, dtype=torch.float32)
+        for _ in range(T_plot - T):
+            x4 = nominal_plant_ext.nominal_dynamics(x4, u_zero)
+            tail.append(x4[0, 0, :2].numpy())
+        return np.concatenate([xy, np.stack(tail[1:])], axis=0)
+
+    fig, (ax_top, ax_ts) = plt.subplots(
+        1, 2, figsize=(11, 4.2),
+        gridspec_kw={"width_ratios": [1, 1.6]},
+    )
+
+    # ── Left: top-down view ───────────────────────────────────────────────────
+    # Wall
+    y_lim = float(args.corridor_limit) * 1.05
+    ax_top.axvline(wall_x, color="#ef4444", lw=2.0, zorder=3, label="Wall")
+
+    # Gate opening at crossing time (use context variant if available, else first variant)
+    ref_mode = "context" if "context" in test_metrics else variant_order[0][0]
+    ref_cross_idx = int(test_metrics[ref_mode]["rollout"]["cross_idx"][sample_idx].item())
+    g_cross = float(gate_np[min(ref_cross_idx, T - 1)])
+    ax_top.fill_betweenx(
+        [g_cross - h, g_cross + h],
+        wall_x - 0.02, wall_x + 0.02,
+        color="#bbf7d0", zorder=4, label="Gate opening",
+    )
+    # Wall above and below gate
+    ax_top.fill_betweenx([g_cross + h, y_lim], wall_x - 0.01, wall_x + 0.01,
+                         color="#fca5a5", zorder=4, alpha=0.7)
+    ax_top.fill_betweenx([-y_lim, g_cross - h], wall_x - 0.01, wall_x + 0.01,
+                         color="#fca5a5", zorder=4, alpha=0.7)
+
+    for mode, label in variant_order:
+        if mode not in test_metrics:
+            continue
+        traj = test_metrics[mode]["rollout"]["x_seq"][sample_idx, :, :2].numpy()  # (T, 2)
+        traj = extend_traj(traj)
+        x_traj, y_traj = traj[:, 0], traj[:, 1]
+        # Colour trajectory by time
+        pts = np.stack([x_traj, y_traj], axis=1)[np.newaxis]  # (1, T, 2)
+        segs = np.concatenate([pts[:, :-1], pts[:, 1:]], axis=0).transpose(1, 0, 2)
+        lc = LineCollection(segs, cmap="viridis", linewidth=2.0, alpha=0.85, zorder=5)  # noqa
+        lc.set_array(np.linspace(0, 1, len(segs)))
+        ax_top.add_collection(lc)
+        # Mark start and end
+        ax_top.scatter(x_traj[0], y_traj[0], s=40, color=colors.get(mode, "#888"),
+                       zorder=6, marker="o")
+        ax_top.scatter(x_traj[-1], y_traj[-1], s=40, color=colors.get(mode, "#888"),
+                       zorder=6, marker="x")
+
+    ax_top.set_xlim(float(args.start_x_max) * 1.05, -0.15)
+    ax_top.set_ylim(-y_lim, y_lim)
+    ax_top.set_xlabel("x  (m)")
+    ax_top.set_ylabel("y  (m)")
+    ax_top.set_title("Top-down trajectory", fontweight="bold")
+    # Dummy handles for legend
+    handles = [Line2D([0], [0], color=colors.get(m, "#888"), lw=2, label=labels[m])
+               for m, _ in variant_order if m in test_metrics]
+    handles += [Line2D([0], [0], color="#ef4444", lw=2, label="Wall"),
+                plt.Rectangle((0, 0), 1, 1, fc="#bbf7d0", label="Gate")]
+    ax_top.legend(handles=handles, fontsize=8, loc="best")
+    ax_top.invert_xaxis()
+
+    # ── Right: time series ────────────────────────────────────────────────────
+    # Gate band
+    ax_ts.fill_between(steps, gate_np - h, gate_np + h,
+                       color="#bbf7d0", alpha=0.45, label="Gate opening", zorder=1)
+    ax_ts.plot(steps, gate_np, color="#16a34a", lw=1.2, ls="--", label="Gate centre $g_t$", zorder=2)
+
+    for mode, label in variant_order:
+        if mode not in test_metrics:
+            continue
+        y_seq_ctrl = test_metrics[mode]["rollout"]["x_seq"][sample_idx, :, 1].numpy()
+        traj_ext = extend_traj(test_metrics[mode]["rollout"]["x_seq"][sample_idx, :, :2].numpy())
+        y_seq = traj_ext[:, 1]
+        cross_idx = int(test_metrics[mode]["rollout"]["cross_idx"][sample_idx].item())
+        c = colors.get(mode, "#888")
+        # Solid line during control horizon, dashed during extension
+        ax_ts.plot(steps[:T], y_seq[:T], color=c, lw=1.8, label=label, zorder=3)
+        if T_plot > T:
+            ax_ts.plot(steps[T - 1:], y_seq[T - 1:], color=c, lw=1.4, ls="--", zorder=3)
+        ax_ts.scatter(cross_idx, y_seq_ctrl[min(cross_idx, T - 1)],
+                      color=c, s=55, zorder=5, marker="D")
+
+    # Freeze and crossing reference lines
+    ax_ts.axvline(freeze_step, color="#7c3aed", lw=1.4, ls=":", zorder=4,
+                  label=f"$t_{{\\mathrm{{freeze}}}}={freeze_step}$")
+    ax_ts.axvline(expected_cross_index, color="#ef4444", lw=1.4, ls=":", zorder=4,
+                  label=f"$t_{{\\mathrm{{wall}}}}={expected_cross_index}$")
+
+    if T_plot > T:
+        ax_ts.axvline(T, color="#94a3b8", lw=1.2, ls="--", zorder=2,
+                      label=f"Control horizon $T={T}$")
+    ax_ts.axhline(0, color="#94a3b8", lw=0.7, ls="-", zorder=0)
+    ax_ts.set_xlabel("Step $t$")
+    ax_ts.set_ylabel("$y_t$  (m)")
+    ax_ts.set_title("Lateral position vs. gate centre", fontweight="bold")
+    ax_ts.legend(fontsize=8, loc="best")
+
+    fig.suptitle(f"Sample episode #{sample_idx}", fontsize=12, fontweight="bold")
+    fig.tight_layout()
+
+    out = run_dir / "sample_trajectory.pdf"
+    fig.savefig(str(out), bbox_inches="tight")
+    print(f"Saved sample trajectory figure → {out}")
     if show_plots:
         plt.show()
     plt.close(fig)
@@ -1922,9 +2175,9 @@ def strip_rollout(metrics: dict) -> dict:
 def build_interpretation(test_metrics: dict[str, dict]) -> str:
     lines = []
     if "context" in test_metrics:
-        lines.append(f"Factorized M_b x M_p+lift: success rate {test_metrics['context']['success_rate']:.3f}")
+        lines.append(f"Factorized M_b x M_p: success rate {test_metrics['context']['success_rate']:.3f}")
     if "mp_only_context" in test_metrics:
-        lines.append(f"M_p-only+lift: {test_metrics['mp_only_context']['success_rate']:.3f}")
+        lines.append(f"M_p-only (matched params): {test_metrics['mp_only_context']['success_rate']:.3f}")
     if "disturbance_only" in test_metrics:
         lines.append(f"Disturbance-only PB+SSM: {test_metrics['disturbance_only']['success_rate']:.3f}")
     if "nominal" in test_metrics:
@@ -1943,6 +2196,92 @@ def main() -> None:
         print("CUDA requested but not available. Falling back to CPU.")
         requested_device = "cpu"
     device = torch.device(requested_device)
+
+    # ── Plot-only mode ────────────────────────────────────────────────────────
+    if args.plot_only:
+        _plot_only_path = Path(args.plot_only).expanduser()
+        if not _plot_only_path.is_absolute():
+            _plot_only_path = Path(__file__).resolve().parent / "runs" / args.plot_only
+        run_dir = _plot_only_path.resolve()
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"--plot_only path does not exist: {run_dir}")
+        config_path = run_dir / "config.json"
+        if config_path.exists():
+            import json as _json
+            saved_cfg = _json.loads(config_path.read_text(encoding="utf-8"))
+            # Merge saved config into args (CLI overrides saved values where specified)
+            cli_overrides = set(sys.argv[1:])
+            for k, v in saved_cfg.items():
+                if f"--{k}" not in cli_overrides and hasattr(args, k):
+                    setattr(args, k, v)
+            print(f"[plot_only] Loaded config from {config_path}")
+        else:
+            print(f"[plot_only] Warning: no config.json found in {run_dir}, using current args.")
+
+        expected_cross_index = estimate_expected_cross_index(args)
+        specs = variant_specs(args)
+
+        test_batch = sample_batch(
+            args=args,
+            batch_size=int(args.test_batch),
+            seed=int(args.seed) + 60_000,
+            paired=True,
+            shuffle=False,
+            expected_cross_index=expected_cross_index,
+        )
+        val_batch = sample_batch(
+            args=args,
+            batch_size=int(args.val_batch),
+            seed=int(args.seed) + 50_000,
+            paired=True,
+            shuffle=False,
+            expected_cross_index=expected_cross_index,
+        )
+
+        controllers: dict[str, PBController | None] = {}
+        plants: dict[str, DoubleIntegratorTrue | None] = {}
+        val_metrics: dict[str, dict] = {}
+        test_metrics: dict[str, dict] = {}
+        histories: dict[str, list[dict]] = {}
+
+        mp_only_d_model = int(args.ssm_d_model)
+        mp_only_layers = int(args.ssm_layers)
+
+        for mode, label in specs:
+            pt_path = run_dir / f"{mode}_controller.pt"
+            use_mp_only = (mode == "mp_only_context")
+            controller, plant_true = build_controller(device, args, mp_only=use_mp_only)
+            if pt_path.exists():
+                controller.load_state_dict(torch.load(pt_path, map_location=device))
+                print(f"[plot_only] Loaded {pt_path.name}")
+            else:
+                print(f"[plot_only] Warning: {pt_path.name} not found — using random weights for {mode}.")
+            controllers[mode] = controller
+            plants[mode] = plant_true
+            histories[mode] = []
+            val_metrics[mode] = evaluate_variant(
+                args=args, batch=val_batch, device=device, mode=mode,
+                controller=controller, plant_true=plant_true,
+                expected_cross_index=expected_cross_index,
+            )
+            test_metrics[mode] = evaluate_variant(
+                args=args, batch=test_batch, device=device, mode=mode,
+                controller=controller, plant_true=plant_true,
+                expected_cross_index=expected_cross_index,
+            )
+
+        show_plots = not args.no_show_plots
+        _run_all_plots(
+            args=args, run_dir=run_dir, specs=specs,
+            controllers=controllers, plants=plants,
+            val_batch=val_batch, test_batch=test_batch,
+            val_metrics=val_metrics, test_metrics=test_metrics,
+            histories=histories, show_plots=show_plots,
+            expected_cross_index=expected_cross_index,
+        )
+        return
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     expected_cross_index = estimate_expected_cross_index(args)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2014,7 +2353,7 @@ def main() -> None:
         # Warm-start the context mode from the disturbance_only checkpoint.
         # mp_only_context starts from scratch (different architecture / size).
         warm_start = None
-        if mode == "context" and controllers.get("disturbance_only") is not None:
+        if mode == "context" and args.warm_start and controllers.get("disturbance_only") is not None:
             warm_start = {k: v.detach().cpu().clone() for k, v in controllers["disturbance_only"].state_dict().items()}
             print("[context] warm-starting from disturbance_only checkpoint.")
         use_mp_only = (mode == "mp_only_context")
@@ -2046,6 +2385,32 @@ def main() -> None:
             torch.save(controller.state_dict(), run_dir / f"{mode}_controller.pt")
 
     show_plots = not args.no_show_plots
+    _run_all_plots(
+        args=args, run_dir=run_dir, specs=specs,
+        controllers=controllers, plants=plants,
+        val_batch=val_batch, test_batch=test_batch,
+        val_metrics=val_metrics, test_metrics=test_metrics,
+        histories=histories, show_plots=show_plots,
+        expected_cross_index=expected_cross_index,
+    )
+
+
+def _run_all_plots(
+    *,
+    args,
+    run_dir: Path,
+    specs: list[tuple[str, str]],
+    controllers: dict,
+    plants: dict,
+    val_batch: ScenarioBatch,
+    test_batch: ScenarioBatch,
+    val_metrics: dict,
+    test_metrics: dict,
+    histories: dict,
+    show_plots: bool,
+    expected_cross_index: int,
+) -> None:
+    """Run all plots and save JSON metrics. Shared by normal and --plot_only paths."""
     plot_loss_curves(
         run_dir=run_dir,
         histories=histories,
@@ -2075,8 +2440,15 @@ def main() -> None:
         test_metrics=test_metrics,
         show_plots=show_plots,
     )
-
     animate_rollout(
+        args=args,
+        run_dir=run_dir,
+        variant_order=specs,
+        test_batch=test_batch,
+        test_metrics=test_metrics,
+        show_plots=show_plots,
+    )
+    animate_adversarial_sample(
         args=args,
         run_dir=run_dir,
         variant_order=specs,
@@ -2097,6 +2469,15 @@ def main() -> None:
         variant_order=specs,
         test_batch=test_batch,
         test_metrics=test_metrics,
+        show_plots=show_plots,
+    )
+    plot_sample_trajectory(
+        args=args,
+        run_dir=run_dir,
+        variant_order=specs,
+        test_batch=test_batch,
+        test_metrics=test_metrics,
+        expected_cross_index=expected_cross_index,
         show_plots=show_plots,
     )
 

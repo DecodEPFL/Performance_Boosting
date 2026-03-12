@@ -709,9 +709,11 @@ We study two variants:
     \(\sigma_t\) is the number of steps since the last gate switch (stability cue:
     large \(\sigma_t\) means the gate has been settled long enough to commit).
 \end{itemize}
-The minimal context is designed so that the controller can learn the waiting strategy without
-access to the freeze schedule \eqref{eq:freeze-step}: a rising \(\sigma_t\) near the wall
-(\(\alpha_t\approx 1\)) signals that the gate has stabilised and it is safe to aim.
+The three features are directly observable without privileged knowledge of the freeze
+schedule \eqref{eq:freeze-step}: a rising \(\sigma_t\) near the wall
+(\(\alpha_t\approx 1\)) indicates that the gate has been stable long enough to aim,
+providing the information necessary to navigate the trade-off between early commitment
+and waiting for the gate to settle.
 
 \paragraph{Context lifting.}
 Rather than feeding \(z_t\) directly into \(\mathcal{M}_p\), we first lift it through a
