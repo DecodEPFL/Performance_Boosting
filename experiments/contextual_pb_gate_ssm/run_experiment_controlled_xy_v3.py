@@ -272,6 +272,7 @@ def find_matched_ssm_d_model(
 def variant_specs(args=None) -> list[tuple[str, str]]:
     if args is not None and getattr(args, "simple_comparison", False):
         return [
+            ("nominal", "Nominal only"),
             ("disturbance_only", "PB+SSM: no context"),
             ("context", "PB+SSM: factorized M_b x M_p"),
         ]
