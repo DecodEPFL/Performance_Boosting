@@ -3,7 +3,7 @@
 A planar navigation task that demonstrates the advantage of **contextual
 Performance Boosting** over a disturbance-only baseline.
 
-![Sample rollout](runs/controlled_xy_20260317_150748/rollout_animation_04_idx1.gif)
+![Sample rollout](experiments/contextual_pb_gate_ssm/runs/controlled_xy_20260317_150748/rollout_animation_04_idx1.gif)
 
 ---
 
@@ -56,14 +56,15 @@ commit.
 From the repository root:
 
 ```bash
-python experiments/contextual_pb_gate_ssm/Moving_gate_exp.py --no_show_plots
+cd experiments/contextual_pb_gate_ssm
+python Moving_gate_exp.py --no_show_plots
 ```
 
 To reproduce plots from a completed run without retraining:
 
 ```bash
-python experiments/contextual_pb_gate_ssm/Moving_gate_exp.py \
-    --plot_only controlled_xy_<timestamp>
+cd experiments/contextual_pb_gate_ssm
+python Moving_gate_exp.py --plot_only controlled_xy_<timestamp>
 ```
 
 Results are written to:
