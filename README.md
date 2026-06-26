@@ -48,6 +48,7 @@ commit.
 | **Nominal** | Pre-stabiliser only, no PB correction |
 | **PB: no context** | PB+SSM operator seeing only disturbance `w_t` |
 | **PB: factorized M_b × M_p** | PB+SSM with context-aware factorized operator |
+| **PB: MAD (s=1)** | Special case with scalar `M_p` magnitude and bounded `M_b(w,z)` direction mixer |
 
 ---
 
@@ -83,3 +84,125 @@ Key outputs per run:
 | `rollout_animation_*.gif` | Animated rollouts |
 | `*_controller.pt` | Saved controller weights |
 | `metrics.json` | Numerical evaluation metrics |
+
+## Running on EPFL RCP / Run:AI
+
+The RCP tutorial uses Docker plus Run:AI, not `sbatch`. The one-time setup is:
+install `docker`, `kubectl`, and `runai`; create a public Harbor project; then
+configure RCP access:
+
+```bash
+mkdir -p ~/.kube
+curl https://wiki.rcp.epfl.ch/public/files/kube-config.yaml -o ~/.kube/config
+chmod 600 ~/.kube/config
+runai login
+runai config project <runai-project-name>
+```
+
+Build and push the Docker image from your laptop. Use the UID/GID values from
+EPFL, and the Harbor project name you created:
+
+```bash
+GASPAR=<gaspar> LDAP_UID=<uid> LDAP_GID=<gid> PROJECT=<harbor-project> \
+  IMAGE=performance-boosting TAG=v1.0 \
+  scripts/rcp_build_push_image.sh
+```
+
+The image uses `DockerfileRCP` and `requirements-rcp.txt`. PyTorch is not in the
+RCP requirements file because the NVIDIA PyTorch base image provides the CUDA
+matched torch build.
+
+On the RCP jumphost, clone or update this repository:
+
+```bash
+ssh <gaspar>@jumphost.rcp.epfl.ch
+git clone <repo-url> ~/Performance_Boosting
+cd ~/Performance_Boosting
+git pull
+```
+
+Submit a short moving-gate smoke test from the jumphost:
+
+```bash
+GASPAR=<gaspar> PROJECT=<harbor-project> IMAGE=performance-boosting TAG=v1.0 \
+  GPU=0.1 scripts/rcp_runai_submit.sh \
+  --epochs 2 --disturbance_only_epochs 1 \
+  --train_batch 16 --val_batch 16 --test_batch 16 \
+  --variants disturbance_only,context \
+  --no_storyboard --no_storyboard_compact
+```
+
+Submit a full moving-gate run:
+
+```bash
+GASPAR=<gaspar> PROJECT=<harbor-project> IMAGE=performance-boosting TAG=v1.0 \
+  JOB_NAME=pb-gate-full RUN_ID=rcp_gate_full GPU=1 \
+  scripts/rcp_runai_submit.sh --epochs 250
+```
+
+Submit the moving-obstacles variant. Set `--epochs` explicitly because its
+default is intentionally large:
+
+```bash
+GASPAR=<gaspar> PROJECT=<harbor-project> IMAGE=performance-boosting TAG=v1.0 \
+  EXPERIMENT=obstacles JOB_NAME=pb-obstacles-full RUN_ID=rcp_obstacles_full GPU=1 \
+  scripts/rcp_runai_submit.sh --epochs 250
+```
+
+Useful Run:AI commands from the jumphost:
+
+```bash
+runai list jobs
+runai describe <job-name>
+runai bash <job-name>
+runai logs <job-name> --loglevel debug
+runai delete job <job-name>
+```
+
+Copy results back from a local terminal:
+
+```bash
+scp -r <gaspar>@jumphost.rcp.epfl.ch:~/Performance_Boosting/experiments/contextual_pb_gate_ssm/runs/<run_id> ~/Desktop/
+```
+
+Results are written under the matching experiment directory:
+
+```text
+experiments/contextual_pb_gate_ssm/runs/<run_id>/
+experiments/contextual_pb_obstacles_ssm/runs/<run_id>/
+```
+
+The repository also includes `scripts/rcp_experiment.sbatch` as a generic Slurm
+fallback for clusters that actually expose `sbatch`; it is not the primary RCP
+path from the tutorial.
+
+---
+
+## Moving Obstacles Variant
+
+There is now a sibling experiment where the robot starts from a chosen
+initial position and must still reach the origin, but instead of
+crossing a moving gate it must avoid **moving circular obstacles**
+that can travel in arbitrary 2D directions along the route. The
+contextual variant receives each obstacle's relative position together
+with its velocity vector, so it can anticipate where the obstacle is
+going rather than only reacting to its current location.
+Both contextual experiments also include a MAD-style special case
+(`s=1`) that compares the full context-aware factorized operator against
+a scalar-magnitude, bounded-direction policy.
+
+Run it from the repository root with:
+
+```bash
+cd experiments/contextual_pb_obstacles_ssm
+python Moving_obstacles_exp.py --no_show_plots
+```
+
+Its outputs are written to:
+
+```
+experiments/contextual_pb_obstacles_ssm/runs/<run_id>/
+```
+
+Key obstacle outputs include static summaries plus `rollout_animation_*.gif`
+files showing the moving obstacles and the robot trajectories over time.

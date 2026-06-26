@@ -26,7 +26,7 @@ from context_lifting import LpContextLifter
 from nav_plants import DoubleIntegratorNominal, DoubleIntegratorTrue
 from pb_core import PBController, as_bt, rollout_pb, validate_component_compatibility, WIntegralAugmenter
 from pb_core.factories import build_factorized_controller
-from ssm_operators import MpDeepSSM
+from ssm_operators import MpDeepSSM, MpContextualSSM
 
 
 @dataclass
@@ -80,7 +80,7 @@ def get_plt(show_plots: bool):
     return _PLT
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser("2D contextual PB gate experiment with PBController + SSM")
     parser.add_argument("--seed", type=int, default=25)
     parser.add_argument("--device", type=str, default="cpu")
@@ -88,7 +88,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--val_batch", type=int, default=512)
     parser.add_argument("--test_batch", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=250)
-    parser.add_argument("--disturbance_only_epochs", type=int, default=250)
+    parser.add_argument("--disturbance_only_epochs", type=int, default=5)
     parser.add_argument("--eval_every", type=int, default=10)
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--lr_min", type=float, default=2e-4)
@@ -118,6 +118,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "(M_p-only with lift) to isolate the effect of lifting.")
     parser.add_argument("--no_lift_comparison", dest="lift_comparison", action="store_false")
     parser.set_defaults(lift_comparison=False)
+    parser.add_argument("--mad_comparison", dest="mad_comparison", action="store_true",
+                        help="Add the MAD special case: factorized context operator with s=1, "
+                             "so M_p outputs a scalar magnitude and M_b is a bounded 2x1 mixer.")
+    parser.add_argument("--no_mad_comparison", dest="mad_comparison", action="store_false")
+    parser.set_defaults(mad_comparison=True)
     parser.add_argument("--use_storyboard", dest="use_storyboard", action="store_true")
     parser.add_argument("--no_storyboard", dest="use_storyboard", action="store_false")
     parser.set_defaults(use_storyboard=True)
@@ -127,6 +132,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--pre_kp", type=float, default=0.32)
     parser.add_argument("--pre_kd", type=float, default=0.80)
+    parser.add_argument("--drag_coeff", type=float, default=0.0,
+                        help="Quadratic velocity-drag coefficient c in the plant: "
+                             "acc -= c*||vel||*vel (added to BOTH nominal and true "
+                             "dynamics). 0 = linear double integrator. ~0.5-2 is 'a bit'.")
     parser.add_argument("--start_x_min", type=float, default=1.7)
     parser.add_argument("--start_x_max", type=float, default=2.1)
     parser.add_argument("--start_y_max", type=float, default=0.40)
@@ -159,6 +168,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gust_vel_x_max", type=float, default=0.004)
     parser.add_argument("--gust_clip_y", type=float, default=0.045)
 
+    # Process-noise decay: fade the injected noise (hence the reconstructed
+    # disturbance w_t) toward 0 over the horizon, so w is an L2 / transient signal
+    # rather than a stationary floor. The IC term w_0 = x_0 is left untouched.
+    parser.add_argument("--noise_decay", type=str, default="taper",
+                        choices=["none", "taper", "linear", "exponential"],
+                        help="Decay window on the process noise over the horizon (w_t -> 0 by "
+                             "t=T). 'none' = stationary noise (legacy); 'taper' (default) keeps "
+                             "noise flat then cosine-fades the trailing --noise_decay_ramp steps.")
+    parser.add_argument("--noise_decay_ramp", type=int, default=0,
+                        help="taper only: trailing cosine roll-off length in steps "
+                             "(0 = auto = horizon//2).")
+    parser.add_argument("--noise_decay_rate", type=float, default=0.98,
+                        help="exponential only: per-step decay factor (noise scaled by rate**t).")
+
     # PB architecture.
     parser.add_argument("--feat_dim", type=int, default=16)
     parser.add_argument("--mb_hidden", type=int, default=64)
@@ -166,7 +189,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--z_scale", type=float, default=6.0)
     parser.add_argument("--z_residual_gain", type=float, default=10.0)
     parser.add_argument("--mb_bound", type=float, default=8.0)
-    parser.add_argument("--ssm_param", type=str, default="lru", choices=["lru", "tv"])
+    parser.add_argument("--ssm_param", type=str, default="lru", choices=["lru", "tv", "tvc"],
+                        help="SSM core parametrization: 'lru' (default), 'tv' (time-varying "
+                             "selective), or 'tvc' (time-varying selective, context-conditionable "
+                             "— required to use the contextual operator's 'select' port).")
+    parser.add_argument("--ssm_bcd_nonlinearity", type=str, default="tanh",
+                        choices=["tanh", "identity"],
+                        help="tvc only: nonlinearity bounding b,c,d before normalization. "
+                             "'tanh' (default) trains more stably; 'identity' is the legacy "
+                             "unbounded behavior. Ignored by lru/tv.")
     parser.add_argument("--ssm_layers", type=int, default=4)
     parser.add_argument("--ssm_d_model", type=int, default=32)
     parser.add_argument("--ssm_d_state", type=int, default=64)
@@ -179,6 +210,54 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mp_only_ssm_layers", type=int, default=None,
                         help="SSM n_layers for the M_p-only variant. "
                              "Defaults to --ssm_layers (same as factorized variant).")
+
+    # Contextual SSM variant (neural_ssm.ContextualDeepSSM from Clean_SSM / neural-ssm >= 0.4).
+    # A single context-native operator (M_p and M_b fused) that injects context through
+    # the mixer (router) / input (driver) / gate ports.  Added as an extra variant
+    # alongside the hand-rolled factorized M_b x M_p controllers.
+    parser.add_argument("--contextual_comparison", dest="contextual_comparison", action="store_true",
+                        help="Include the ContextualDeepSSM variant (default on).")
+    parser.add_argument("--no_contextual_comparison", dest="contextual_comparison", action="store_false")
+    parser.set_defaults(contextual_comparison=True)
+    parser.add_argument("--ctx_modes", type=str, default="mixer,input,gate",
+                        help="Comma-separated context ports for ContextualDeepSSM: any of "
+                             "mixer,input,gate,select.")
+    parser.add_argument("--ctx_filter", type=str, default="taper",
+                        choices=["auto", "finite_horizon", "taper", "exponential", "polynomial",
+                                 "difference", "none"],
+                        help="L2 projection for the 'input' (driver) port. Time-windowed filters "
+                             "(taper/finite_horizon/exponential/polynomial) are correct in the "
+                             "step-by-step closed loop; difference/none are not recommended there.")
+    parser.add_argument("--ctx_filter_ramp", type=int, default=20,
+                        help="Cosine roll-off length for the 'taper' filter (1..horizon). "
+                             "0 -> defaults to the full horizon.")
+    parser.add_argument("--ctx_mixer_bound", type=float, default=4.0,
+                        help="Spectral-norm bound on the mixer matrix A_t (router gain cap).")
+    parser.add_argument("--ctx_d_features", type=int, default=16,
+                        help="Core feature width fed to the mixer (analogous to feat_dim).")
+    parser.add_argument("--ctx_gamma", type=float, default=0.0,
+                        help="Prescribed L2 gain cap for the ContextualDeepSSM core. "
+                             "0 -> no cap (free finite gain, matches the other SSM variants).")
+    parser.add_argument("--ctx_gate_per_channel", dest="ctx_gate_per_channel", action="store_true",
+                        help="Per-channel (vs scalar) sigmoid gates in the 'gate' port.")
+    parser.set_defaults(ctx_gate_per_channel=False)
+    parser.add_argument("--ctx_select", dest="ctx_select", action="store_true",
+                        help="Enable the contextual 'select' port: inject context into the "
+                             "selective SSM matrices (A/B/C[/D]) via the cell param_net. "
+                             "Requires --ssm_param tv or tvc; gain-safe (no L2 projection). "
+                             "Adds 'select' to --ctx_modes if not already present.")
+    parser.set_defaults(ctx_select=False)
+
+    # Explicit variant selection. When non-empty, runs EXACTLY these variants
+    # (comma-separated, in order) and overrides the *_comparison toggles below.
+    # Example: --variants contextual_ssm   (run only the new ContextualDeepSSM variant)
+    parser.add_argument("--variants", type=str, default="",
+                        help="Comma-separated subset of variants to run, e.g. "
+                             "'contextual_ssm' or 'context,contextual_ssm'. Choices: "
+                             "nominal, disturbance_only, context, mad_context, "
+                             "mp_only_context, context_no_lift, contextual_ssm. "
+                             "Empty = use the *_comparison flags.")
+
     # Context mode (v3): full (11-D) or minimal (3-D: gate error, approach, switch age).
     parser.add_argument("--simple_comparison", dest="simple_comparison", action="store_true",
                         help="Only run two variants: disturbance-only M_p (no context) "
@@ -234,7 +313,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no_terminal_vel", dest="use_terminal_vel", action="store_false")
     parser.set_defaults(use_terminal_vel=True)
     parser.add_argument("--sample_traj_count", type=int, default=4)
-    return parser.parse_args(argv)
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
 
 
 def set_seeds(seed: int) -> None:
@@ -272,6 +355,7 @@ def find_matched_ssm_d_model(
             d_model=d_model,
             d_state=int(args.ssm_d_state),
             ff=args.ssm_ff,
+            bcd_nonlinearity=args.ssm_bcd_nonlinearity,
         ).to(device)
         if count_params(mp) >= target_params:
             return d_model
@@ -281,22 +365,68 @@ def find_matched_ssm_d_model(
     )
 
 
+def contextual_label(args=None) -> str:
+    modes = "mixer,input,gate"
+    if args is not None:
+        modes = str(getattr(args, "ctx_modes", modes))
+        if getattr(args, "ctx_select", False) and "select" not in modes.split(","):
+            modes = f"{modes},select"
+    return f"PB+SSM: ContextualDeepSSM ({modes})"
+
+
+# Canonical label for every supported variant (used by --variants selection).
+ALL_VARIANTS: dict[str, str] = {
+    "nominal": "Nominal only",
+    "disturbance_only": "PB+SSM: no context",
+    "context": "PB+SSM: factorized M_b x M_p",
+    "mad_context": "PB+SSM: MAD s=1",
+    "mp_only_context": "PB+SSM: M_p-only + lift (matched params)",
+    "context_no_lift": "PB+SSM: factorized M_b x M_p (no lift)",
+    "contextual_ssm": "PB+SSM: ContextualDeepSSM",
+}
+
+
 def variant_specs(args=None) -> list[tuple[str, str]]:
-    lift_cmp = args is not None and getattr(args, "lift_comparison", False)
-    if args is not None and getattr(args, "simple_comparison", False) and not lift_cmp:
+    # Explicit selection overrides all *_comparison toggles.
+    selection = str(getattr(args, "variants", "") or "").strip() if args is not None else ""
+    if selection:
+        chosen = [m.strip() for m in selection.split(",") if m.strip()]
+        unknown = [m for m in chosen if m not in ALL_VARIANTS]
+        if unknown:
+            raise ValueError(
+                f"Unknown variant(s) {unknown}. Choose from {list(ALL_VARIANTS)}."
+            )
         return [
+            (m, contextual_label(args) if m == "contextual_ssm" else ALL_VARIANTS[m])
+            for m in chosen
+        ]
+
+    lift_cmp = args is not None and getattr(args, "lift_comparison", False)
+    mad_cmp = args is None or getattr(args, "mad_comparison", True)
+    ctx_cmp = args is None or getattr(args, "contextual_comparison", True)
+    if args is not None and getattr(args, "simple_comparison", False) and not lift_cmp:
+        specs = [
             ("nominal", "Nominal only"),
             ("disturbance_only", "PB+SSM: no context"),
             ("context", "PB+SSM: factorized M_b x M_p"),
         ]
+        if mad_cmp:
+            specs.append(("mad_context", "PB+SSM: MAD s=1"))
+        if ctx_cmp:
+            specs.append(("contextual_ssm", contextual_label(args)))
+        return specs
     specs = [
         ("nominal", "Nominal only"),
         ("disturbance_only", "PB+SSM: no context"),
         ("context", "PB+SSM: factorized M_b x M_p"),
-        ("mp_only_context", "PB+SSM: M_p-only + lift (matched params)"),
     ]
+    if mad_cmp:
+        specs.append(("mad_context", "PB+SSM: MAD s=1"))
+    specs.append(("mp_only_context", "PB+SSM: M_p-only + lift (matched params)"))
     if args is not None and getattr(args, "lift_comparison", False):
         specs.append(("context_no_lift", "PB+SSM: factorized M_b x M_p (no lift)"))
+    if ctx_cmp:
+        specs.append(("contextual_ssm", contextual_label(args)))
     return specs
 
 
@@ -347,7 +477,7 @@ def build_gate_features(gates: np.ndarray, ema_alpha: float) -> tuple[np.ndarray
 
 
 def estimate_expected_cross_index(args: argparse.Namespace) -> int:
-    plant = DoubleIntegratorTrue(dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd))
+    plant = DoubleIntegratorTrue(dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd), drag_coeff=float(args.drag_coeff))
     start_x = 0.5 * (float(args.start_x_min) + float(args.start_x_max))
     x = torch.tensor([[[start_x, 0.0, 0.0, 0.0]]], dtype=torch.float32)
     u = torch.zeros(1, 1, 2, dtype=torch.float32)
@@ -401,6 +531,39 @@ def sample_switching_gate(
     return gate, is_adversarial
 
 
+def noise_decay_window(args: argparse.Namespace) -> np.ndarray:
+    """Multiplicative window g(t) in [0,1] applied to the process noise so the
+    reconstructed disturbance w_t fades toward 0 by the end of the horizon.
+
+    The initial-condition term (w_0 = x_0) is unaffected — only the t>=1 process
+    noise is scaled. Modes:
+      none         g=1 (stationary noise; original behaviour)
+      taper        flat 1, then a cosine roll-off to 0 over the trailing
+                   --noise_decay_ramp steps (0 -> auto = horizon//2)
+      linear       1 - t/(T-1)  (linear ramp to 0 at the last step)
+      exponential  --noise_decay_rate ** t  (anytime geometric decay)
+    """
+    T = int(args.horizon)
+    mode = str(getattr(args, "noise_decay", "none")).lower()
+    t = np.arange(T, dtype=np.float32)
+    if mode == "none":
+        return np.ones(T, dtype=np.float32)
+    if mode == "linear":
+        return np.clip(1.0 - t / max(T - 1, 1), 0.0, 1.0).astype(np.float32)
+    if mode == "exponential":
+        rate = float(getattr(args, "noise_decay_rate", 0.98))
+        return np.power(rate, t).astype(np.float32)
+    if mode == "taper":
+        ramp = int(getattr(args, "noise_decay_ramp", 0)) or max(1, T // 2)
+        ramp = min(max(ramp, 1), T)
+        flat_until = T - ramp
+        w = np.ones(T, dtype=np.float32)
+        idx = np.arange(flat_until, T, dtype=np.float32)
+        w[flat_until:] = 0.5 * (1.0 + np.cos(np.pi * (idx - flat_until) / ramp))
+        return w
+    raise ValueError(f"Unknown --noise_decay mode {mode!r}.")
+
+
 def sample_paired_process_noise(
     *,
     args: argparse.Namespace,
@@ -438,6 +601,10 @@ def sample_paired_process_noise(
     else:
         for i in range(batch_size):
             noise[i] = draw_one()
+
+    window = noise_decay_window(args)  # (horizon,) in [0, 1]
+    if not np.allclose(window, 1.0):
+        noise = noise * window[None, :, None]
     return noise
 
 
@@ -585,28 +752,132 @@ def build_context(
     return z_t.unsqueeze(1)
 
 
+def build_contextual_controller(
+    device: torch.device,
+    args: argparse.Namespace,
+) -> tuple[PBController, DoubleIntegratorTrue]:
+    """Build a PBController whose operator is a single neural_ssm.ContextualDeepSSM.
+
+    Context is injected through the ports named in --ctx_modes (mixer/input/gate/
+    select).  The SSM core reuses the shared --ssm_* sizing; the 'input' driver is
+    L2-projected by --ctx_filter, the 'mixer' router is bounded by
+    --ctx_mixer_bound, and an optional prescribed L2 cap is set via --ctx_gamma.
+    """
+    nx = 4
+    nu = 2
+    z_dim = context_dim(args)
+
+    modes = tuple(m.strip().lower() for m in str(args.ctx_modes).split(",") if m.strip())
+    if getattr(args, "ctx_select", False) and "select" not in modes:
+        modes = modes + ("select",)
+    if not modes:
+        raise ValueError("--ctx_modes must name at least one of mixer,input,gate,select.")
+    if "select" in modes and str(args.ssm_param) not in ("tv", "tvc"):
+        raise ValueError(
+            "The contextual 'select' port injects context into the selective SSM "
+            "matrices and needs a selective core. Pass --ssm_param tv or --ssm_param tvc "
+            f"(got --ssm_param {args.ssm_param!r}). Either set a selective core or drop "
+            "'select' (remove --ctx_select / remove it from --ctx_modes)."
+        )
+
+    ramp = int(args.ctx_filter_ramp)
+    ramp = ramp if ramp > 0 else None
+    gamma = float(args.ctx_gamma)
+    gamma = gamma if gamma > 0.0 else None
+
+    w_augmenter = None
+    if getattr(args, "use_w_augment", False):
+        w_augmenter = WIntegralAugmenter(decay=float(args.w_augment_decay)).to(device)
+
+    nominal_plant = DoubleIntegratorNominal(
+        dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd),
+        drag_coeff=float(args.drag_coeff),
+    )
+    true_plant = DoubleIntegratorTrue(
+        dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd),
+        drag_coeff=float(args.drag_coeff),
+    )
+
+    operator = MpContextualSSM(
+        nx,
+        z_dim,
+        nu,
+        context_modes=modes,
+        detach_state=False,
+        w_augmenter=w_augmenter,
+        # context ports
+        context_filter=args.ctx_filter,
+        horizon=int(args.horizon),
+        context_filter_ramp=ramp,
+        mixer_bound=float(args.ctx_mixer_bound),
+        d_features=int(args.ctx_d_features),
+        gate_per_channel=bool(args.ctx_gate_per_channel),
+        # shared SSM core sizing (same knobs as the other SSM variants)
+        param=args.ssm_param,
+        n_layers=int(args.ssm_layers),
+        d_model=int(args.ssm_d_model),
+        d_state=int(args.ssm_d_state),
+        ff=args.ssm_ff,
+        bcd_nonlinearity=args.ssm_bcd_nonlinearity,
+        gamma=gamma,
+    ).to(device)
+
+    controller = PBController(
+        plant=nominal_plant,
+        operator=operator,
+        u_nominal=None,
+        u_dim=nu,
+        detach_state=False,
+    ).to(device)
+
+    x_probe = torch.zeros(4, 1, nx, device=device)
+    z_probe = torch.zeros(4, 1, z_dim, device=device)
+    ok, msg = validate_component_compatibility(
+        controller=controller,
+        plant_true=true_plant,
+        x0=x_probe,
+        z0=z_probe,
+        raise_on_error=False,
+    )
+    if not ok:
+        raise RuntimeError(f"PB contextual component compatibility check failed: {msg}")
+    return controller, true_plant
+
+
 def build_controller(
     device: torch.device,
     args: argparse.Namespace,
     *,
     mp_only: bool = False,
     force_no_lift: bool = False,
+    factor_rank_override: int | None = None,
     ssm_d_model_override: int | None = None,
     ssm_layers_override: int | None = None,
+    contextual: bool = False,
 ) -> tuple[PBController, DoubleIntegratorTrue]:
     """Build a PBController + true plant.
 
     Args:
         mp_only: When True, bypass M_b and output M_p(w) directly as u_boost.
                  M_p output dim is set to nu.  Compatible with mp_context_lift.
+        factor_rank_override: Override the factorization width s. Setting this to
+                              1 recovers the MAD magnitude-and-direction policy.
         ssm_d_model_override: Override --ssm_d_model for M_p (used by mp_only_context
                               to match the factorized parameter budget).
         ssm_layers_override: Override --ssm_layers for M_p (same purpose).
+        contextual: When True, build a single neural_ssm.ContextualDeepSSM
+                    operator (M_p and M_b fused; context injected via the
+                    --ctx_modes ports) instead of the factorized M_b x M_p stack.
     """
+    if contextual:
+        return build_contextual_controller(device, args)
+
     nx = 4
     nu = 2
     z_dim = context_dim(args)
-    feat_dim = int(args.feat_dim)
+    feat_dim = int(factor_rank_override if factor_rank_override is not None else args.feat_dim)
+    if feat_dim <= 0:
+        raise ValueError(f"factorization width must be > 0, got {feat_dim}")
     mp_context_lifter = None
 
     # w augmentation doubles the operator's w input dimension
@@ -630,17 +901,19 @@ def build_controller(
             lp_p=float(args.mp_context_lp_p),
             scale=float(args.mp_context_scale),
         ).to(device)
-        mp_in_dim = nx + int(args.mp_context_lift_dim)
+        mp_in_dim = w_dim + int(args.mp_context_lift_dim)
 
     nominal_plant = DoubleIntegratorNominal(
         dt=float(args.dt),
         pre_kp=float(args.pre_kp),
         pre_kd=float(args.pre_kd),
+        drag_coeff=float(args.drag_coeff),
     )
     true_plant = DoubleIntegratorTrue(
         dt=float(args.dt),
         pre_kp=float(args.pre_kp),
         pre_kd=float(args.pre_kd),
+        drag_coeff=float(args.drag_coeff),
     )
 
     ssm_d_model = int(ssm_d_model_override if ssm_d_model_override is not None else args.ssm_d_model)
@@ -656,6 +929,7 @@ def build_controller(
         d_model=ssm_d_model,
         d_state=int(args.ssm_d_state),
         ff=args.ssm_ff,
+        bcd_nonlinearity=args.ssm_bcd_nonlinearity,
     ).to(device)
     if mp_only:
         mb = None
@@ -705,7 +979,7 @@ def rollout_nominal(
     device: torch.device,
 ) -> RolloutArtifacts:
     batch = batch.to(device)
-    plant_true = DoubleIntegratorTrue(dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd))
+    plant_true = DoubleIntegratorTrue(dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd), drag_coeff=float(args.drag_coeff))
     x = make_x0(batch, device)
     x_log = []
     u_log = []
@@ -788,7 +1062,7 @@ def rollout_variant(
             expected_cross_index=expected_cross_index,
             training=training,
         )
-    if mode in ("context", "mp_only_context", "context_no_lift"):
+    if mode in ("context", "mad_context", "mp_only_context", "context_no_lift", "contextual_ssm"):
         return rollout_pb_variant(
             args=args,
             batch=batch,
@@ -984,8 +1258,10 @@ def train_controller(
     warm_start_state: dict | None = None,
     mp_only: bool = False,
     force_no_lift: bool = False,
+    factor_rank_override: int | None = None,
     ssm_d_model_override: int | None = None,
     ssm_layers_override: int | None = None,
+    contextual: bool = False,
 ) -> tuple[PBController | None, DoubleIntegratorTrue | None, list[dict], dict]:
     if mode == "nominal":
         metrics = evaluate_variant(
@@ -1005,8 +1281,10 @@ def train_controller(
         args,
         mp_only=mp_only,
         force_no_lift=force_no_lift,
+        factor_rank_override=factor_rank_override,
         ssm_d_model_override=ssm_d_model_override,
         ssm_layers_override=ssm_layers_override,
+        contextual=contextual,
     )
     print(f"[{mode}] trainable params: {count_params(controller):,}")
 
@@ -1016,12 +1294,27 @@ def train_controller(
         print(f"[{mode}] warm-started from provided checkpoint "
               f"(missing={len(missing)}, unexpected={len(unexpected)}).")
 
-    # AdamW with separate LRs for SSM (operator.mp) and MLP operator (operator.mb + rest)
-    mp_param_ids = {id(p) for p in controller.operator.mp.parameters()}
-    param_groups = [
-        {"params": list(controller.operator.mp.parameters()), "lr": float(args.lr)},
-        {"params": [p for p in controller.parameters() if id(p) not in mp_param_ids], "lr": float(args.lr) * 0.5},
-    ]
+    # AdamW with separate LRs for the recurrent SSM core (full lr) and the
+    # surrounding bounded heads / MLP operator (half lr).
+    #   FactorizedOperator   -> SSM core is operator.mp
+    #   MpContextualSSM      -> SSM core is operator.core.core (DeepSSM inside
+    #                           ContextualDeepSSM); mixer/gate heads get half lr.
+    op = controller.operator
+    if hasattr(op, "mp") and getattr(op, "mp") is not None:
+        ssm_core = op.mp
+    elif hasattr(op, "core"):
+        ssm_core = getattr(op.core, "core", op.core)
+    else:
+        ssm_core = None
+
+    if ssm_core is not None:
+        fast_ids = {id(p) for p in ssm_core.parameters()}
+        slow_params = [p for p in controller.parameters() if id(p) not in fast_ids]
+        param_groups = [{"params": list(ssm_core.parameters()), "lr": float(args.lr)}]
+        if slow_params:
+            param_groups.append({"params": slow_params, "lr": float(args.lr) * 0.5})
+    else:
+        param_groups = [{"params": list(controller.parameters()), "lr": float(args.lr)}]
     optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-4)
 
     # Linear warmup (8 epochs) then cosine decay
@@ -1158,9 +1451,29 @@ def variant_colors() -> dict[str, str]:
         "nominal": "#4b5563",
         "disturbance_only": "#d97706",
         "context": "#0f766e",
+        "mad_context": "#2563eb",
         "mp_only_context": "#7c3aed",
         "context_no_lift": "#db2777",
+        "contextual_ssm": "#16a34a",
     }
+
+
+def reference_rollout_metrics(test_metrics: dict[str, dict]) -> dict:
+    """Return a variant's metrics whose rollout supplies shared reference geometry
+    (the wall-crossing index, identical across variants for a given scenario).
+
+    Prefers 'context' for backward-compatible plots, then any other variant that
+    was actually run — so plots still work when 'context' is not among --variants.
+    """
+    for pref in ("context", "contextual_ssm", "mad_context", "mp_only_context",
+                 "context_no_lift", "disturbance_only", "nominal"):
+        m = test_metrics.get(pref)
+        if isinstance(m, dict) and "rollout" in m:
+            return m
+    for m in test_metrics.values():
+        if isinstance(m, dict) and "rollout" in m:
+            return m
+    raise KeyError("No variant with a rollout is available for reference geometry.")
 
 
 def plot_wall_style_summary(
@@ -1186,7 +1499,7 @@ def plot_wall_style_summary(
     start_y = float(start[1])
     gate_traj = test_batch.gate_y[sample_idx].numpy()
     gate_x_ref = np.linspace(start_x, 0.0, int(args.horizon))
-    context_cross_idx = int(test_metrics["context"]["rollout"]["cross_idx"][sample_idx].item())
+    context_cross_idx = int(reference_rollout_metrics(test_metrics)["rollout"]["cross_idx"][sample_idx].item())
     gate_center = float(gate_traj[min(context_cross_idx, len(gate_traj) - 1)])
 
     ax1 = fig.add_subplot(gs[0, :])
@@ -1213,7 +1526,7 @@ def plot_wall_style_summary(
     for mode, label in variant_order:
         traj = test_metrics[mode]["rollout"]["x_seq"][sample_idx, :, :2].numpy()
         traj_full = np.vstack([start, traj])
-        lw = 2.6 if mode in ("context", "mp_only_context") else 2.0
+        lw = 2.6 if mode in ("context", "mad_context", "mp_only_context", "contextual_ssm") else 2.0
         ax1.plot(traj_full[:, 0], traj_full[:, 1], color=colors[mode], lw=lw, label=label)
 
     ax1.scatter([start_x], [start_y], color="#6b7280", s=36, zorder=4, label="Start")
@@ -1396,7 +1709,7 @@ def plot_trajectory_samples(
     axes_flat = axes.ravel()
 
     for ax, idx in zip(axes_flat, idxs):
-        ctx_roll = test_metrics["context"]["rollout"]
+        ctx_roll = reference_rollout_metrics(test_metrics)["rollout"]
         cross_idx = int(ctx_roll["cross_idx"][idx].item())
         gate_center = float(test_batch.gate_y[idx, cross_idx].item())
         draw_wall(ax, float(args.wall_x), gate_center, float(args.gate_half_width), float(args.corridor_limit))
@@ -1437,7 +1750,7 @@ def plot_waiting_behavior(
     plt = get_plt(show_plots)
     setup_plot_style(plt)
 
-    roll      = test_metrics["context"]["rollout"]
+    roll      = reference_rollout_metrics(test_metrics)["rollout"]
     x_seq_t   = roll["x_seq"]                          # (B, T, 4)
     cross_idx = roll["cross_idx"]                       # (B,)
     B, T, _   = x_seq_t.shape
@@ -1700,7 +2013,7 @@ def _animate_one_sample(
     trail_lines: dict[str, object] = {}
     dots: dict[str, object] = {}
     for mode, lbl in variant_order:
-        lw = 2.8 if mode in ("context", "mp_only_context") else 1.8
+        lw = 2.8 if mode in ("context", "mad_context", "mp_only_context", "contextual_ssm") else 1.8
         outcome = _outcome(mode)
         ln, = ax_arena.plot([], [], color=colors[mode], lw=lw, zorder=4,
                             label=f"{lbl}  {outcome}",
@@ -1746,7 +2059,7 @@ def _animate_one_sample(
     y_lines: dict[str, tuple] = {}
     for mode, lbl in variant_order:
         y_seq = trajs[mode][1:, 1]
-        lw = 2.4 if mode in ("context", "mp_only_context") else 1.6
+        lw = 2.4 if mode in ("context", "mad_context", "mp_only_context", "contextual_ssm") else 1.6
         ln, = ax_time.plot([], [], color=colors[mode], lw=lw, label=lbl)
         y_lines[mode] = (ln, y_seq)
 
@@ -1868,7 +2181,7 @@ def animate_adversarial_sample(
     # Pick the adversarial sample with the best (lowest) final position error
     # for the first available context variant, so the GIF shows informative behaviour.
     primary_mode = next(
-        (m for m, _ in variant_order if m in ("context", "mp_only_context", "disturbance_only")),
+        (m for m, _ in variant_order if m in ("context", "mad_context", "mp_only_context", "contextual_ssm", "disturbance_only")),
         variant_order[0][0],
     )
     x_seq = test_metrics[primary_mode]["rollout"]["x_seq"]  # (B, T, 4)
@@ -2012,7 +2325,7 @@ def plot_adversarial_switching(
                 xy = test_metrics[mode]["rollout"]["x_seq"][idx, :, :2].numpy()
                 start = test_batch.start[idx].numpy()
                 traj = np.vstack([start, xy])
-                lw = 2.2 if mode in ("context", "mp_only_context") else 1.4
+                lw = 2.2 if mode in ("context", "mad_context", "mp_only_context", "contextual_ssm") else 1.4
                 ax_traj.plot(traj[:, 0], traj[:, 1], color=colors[mode], lw=lw,
                              alpha=0.8, label=label if idx == int(adv_indices[0]) else "")
         corr_adv = float(args.corridor_limit)
@@ -2085,7 +2398,8 @@ def plot_sample_trajectory(
 
     # Helper: extend a trajectory past the control horizon using zero-input nominal dynamics
     nominal_plant_ext = DoubleIntegratorNominal(
-        dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd)
+        dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd),
+        drag_coeff=float(args.drag_coeff),
     )
 
     def extend_traj(xy: np.ndarray) -> np.ndarray:
@@ -2654,8 +2968,12 @@ def build_interpretation(test_metrics: dict[str, dict]) -> str:
     lines = []
     if "context" in test_metrics:
         lines.append(f"Factorized M_b x M_p: success rate {test_metrics['context']['success_rate']:.3f}")
+    if "mad_context" in test_metrics:
+        lines.append(f"MAD s=1: {test_metrics['mad_context']['success_rate']:.3f}")
     if "mp_only_context" in test_metrics:
         lines.append(f"M_p-only (matched params): {test_metrics['mp_only_context']['success_rate']:.3f}")
+    if "contextual_ssm" in test_metrics:
+        lines.append(f"ContextualDeepSSM: {test_metrics['contextual_ssm']['success_rate']:.3f}")
     if "disturbance_only" in test_metrics:
         lines.append(f"Disturbance-only PB+SSM: {test_metrics['disturbance_only']['success_rate']:.3f}")
     if "nominal" in test_metrics:
@@ -2692,6 +3010,10 @@ def main() -> None:
             for k, v in saved_cfg.items():
                 if f"--{k}" not in cli_overrides and hasattr(args, k):
                     setattr(args, k, v)
+            if "--no_mad_comparison" in cli_overrides:
+                args.mad_comparison = False
+            if "mad_comparison" not in saved_cfg and "--mad_comparison" not in cli_overrides:
+                args.mad_comparison = False
             print(f"[plot_only] Loaded config from {config_path}")
         else:
             print(f"[plot_only] Warning: no config.json found in {run_dir}, using current args.")
@@ -2728,7 +3050,15 @@ def main() -> None:
         for mode, label in specs:
             pt_path = run_dir / f"{mode}_controller.pt"
             use_mp_only = (mode == "mp_only_context")
-            controller, plant_true = build_controller(device, args, mp_only=use_mp_only)
+            use_mad = (mode == "mad_context")
+            use_contextual = (mode == "contextual_ssm")
+            controller, plant_true = build_controller(
+                device,
+                args,
+                mp_only=use_mp_only,
+                factor_rank_override=1 if use_mad else None,
+                contextual=use_contextual,
+            )
             if pt_path.exists():
                 controller.load_state_dict(torch.load(pt_path, map_location=device))
                 print(f"[plot_only] Loaded {pt_path.name}")
@@ -2811,7 +3141,8 @@ def main() -> None:
         del _tmp_ctrl
 
         nx = 4
-        mp_in_dim_with_lift = nx + (int(args.mp_context_lift_dim) if bool(args.mp_context_lift) else 0)
+        base_w_dim = nx * 2 if getattr(args, "use_w_augment", False) else nx
+        mp_in_dim_with_lift = base_w_dim + (int(args.mp_context_lift_dim) if bool(args.mp_context_lift) else 0)
         if args.mp_only_ssm_d_model is not None:
             mp_only_d_model = int(args.mp_only_ssm_d_model)
             print(f"[v3] M_p-only SSM d_model overridden to {mp_only_d_model} (manual).")
@@ -2836,6 +3167,8 @@ def main() -> None:
             print("[context] warm-starting from disturbance_only checkpoint.")
         use_mp_only = (mode == "mp_only_context")
         use_no_lift = (mode == "context_no_lift")
+        use_mad = (mode == "mad_context")
+        use_contextual = (mode == "contextual_ssm")
         controller, plant_true, history, best_val_metrics = train_controller(
             args=args,
             device=device,
@@ -2845,8 +3178,10 @@ def main() -> None:
             warm_start_state=warm_start,
             mp_only=use_mp_only,
             force_no_lift=use_no_lift,
+            factor_rank_override=1 if use_mad else None,
             ssm_d_model_override=mp_only_d_model if use_mp_only else None,
             ssm_layers_override=mp_only_layers if use_mp_only else None,
+            contextual=use_contextual,
         )
         controllers[mode] = controller
         plants[mode] = plant_true
