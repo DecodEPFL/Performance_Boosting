@@ -30,6 +30,11 @@ LOG_DIR = EXP_DIR / ".launch_logs"
 for _d in (RUNS_DIR, LOG_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
+# Optional user-saved launcher defaults (written by the "Save as defaults" button).
+# These only pre-fill the form; the CLI script's argparse defaults and each run's
+# saved config.json are left untouched.
+DEFAULTS_FILE = EXP_DIR / "ui_defaults.json"
+
 # Flags handled specially / outside the auto-generated form.
 # The *_comparison toggles and the raw --variants string are superseded by the
 # explicit variant checkbox picker (see the "Variants to run" section below).
@@ -37,6 +42,8 @@ SKIP_DESTS = {
     "no_show_plots", "plot_only", "help",
     "variants", "simple_comparison", "mad_comparison",
     "contextual_comparison", "lift_comparison",
+    # Handled by the custom Experiment selector + Context-signal checkboxes.
+    "gate_motion", "context_features", "context_mode",
 }
 DEVICE_CHOICES = ["cpu", "cuda", "mps"]
 
@@ -58,10 +65,10 @@ GROUPS = [
         "horizon", "plot_horizon", "use_plot_horizon", "dt", "pre_kp", "pre_kd", "drag_coeff",
         "wall_x", "gate_half_width", "gate_amplitude", "goal_tol", "corridor_limit",
         "wall_focus_sigma", "gate_settle_steps"}, False),
-    ("Gate schedule", lambda d: d.startswith("gate_dwell"), False),
+    ("Gate schedule / motion", lambda d: d.startswith("gate_dwell") or d in {"gate_corr_time", "gate_range", "gate_center_range"}, False),
     ("Disturbance process", lambda d: d.startswith("noise_") or d.startswith("gust_"), False),
     ("Loss weights", lambda d: d.endswith("_weight") or d.endswith("_sharpness")
-        or d in {"use_terminal_vel", "sample_traj_count"}, False),
+        or d in {"use_terminal_vel", "sample_traj_count", "gate_margin_train"}, False),
 ]
 
 
@@ -163,27 +170,89 @@ def get_variant_options():
     return opts
 
 
-def render_widget(dest, bools, values):
-    """Render one widget; return the raw widget value."""
+# ── Experiment selector + per-experiment parameter / context gating ──────────
+EXPERIMENTS = {
+    "Switching gate (original)": "switch",
+    "Continuous gate · OU (new)": "continuous",
+}
+# Params that apply to only one gate-motion regime (hidden for the other).
+SWITCH_ONLY_DESTS = {"gate_dwell_min", "gate_dwell_max", "gate_settle_steps"}
+CONTINUOUS_ONLY_DESTS = {"gate_corr_time", "gate_range", "gate_center_range", "gate_margin_train"}
+
+
+@st.cache_resource(show_spinner=False)
+def get_context_meta():
+    """(order, meta, fair_default) for context features, from the experiment module."""
+    if str(EXP_DIR) not in sys.path:
+        sys.path.insert(0, str(EXP_DIR))
+    import Moving_gate_exp as M
+    return list(M.CONTEXT_FEATURE_ORDER), dict(M.CONTEXT_FEATURE_META), list(M.FAIR_CONTEXT_DEFAULT)
+
+
+def param_applies(dest: str, exp_key: str) -> bool:
+    if dest in SWITCH_ONLY_DESTS:
+        return exp_key == "switch"
+    if dest in CONTINUOUS_ONLY_DESTS:
+        return exp_key == "continuous"
+    return True
+
+
+_NO_OVERRIDE = object()
+
+
+def load_ui_defaults() -> dict:
+    """Return saved form-default overrides as {'params': {...}, 'variants': {...}}.
+
+    Empty dict if no saved file. These pre-fill the launcher only.
+    """
+    try:
+        data = json.loads(DEFAULTS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_ui_defaults(params: dict, variants: dict, context: dict | None = None,
+                     experiment: str | None = None) -> None:
+    payload = {"params": params, "variants": variants}
+    if context is not None:
+        payload["context"] = context
+    if experiment is not None:
+        payload["experiment"] = experiment
+    DEFAULTS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def render_widget(dest, bools, values, override=_NO_OVERRIDE):
+    """Render one widget; return the raw widget value.
+
+    ``override`` (when not ``_NO_OVERRIDE``) replaces the parser default as the
+    widget's initial value — used to apply user-saved launcher defaults.
+    """
+    has_ovr = override is not _NO_OVERRIDE
     if dest in bools:
         e = bools[dest]
-        return st.checkbox(dest, value=bool(e["default"]), help=e["help"], key=f"w_{dest}")
+        val = bool(override) if has_ovr else bool(e["default"])
+        return st.checkbox(dest, value=val, help=e["help"], key=f"w_{dest}")
     e = values[dest]
     default, tname, choices, helptext = e["default"], e["type"], e["choices"], e["help"]
     if dest == "device" and not choices:
         choices = DEVICE_CHOICES
     if choices:
-        idx = choices.index(default) if default in choices else 0
+        cur = override if has_ovr else default
+        idx = choices.index(cur) if cur in choices else 0
         return st.selectbox(dest, choices, index=idx, help=helptext, key=f"w_{dest}")
     if tname == "int":
         if default is None:
-            return st.text_input(f"{dest} (blank = auto)", value="", help=helptext, key=f"w_{dest}")
-        return st.number_input(dest, value=int(default), step=1, help=helptext, key=f"w_{dest}")
+            val = str(override) if (has_ovr and override not in (None, "")) else ""
+            return st.text_input(f"{dest} (blank = auto)", value=val, help=helptext, key=f"w_{dest}")
+        val = int(override) if has_ovr else int(default)
+        return st.number_input(dest, value=val, step=1, help=helptext, key=f"w_{dest}")
     if tname == "float":
         # text input preserves scientific notation / exact small values
-        return st.text_input(dest, value=str(default), help=helptext, key=f"w_{dest}")
-    return st.text_input(dest, value="" if default is None else str(default),
-                         help=helptext, key=f"w_{dest}")
+        val = str(override) if has_ovr else str(default)
+        return st.text_input(dest, value=val, help=helptext, key=f"w_{dest}")
+    val = str(override) if has_ovr else ("" if default is None else str(default))
+    return st.text_input(dest, value=val, help=helptext, key=f"w_{dest}")
 
 
 def build_argv(order, bools, values, widget_vals, run_id):
@@ -277,6 +346,32 @@ def main():
         if specs_error is not None:
             st.error(f"Could not import the experiment / build the parser:\n\n{specs_error}")
         else:
+            saved_defaults = load_ui_defaults()
+            param_overrides = saved_defaults.get("params", {}) or {}
+            variant_overrides = saved_defaults.get("variants", {}) or {}
+            ctx_overrides = saved_defaults.get("context", {}) or {}
+            exp_override = saved_defaults.get("experiment")
+
+            # Experiment selector lives OUTSIDE the form so changing it re-renders
+            # the form (different gate params + context options) immediately.
+            exp_labels = list(EXPERIMENTS.keys())
+            _exp_idx = exp_labels.index(exp_override) if exp_override in exp_labels else 0
+            exp_label = st.radio(
+                "🧪 Experiment", exp_labels, index=_exp_idx, horizontal=True,
+                key="experiment_radio",
+                help="Switching gate = original piecewise schedule with a pre-crossing "
+                     "freeze. Continuous gate = Ornstein–Uhlenbeck drift that never settles; "
+                     "the controller must infer the motion from history.",
+            )
+            exp_key = EXPERIMENTS[exp_label]
+            ctx_order, ctx_meta, fair_default = get_context_meta()
+            ctx_feats = [k for k in ctx_order if exp_key in ctx_meta[k][2]]
+
+            def _ctx_default(feature: str) -> bool:
+                if exp_key == "continuous":
+                    return feature in fair_default
+                return feature in ("gate_error", "approach", "switch_age")  # legacy minimal
+
             assigned: set[str] = set()
             with st.form("launch_form", border=False):
                 st.markdown("#### ① Variants to run")
@@ -286,48 +381,113 @@ def main():
                 for i, (vkey, vlabel) in enumerate(vopts):
                     vcols[i % 3].checkbox(
                         vlabel,
-                        value=(vkey in VARIANT_DEFAULT_ON),
+                        value=bool(variant_overrides.get(vkey, vkey in VARIANT_DEFAULT_ON)),
                         help=VARIANT_HELP.get(vkey),
                         key=f"var_{vkey}",
                     )
                 st.divider()
-                st.markdown("#### ② Parameters")
+
+                st.markdown("#### ② Context signal")
+                st.caption("Pick what information the controller receives. Causal gate-motion "
+                           "signals are fair; schedule/noncausal features stay privileged.")
+                fair_keys = [k for k in ctx_feats if ctx_meta[k][0] == "fair"]
+                priv_keys = [k for k in ctx_feats if ctx_meta[k][0] == "privileged"]
+                xc1, xc2 = st.columns(2)
+                xc1.markdown("**Fair** — observation, causal motion + own state")
+                for k in fair_keys:
+                    xc1.checkbox(
+                        ctx_meta[k][1],
+                        value=bool(ctx_overrides.get(k, _ctx_default(k))),
+                        key=f"ctx_{k}",
+                    )
+                xc2.markdown("**Privileged** — schedule / noncausal ⚠️ cheating")
+                for k in priv_keys:
+                    xc2.checkbox(
+                        "⚠️ " + ctx_meta[k][1],
+                        value=bool(ctx_overrides.get(k, _ctx_default(k))),
+                        key=f"ctx_{k}",
+                    )
+                st.divider()
+
+                st.markdown("#### ③ Parameters")
                 c1, c2 = st.columns(2)
                 halves = (GROUPS[: len(GROUPS) // 2 + 1], GROUPS[len(GROUPS) // 2 + 1:])
                 for col, half in ((c1, halves[0]), (c2, halves[1])):
                     with col:
                         for title, pred, expanded in half:
-                            members = [d for d in order if d not in assigned and pred(d)]
+                            members = [d for d in order if d not in assigned
+                                       and pred(d) and param_applies(d, exp_key)]
                             if not members:
                                 continue
                             assigned.update(members)
                             with st.expander(title, expanded=expanded):
                                 for d in members:
-                                    render_widget(d, bools, values)
-                leftover = [d for d in order if d not in assigned]
+                                    render_widget(d, bools, values,
+                                                  param_overrides.get(d, _NO_OVERRIDE))
+                leftover = [d for d in order if d not in assigned
+                            and param_applies(d, exp_key)]
                 if leftover:
                     with c2:
                         with st.expander("Other", expanded=False):
                             for d in leftover:
-                                render_widget(d, bools, values)
-                submitted = st.form_submit_button(
+                                render_widget(d, bools, values,
+                                              param_overrides.get(d, _NO_OVERRIDE))
+                _bc1, _bc2 = st.columns([2, 2])
+                submitted = _bc1.form_submit_button(
                     "🚀 Launch run", type="primary", width="stretch")
+                save_clicked = _bc2.form_submit_button(
+                    "💾 Save current values as defaults", width="stretch")
+
+            active_order = [d for d in order if param_applies(d, exp_key)]
+
+            if save_clicked:
+                params = {d: st.session_state.get(f"w_{d}")
+                          for d in active_order if d != "run_id"}
+                variants = {k: bool(st.session_state.get(f"var_{k}"))
+                            for k, _ in get_variant_options()}
+                context = {k: bool(st.session_state.get(f"ctx_{k}")) for k in ctx_feats}
+                save_ui_defaults(params, variants, context=context, experiment=exp_label)
+                st.success(
+                    f"Saved current values as defaults → `{DEFAULTS_FILE.name}` "
+                    f"(experiment: {exp_label}). New launcher sessions start from these; "
+                    "the CLI script's own defaults are unchanged.")
+
+            if DEFAULTS_FILE.exists():
+                _rc1, _rc2 = st.columns([3, 1])
+                _rc1.caption(f"📌 Custom launcher defaults active — `{DEFAULTS_FILE.name}`.")
+                if _rc2.button("↩︎ Reset to built-in", width="stretch"):
+                    DEFAULTS_FILE.unlink(missing_ok=True)
+                    for _d in order:
+                        st.session_state.pop(f"w_{_d}", None)
+                    for _k, _ in get_variant_options():
+                        st.session_state.pop(f"var_{_k}", None)
+                    for _k in ctx_order:
+                        st.session_state.pop(f"ctx_{_k}", None)
+                    st.session_state.pop("experiment_radio", None)
+                    st.toast("Reset to built-in defaults.")
+                    _rerun()
 
             if submitted:
-                widget_vals = {d: st.session_state.get(f"w_{d}") for d in order}
+                widget_vals = {d: st.session_state.get(f"w_{d}") for d in active_order}
                 run_id = (widget_vals.get("run_id") or "").strip() or f"ui_{datetime.now():%Y%m%d_%H%M%S}"
                 selected = [k for k, _ in get_variant_options() if st.session_state.get(f"var_{k}")]
+                ctx_selected = [k for k in ctx_feats if st.session_state.get(f"ctx_{k}")]
                 if not selected:
                     st.error("Select at least one variant to run under ① above.")
+                elif not ctx_selected:
+                    st.error("Select at least one context feature under ② above.")
                 else:
-                    argv, warns = build_argv(order, bools, values, widget_vals, run_id)
+                    argv, warns = build_argv(active_order, bools, values, widget_vals, run_id)
+                    argv += ["--gate_motion", exp_key]
+                    argv += ["--context_features", ",".join(ctx_selected)]
                     argv += ["--variants", ",".join(selected)]
                     for w in warns:
                         st.warning(w)
                     launch(argv, run_id)
                     st.success(
-                        f"Launched **{run_id}** — {len(selected)} variant(s): "
-                        f"{', '.join(selected)}  (PID {st.session_state['proc'].pid}).")
+                        f"Launched **{run_id}** — {exp_label}; {len(selected)} variant(s): "
+                        f"{', '.join(selected)}; context [{', '.join(ctx_selected)}]  "
+                        f"(PID {st.session_state['proc'].pid}).")
 
             proc = st.session_state.get("proc")
             if proc is not None:

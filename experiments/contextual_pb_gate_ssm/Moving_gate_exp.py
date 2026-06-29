@@ -84,6 +84,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser("2D contextual PB gate experiment with PBController + SSM")
     parser.add_argument("--seed", type=int, default=25)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--tf32", dest="tf32", action="store_true",
+                        help="On CUDA: allow TF32 matmul/cudnn kernels (faster on "
+                             "Ampere+ GPUs, negligible precision loss). Default on; "
+                             "ignored on CPU.")
+    parser.add_argument("--no_tf32", dest="tf32", action="store_false",
+                        help="Disable TF32; use full FP32 matmuls on CUDA.")
+    parser.set_defaults(tf32=True)
     parser.add_argument("--train_batch", type=int, default=512)
     parser.add_argument("--val_batch", type=int, default=512)
     parser.add_argument("--test_batch", type=int, default=1024)
@@ -146,6 +153,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--corridor_limit", type=float, default=1.6)
     parser.add_argument("--wall_focus_sigma", type=float, default=0.14)
     parser.add_argument("--gate_settle_steps", type=int, default=2)
+
+    # Gate motion: 'switch' (original piecewise-constant schedule + pre-crossing
+    # freeze) or 'continuous' (Ornstein-Uhlenbeck drift that never settles).
+    parser.add_argument("--gate_motion", type=str, default="switch",
+                        choices=["switch", "continuous"],
+                        help="Gate-center dynamics. 'switch' = original schedule with a "
+                             "pre-crossing freeze; 'continuous' = OU drift (no freeze, no "
+                             "discrete switches) so the controller must infer motion from "
+                             "the observation history.")
+    parser.add_argument("--gate_corr_time", type=float, default=40.0,
+                        help="continuous only: gate-motion smoothness as an OU correlation "
+                             "time in steps. LARGER = slower, smoother drift; smaller = "
+                             "faster, jerkier (theta = 1 - exp(-1/corr_time)).")
+    parser.add_argument("--gate_range", type=float, default=0.50,
+                        help="continuous only: within-episode roaming amplitude (OU "
+                             "stationary std), same units as the gate center, clamped to "
+                             "+/- gate_amplitude. Independent of --gate_corr_time.")
+    parser.add_argument("--gate_center_range", type=float, default=0.35,
+                        help="continuous only: per-episode random reversion center, as a "
+                             "fraction of gate_amplitude. 0 = every episode centered on the "
+                             "wall middle (gate hugs center); larger = different episodes "
+                             "settle around different heights, so the gate covers more "
+                             "vertical space and the controller can't just park at center.")
+    parser.add_argument("--gate_margin_train", type=float, default=0.04,
+                        help="continuous only: safety margin subtracted from "
+                             "--gate_half_width inside the training collision loss. "
+                             "Evaluation still uses the real gate width; set 0 to disable.")
 
     # Gate schedule.
     parser.add_argument("--gate_dwell_min", type=int, default=6)
@@ -269,7 +303,15 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["full", "minimal"],
                         help="Context feature set fed to the PB operator. "
                              "'full' uses all 11 features; 'minimal' uses only "
-                             "[gate_error_t, approach_t, switch_age_t] (3-D).")
+                             "[gate_error_t, approach_t, switch_age_t] (3-D). "
+                             "Superseded by --context_features when that is non-empty.")
+    parser.add_argument("--context_features", type=str, default="",
+                        help="Explicit comma-separated context features, e.g. "
+                             "'gate_obs,gate_error,approach'. Overrides --context_mode when "
+                             "non-empty; emitted in a fixed canonical order. Choices: "
+                             + ",".join(CONTEXT_FEATURE_ORDER) + ". 'Fair' features "
+                             "(observation + own state) vs 'privileged' (gate dynamics / "
+                             "schedule = cheating) are documented in CONTEXT_FEATURE_META.")
     parser.add_argument("--mp_context_lift", dest="mp_context_lift", action="store_true")
     parser.add_argument("--no_mp_context_lift", dest="mp_context_lift", action="store_false")
     parser.set_defaults(mp_context_lift=True)
@@ -323,6 +365,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def set_seeds(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def to_python_float(value) -> float:
@@ -430,14 +474,72 @@ def variant_specs(args=None) -> list[tuple[str, str]]:
     return specs
 
 
-FULL_CONTEXT_DIM = 11
-MINIMAL_CONTEXT_DIM = 3  # [gate_error_t, approach_t, switch_age_t]
+# Canonical context-feature layout. This ORDER defines the context-vector layout
+# and must stay fixed (operator input weights depend on it); it matches the
+# original 11-feature 'full' context exactly.
+CONTEXT_FEATURE_ORDER = [
+    "gate_obs", "gate_vel", "gate_ema", "gate_slow_ema", "gate_error",
+    "rel_wall_x", "goal_dx", "goal_dy", "approach", "switch_age", "time_to_wall",
+]
+# key -> (group, human label, experiments-it-applies-to). 'fair' = observation +
+# own state + known geometry; 'privileged' = gate dynamics / schedule ("cheating").
+CONTEXT_FEATURE_META = {
+    "gate_obs":      ("fair",       "Observed gate center y",                ("switch", "continuous")),
+    "gate_vel":      ("fair",       "Causal observed gate velocity",         ("switch", "continuous")),
+    "gate_ema":      ("fair",       "Causal gate EMA (fast)",                ("switch", "continuous")),
+    "gate_slow_ema": ("fair",       "Causal gate EMA (slow)",                ("switch", "continuous")),
+    "gate_error":    ("fair",       "Gate error (y_robot - gate_obs)",       ("switch", "continuous")),
+    "rel_wall_x":    ("fair",       "Distance to wall (x)",                  ("switch", "continuous")),
+    "goal_dx":       ("fair",       "Goal offset x",                         ("switch", "continuous")),
+    "goal_dy":       ("fair",       "Goal offset y",                         ("switch", "continuous")),
+    "approach":      ("fair",       "Approach weight (near wall)",           ("switch", "continuous")),
+    "switch_age":    ("privileged", "Steps since last gate switch",          ("switch",)),
+    "time_to_wall":  ("privileged", "Normalized time-to-wall (schedule)",    ("switch", "continuous")),
+}
+# Default fair set for the continuous experiment: observation, causal gate-motion
+# history, own state, and known geometry.
+FAIR_CONTEXT_DEFAULT = [
+    "gate_obs", "gate_vel", "gate_ema", "gate_error",
+    "rel_wall_x", "goal_dx", "goal_dy", "approach",
+]
+_FULL_FEATURES = list(CONTEXT_FEATURE_ORDER)
+_MINIMAL_FEATURES = ["gate_error", "approach", "switch_age"]  # legacy --context_mode minimal
+
+FULL_CONTEXT_DIM = len(_FULL_FEATURES)
+MINIMAL_CONTEXT_DIM = len(_MINIMAL_FEATURES)
+
+
+def is_continuous_gate(args: argparse.Namespace | None) -> bool:
+    return str(getattr(args, "gate_motion", "switch")).lower() == "continuous"
+
+
+def resolve_context_features(args=None) -> list[str]:
+    """Active context features in canonical order.
+
+    --context_features (comma-separated) is authoritative when set; otherwise
+    fall back to the legacy --context_mode (full/minimal). Continuous-gate
+    runs default to the fair observation/state set instead of legacy
+    switch_age-based minimal context.
+    """
+    raw = str(getattr(args, "context_features", "") or "").strip() if args is not None else ""
+    if raw:
+        sel = {f.strip() for f in raw.split(",") if f.strip()}
+        unknown = sel - set(CONTEXT_FEATURE_ORDER)
+        if unknown:
+            raise ValueError(
+                f"Unknown context feature(s) {sorted(unknown)}. "
+                f"Choose from {CONTEXT_FEATURE_ORDER}."
+            )
+        return [k for k in CONTEXT_FEATURE_ORDER if k in sel]
+    if args is not None and is_continuous_gate(args) and getattr(args, "context_mode", "full") == "minimal":
+        return list(FAIR_CONTEXT_DEFAULT)
+    if args is not None and getattr(args, "context_mode", "full") == "minimal":
+        return list(_MINIMAL_FEATURES)
+    return list(_FULL_FEATURES)
 
 
 def context_dim(args=None) -> int:
-    if args is not None and getattr(args, "context_mode", "full") == "minimal":
-        return MINIMAL_CONTEXT_DIM
-    return FULL_CONTEXT_DIM
+    return len(resolve_context_features(args))
 
 
 def epochs_for_mode(args: argparse.Namespace, mode: str) -> int:
@@ -450,7 +552,7 @@ def build_gate_features(gates: np.ndarray, ema_alpha: float) -> tuple[np.ndarray
     gate_velocity = np.zeros_like(gates, dtype=np.float32)
     if gates.shape[1] > 1:
         gate_velocity[:, 1:] = gates[:, 1:] - gates[:, :-1]
-        gate_velocity[:, 0] = gate_velocity[:, 1]
+        gate_velocity[:, 0] = 0.0
 
     gate_ema = np.zeros_like(gates, dtype=np.float32)
     gate_ema[:, 0] = gates[:, 0]
@@ -529,6 +631,47 @@ def sample_switching_gate(
         is_adversarial = True
     gate[freeze_step:] = gate[freeze_step - 1]
     return gate, is_adversarial
+
+
+def sample_continuous_gate(
+    args: argparse.Namespace,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, bool]:
+    """Ornstein-Uhlenbeck gate center over the full horizon (continuous experiment).
+
+    Three intuitive, decoupled knobs:
+      --gate_corr_time   : correlation time tau (steps). Larger = slower, smoother.
+      --gate_range       : within-episode roaming std around this episode's center.
+      --gate_center_range: per-episode random center spread (fraction of amplitude),
+                           so different episodes explore different heights.
+
+    Discretized as g_{t+1} = mu + (1 - theta)*(g_t - mu) + sigma * N(0, 1) with
+    theta = 1 - exp(-1/tau), sigma = gate_range * sqrt(2*theta - theta^2), and a
+    per-episode reversion center mu ~ U(-c*amp, c*amp) (c = gate_center_range).
+    Within an episode the std around mu is gate_range; across episodes mu roams,
+    so the marginal vertical coverage is wider and not biased to the wall center.
+    Never freezes or switches discretely, so the controller must infer the motion
+    from history. Clamped to +/- gate_amplitude. Returns (gate, is_adversarial=
+    False) to match sample_switching_gate's signature.
+    """
+    T = int(args.horizon)
+    amp = float(args.gate_amplitude)
+    tau = max(1.0, float(args.gate_corr_time))
+    rng_std = float(args.gate_range)
+    center_frac = float(getattr(args, "gate_center_range", 0.0))
+    theta = 1.0 - float(np.exp(-1.0 / tau))
+    sigma = rng_std * float(np.sqrt(max(2.0 * theta - theta * theta, 1e-8)))
+    # Per-episode reversion center: different episodes settle around different
+    # heights, so the dataset covers the full vertical extent of the wall.
+    mu = float(rng.uniform(-center_frac * amp, center_frac * amp))
+    gate = np.zeros(T, dtype=np.float32)
+    g = mu + float(rng.normal(scale=rng_std))       # start from the stationary distribution
+    gate[0] = float(np.clip(g, -amp, amp))
+    for t in range(1, T):
+        g = mu + (1.0 - theta) * (g - mu) + sigma * float(rng.standard_normal())
+        g = float(np.clip(g, -amp, amp))
+        gate[t] = g
+    return gate, False
 
 
 def noise_decay_window(args: argparse.Namespace) -> np.ndarray:
@@ -633,7 +776,10 @@ def sample_batch(
     for pair_idx in range(base_count):
         start_x = float(rng.uniform(float(args.start_x_min), float(args.start_x_max)))
         start_y = float(rng.uniform(-float(args.start_y_max), float(args.start_y_max)))
-        gate, is_adv = sample_switching_gate(args, rng, freeze_step)
+        if is_continuous_gate(args):
+            gate, is_adv = sample_continuous_gate(args, rng)
+        else:
+            gate, is_adv = sample_switching_gate(args, rng, freeze_step)
 
         if paired:
             starts.extend([[start_x, start_y], [start_x, start_y]])
@@ -719,36 +865,32 @@ def build_context(
     x_scale = max(float(args.start_x_max), abs(float(args.wall_x)), 1.0)
     y_scale = max(float(args.corridor_limit), abs(float(args.gate_amplitude)), 1.0)
     age_scale = max(float(args.horizon), 1.0)
-    z_t = torch.cat(
-        [
-            gate_t / y_scale,
-            gate_v_t / y_scale,
-            gate_ema_t / y_scale,
-            gate_slow_ema_t / y_scale,
-            gate_error / y_scale,
-            rel_wall_x / x_scale,
-            goal_dx / x_scale,
-            goal_dy / y_scale,
-            approach,
-            switch_age_t / age_scale,
-            time_to_wall,
-        ],
-        dim=-1,
-    )
-    if getattr(args, "context_mode", "full") == "minimal":
-        # Minimal context: gate error, spatial approach weight, gate switch age.
-        # All three are observable without privileged knowledge of the freeze schedule.
-        z_t = torch.cat([gate_error / y_scale, approach, switch_age_t / age_scale], dim=-1)
-        return float(args.z_scale) * z_t.unsqueeze(1)
-
-    z_t = float(args.z_scale) * z_t
-    # Context dropout: randomly zero gate-related features during training.
-    # Forces the SSM to rely on history rather than instantaneous observations.
+    feat_map = {
+        "gate_obs": gate_t / y_scale,
+        "gate_vel": gate_v_t / y_scale,
+        "gate_ema": gate_ema_t / y_scale,
+        "gate_slow_ema": gate_slow_ema_t / y_scale,
+        "gate_error": gate_error / y_scale,
+        "rel_wall_x": rel_wall_x / x_scale,
+        "goal_dx": goal_dx / x_scale,
+        "goal_dy": goal_dy / y_scale,
+        "approach": approach,
+        "switch_age": switch_age_t / age_scale,
+        "time_to_wall": time_to_wall,
+    }
+    feats = resolve_context_features(args)
+    z_t = float(args.z_scale) * torch.cat([feat_map[k] for k in feats], dim=-1)
+    # Context dropout: during training, randomly zero the gate-OBSERVATION features
+    # together (per sample) so the SSM must rely on history. Own-state features
+    # (rel_wall_x, goal_*, approach) and schedule features are never dropped.
     dropout_p = float(args.context_dropout_p)
     if training and dropout_p > 0.0:
-        # Per-sample mask: drop all gate features (indices 0–4) simultaneously
-        mask = (torch.rand(z_t.shape[0], device=z_t.device) > dropout_p).float()
-        z_t[:, :5] = z_t[:, :5] * mask.unsqueeze(-1)
+        gate_obs_keys = {"gate_obs", "gate_vel", "gate_ema", "gate_slow_ema", "gate_error"}
+        gate_idx = [i for i, k in enumerate(feats) if k in gate_obs_keys]
+        if gate_idx:
+            mask = (torch.rand(z_t.shape[0], device=z_t.device) > dropout_p).float()
+            idx = torch.tensor(gate_idx, device=z_t.device)
+            z_t[:, idx] = z_t[:, idx] * mask.unsqueeze(-1)
     return z_t.unsqueeze(1)
 
 
@@ -1081,12 +1223,21 @@ def wall_weights(x_pos: torch.Tensor, wall_x: float, sigma: float) -> torch.Tens
     return raw / raw.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
 
+def loss_gate_half_width(args: argparse.Namespace, training: bool) -> float:
+    half_width = float(args.gate_half_width)
+    if training and is_continuous_gate(args):
+        margin = max(0.0, float(getattr(args, "gate_margin_train", 0.0)))
+        half_width = max(1e-4, half_width - margin)
+    return half_width
+
+
 def compute_loss(
     *,
     args: argparse.Namespace,
     batch: ScenarioBatch,
     rollout: RolloutArtifacts,
     collision_sharpness_override: float | None = None,
+    training: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     goal = batch.goal.to(rollout.x_seq.device).unsqueeze(1)
     pos = rollout.x_seq[..., :2]
@@ -1106,8 +1257,9 @@ def compute_loss(
     wall_track = float(args.wall_track_weight) * (w_wall * gate_error.square()).sum(dim=1)
 
     sharpness = collision_sharpness_override if collision_sharpness_override is not None else float(args.collision_sharpness)
+    gate_half_width_loss = loss_gate_half_width(args, training=training)
     collision_soft = F.softplus(
-        sharpness * (gate_error.abs() - float(args.gate_half_width))
+        sharpness * (gate_error.abs() - gate_half_width_loss)
     ) / max(sharpness, 1e-6)
     wall_collision = float(args.wall_collision_weight) * (w_wall * collision_soft).sum(dim=1)
 
@@ -1150,6 +1302,35 @@ def crossing_indices(x_pos: torch.Tensor, wall_x: float) -> torch.Tensor:
     return idx.to(x_pos.device)
 
 
+def interpolated_wall_crossing(
+    *,
+    x_pos: torch.Tensor,
+    y_pos: torch.Tensor,
+    gate: torch.Tensor,
+    wall_x: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return discrete crossing indices plus y/g interpolated at x == wall_x."""
+    cross_idx = crossing_indices(x_pos, wall_x)
+    row = torch.arange(x_pos.shape[0], device=x_pos.device)
+    y_cross = y_pos[row, cross_idx].clone()
+    g_cross = gate[row, cross_idx].clone()
+
+    wall = float(wall_x)
+    for b in range(x_pos.shape[0]):
+        i = int(cross_idx[b].item())
+        if i <= 0:
+            continue
+        x0 = x_pos[b, i - 1]
+        x1 = x_pos[b, i]
+        denom = x1 - x0
+        bracketed = (x0 - wall) * (x1 - wall) <= 0
+        if bool(bracketed.item()) and abs(float(denom.item())) > 1e-8:
+            alpha = torch.clamp((wall - x0) / denom, 0.0, 1.0)
+            y_cross[b] = y_pos[b, i - 1] + alpha * (y_pos[b, i] - y_pos[b, i - 1])
+            g_cross[b] = gate[b, i - 1] + alpha * (gate[b, i] - gate[b, i - 1])
+    return cross_idx, y_cross, g_cross
+
+
 @torch.no_grad()
 def evaluate_variant(
     *,
@@ -1175,10 +1356,12 @@ def evaluate_variant(
     pos = rollout.x_seq[..., :2]
     x_pos = pos[..., 0]
     y_pos = pos[..., 1]
-    cross_idx = crossing_indices(x_pos, float(args.wall_x))
-    row = torch.arange(x_pos.shape[0], device=x_pos.device)
-    y_cross = y_pos[row, cross_idx]
-    g_cross = batch_dev.gate_y[row, cross_idx]
+    cross_idx, y_cross, g_cross = interpolated_wall_crossing(
+        x_pos=x_pos,
+        y_pos=y_pos,
+        gate=batch_dev.gate_y,
+        wall_x=float(args.wall_x),
+    )
     cross_error = y_cross - g_cross
     collided = cross_error.abs() > float(args.gate_half_width)
     terminal_dist = torch.norm(pos[:, -1, :] - batch_dev.goal, dim=-1)
@@ -1364,6 +1547,7 @@ def train_controller(
             batch=train_batch,
             rollout=rollout,
             collision_sharpness_override=curr_sharpness,
+            training=True,
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -1747,6 +1931,10 @@ def plot_waiting_behavior(
     show_plots: bool,
 ) -> None:
     """Visualise the 'waiting' strategy: controller slows forward/lateral motion after a recent gate switch."""
+    if is_continuous_gate(args):
+        print("Skipping waiting-behavior switch-age plot for continuous gate motion.")
+        return
+
     plt = get_plt(show_plots)
     setup_plot_style(plt)
 
@@ -2220,6 +2408,10 @@ def plot_adversarial_switching(
     An episode is labelled adversarial when the gate switch_age at the wall-crossing
     step is <= gate_dwell_min, meaning a switch occurred very close to the freeze step.
     """
+    if is_continuous_gate(args):
+        print("Skipping adversarial-switching plot for continuous gate motion.")
+        return
+
     plt = get_plt(show_plots)
     setup_plot_style(plt)
     colors = variant_colors()
@@ -2368,7 +2560,7 @@ def plot_sample_trajectory(
     """
     Two-panel paper figure for a single episode:
       Left  – top-down view (x vs y): trajectory per variant + wall + gate gap.
-      Right – time series: y_t and gate band g_t±h vs step, with t_freeze and t_cross marked.
+      Right – time series: y_t and gate band g_t±h vs step, with wall crossing marked.
     Variants are overlaid in their canonical colours.
     """
     import matplotlib
@@ -2391,7 +2583,7 @@ def plot_sample_trajectory(
     freeze_step = max(1, expected_cross_index - int(args.gate_settle_steps))
     steps = np.arange(T_plot)
 
-    # Gate schedule for the selected episode — extend with frozen value past horizon
+    # Gate trace for the selected episode; hold the last value only for plot extension.
     gate_np_ctrl = test_batch.gate_y[sample_idx].numpy()  # (T,)
     gate_np = np.concatenate([gate_np_ctrl,
                                np.full(T_plot - T, gate_np_ctrl[-1])]) if T_plot > T else gate_np_ctrl
@@ -2500,9 +2692,10 @@ def plot_sample_trajectory(
         ax_ts.scatter(cross_idx, y_seq_ctrl[min(cross_idx, T - 1)],
                       color=c, s=55, zorder=5, marker="D")
 
-    # Freeze and crossing reference lines
-    ax_ts.axvline(freeze_step, color="#7c3aed", lw=1.4, ls=":", zorder=4,
-                  label=f"$t_{{\\mathrm{{freeze}}}}={freeze_step}$")
+    # Switching-gate runs have a pre-crossing freeze; continuous OU runs do not.
+    if not is_continuous_gate(args):
+        ax_ts.axvline(freeze_step, color="#7c3aed", lw=1.4, ls=":", zorder=4,
+                      label=f"$t_{{\\mathrm{{freeze}}}}={freeze_step}$")
     ax_ts.axvline(expected_cross_index, color="#ef4444", lw=1.4, ls=":", zorder=4,
                   label=f"$t_{{\\mathrm{{wall}}}}={expected_cross_index}$")
 
@@ -2575,14 +2768,17 @@ def plot_trajectory_storyboard(
     y_lim    = corr * 1.08
 
     freeze_step = max(1, expected_cross_index - int(args.gate_settle_steps))
+    continuous_gate = is_continuous_gate(args)
+    analysis_end = expected_cross_index if continuous_gate else freeze_step
+    analysis_end = int(np.clip(analysis_end, 1, T - 1))
     ref_mode    = "context" if "context" in test_metrics else variant_order[0][0]
 
-    # ── Find a sample with ≥ 3 gate switches before freeze ────────────────────
+    # ── Find a sample with a rich switching schedule for switching-gate runs ───
     def _count_switches(gate: np.ndarray) -> int:
-        return int(np.sum(np.abs(np.diff(gate[:freeze_step])) > 0.05))
+        return int(np.sum(np.abs(np.diff(gate[:analysis_end])) > 0.05))
 
     chosen = sample_idx
-    if _count_switches(test_batch.gate_y[sample_idx].numpy()) < 3:
+    if not continuous_gate and _count_switches(test_batch.gate_y[sample_idx].numpy()) < 3:
         n_batch = test_batch.gate_y.shape[0]
         for i in range(n_batch):
             if _count_switches(test_batch.gate_y[i].numpy()) >= 3:
@@ -2593,23 +2789,24 @@ def plot_trajectory_storyboard(
     start_np = test_batch.start[chosen].numpy()
     cross_idx = int(test_metrics[ref_mode]["rollout"]["cross_idx"][chosen].item())
 
-    # ── Find gate switch points and level segments ─────────────────────────────
-    # switch_pts: indices where the gate value changes (within [0, freeze_step))
-    switch_pts = np.where(np.abs(np.diff(gate_np[:freeze_step])) > 0.05)[0] + 1
-    # Level segments: list of (t_start, t_end) before freeze
-    seg_starts = np.concatenate([[0], switch_pts])
-    seg_ends   = np.concatenate([switch_pts, [freeze_step]])
+    if continuous_gate:
+        # Smooth OU motion has no level segments; use evenly spaced pre-wall samples.
+        t1 = max(1, analysis_end // 4)
+        t2 = max(t1 + 1, analysis_end // 2)
+        t3 = max(t2 + 1, (3 * analysis_end) // 4)
+    else:
+        # switch_pts: indices where the gate value changes before freeze.
+        switch_pts = np.where(np.abs(np.diff(gate_np[:analysis_end])) > 0.05)[0] + 1
+        seg_starts = np.concatenate([[0], switch_pts])
+        seg_ends   = np.concatenate([switch_pts, [analysis_end]])
 
-    # Pick the first 3 level segments whose midpoints are well inside [0, freeze_step)
-    def _mid(s, e):
-        return int(s + max(1, (e - s) // 2))
+        def _mid(s, e):
+            return int(s + max(1, (e - s) // 2))
 
-    level_mids = [_mid(s, e) for s, e in zip(seg_starts, seg_ends)]
-
-    # 5 snapshot times: mid of levels 1, 2, 3 -> wall crossing -> final
-    t1 = level_mids[0] if len(level_mids) > 0 else max(1, freeze_step // 6)
-    t2 = level_mids[1] if len(level_mids) > 1 else freeze_step // 3
-    t3 = level_mids[2] if len(level_mids) > 2 else 2 * freeze_step // 3
+        level_mids = [_mid(s, e) for s, e in zip(seg_starts, seg_ends)]
+        t1 = level_mids[0] if len(level_mids) > 0 else max(1, analysis_end // 6)
+        t2 = level_mids[1] if len(level_mids) > 1 else analysis_end // 3
+        t3 = level_mids[2] if len(level_mids) > 2 else 2 * analysis_end // 3
     t4 = min(cross_idx, T - 1)
     t5 = T - 1
 
@@ -2704,12 +2901,18 @@ def plot_trajectory_storyboard(
 
     # ── Gate schedule strip ────────────────────────────────────────────────────
     t_ax = np.arange(T)
-    ax_gate.step(t_ax, gate_np, where="post", color="#6b7280", lw=1.4,
-                 label="$g_t$  (gate centre)")
-    ax_gate.fill_between(t_ax, gate_np - half_w, gate_np + half_w,
-                         step="post", color="#bbf7d0", alpha=0.45)
-    ax_gate.axvline(freeze_step, color="#94a3b8", lw=1.0, ls="--", zorder=2,
-                    label=f"freeze $t={freeze_step}$")
+    if continuous_gate:
+        ax_gate.plot(t_ax, gate_np, color="#6b7280", lw=1.4,
+                     label="$g_t$  (gate centre)")
+        ax_gate.fill_between(t_ax, gate_np - half_w, gate_np + half_w,
+                             color="#bbf7d0", alpha=0.45)
+    else:
+        ax_gate.step(t_ax, gate_np, where="post", color="#6b7280", lw=1.4,
+                     label="$g_t$  (gate centre)")
+        ax_gate.fill_between(t_ax, gate_np - half_w, gate_np + half_w,
+                             step="post", color="#bbf7d0", alpha=0.45)
+        ax_gate.axvline(freeze_step, color="#94a3b8", lw=1.0, ls="--", zorder=2,
+                        label=f"freeze $t={freeze_step}$")
     # Snapshot cursors
     for t_snap, cc in zip(snapshot_steps, cursor_colors):
         ax_gate.axvline(t_snap, color=cc, lw=1.6, ls=":", zorder=3)
@@ -2741,9 +2944,13 @@ def plot_trajectory_storyboard(
         frameon=False,
     )
 
+    motion_note = (
+        "continuous gate drift"
+        if continuous_gate
+        else f"{_count_switches(gate_np)} gate switches before freeze"
+    )
     fig.suptitle(
-        f"Trajectory storyboard — episode #{chosen}  "
-        f"({_count_switches(gate_np)} gate switches before freeze)",
+        f"Trajectory storyboard — episode #{chosen}  ({motion_note})",
         fontsize=10, fontweight="bold", y=1.01,
     )
 
@@ -2794,14 +3001,17 @@ def plot_trajectory_storyboard_compact(
     y_lim    = corr * 1.08
 
     freeze_step = max(1, expected_cross_index - int(args.gate_settle_steps))
+    continuous_gate = is_continuous_gate(args)
+    analysis_end = expected_cross_index if continuous_gate else freeze_step
+    analysis_end = int(np.clip(analysis_end, 1, T - 1))
     ref_mode    = "context" if "context" in test_metrics else variant_order[0][0]
 
     def _count_switches(gate: np.ndarray) -> int:
-        return int(np.sum(np.abs(np.diff(gate[:freeze_step])) > 0.05))
+        return int(np.sum(np.abs(np.diff(gate[:analysis_end])) > 0.05))
 
-    # Reuse same sample-selection logic as full storyboard
+    # Reuse same sample-selection logic as full storyboard for switching runs.
     chosen = sample_idx
-    if _count_switches(test_batch.gate_y[sample_idx].numpy()) < 3:
+    if not continuous_gate and _count_switches(test_batch.gate_y[sample_idx].numpy()) < 3:
         for i in range(test_batch.gate_y.shape[0]):
             if _count_switches(test_batch.gate_y[i].numpy()) >= 3:
                 chosen = i
@@ -2811,17 +3021,22 @@ def plot_trajectory_storyboard_compact(
     start_np  = test_batch.start[chosen].numpy()
     cross_idx = int(test_metrics[ref_mode]["rollout"]["cross_idx"][chosen].item())
 
-    switch_pts = np.where(np.abs(np.diff(gate_np[:freeze_step])) > 0.05)[0] + 1
-    seg_starts = np.concatenate([[0], switch_pts])
-    seg_ends   = np.concatenate([switch_pts, [freeze_step]])
+    if continuous_gate:
+        t1 = max(1, analysis_end // 4)
+        t2 = max(t1 + 1, analysis_end // 2)
+        t3 = max(t2 + 1, (3 * analysis_end) // 4)
+    else:
+        switch_pts = np.where(np.abs(np.diff(gate_np[:analysis_end])) > 0.05)[0] + 1
+        seg_starts = np.concatenate([[0], switch_pts])
+        seg_ends   = np.concatenate([switch_pts, [analysis_end]])
 
-    def _mid(s, e):
-        return int(s + max(1, (e - s) // 2))
+        def _mid(s, e):
+            return int(s + max(1, (e - s) // 2))
 
-    level_mids  = [_mid(s, e) for s, e in zip(seg_starts, seg_ends)]
-    t1 = level_mids[0] if len(level_mids) > 0 else max(1, freeze_step // 6)
-    t2 = level_mids[1] if len(level_mids) > 1 else freeze_step // 3
-    t3 = level_mids[2] if len(level_mids) > 2 else 2 * freeze_step // 3
+        level_mids  = [_mid(s, e) for s, e in zip(seg_starts, seg_ends)]
+        t1 = level_mids[0] if len(level_mids) > 0 else max(1, analysis_end // 6)
+        t2 = level_mids[1] if len(level_mids) > 1 else analysis_end // 3
+        t3 = level_mids[2] if len(level_mids) > 2 else 2 * analysis_end // 3
     t4 = min(cross_idx, T - 1)
     t5 = T - 1
 
@@ -2910,10 +3125,15 @@ def plot_trajectory_storyboard_compact(
 
     # ── Gate strip ────────────────────────────────────────────────────────────
     t_ax = np.arange(T)
-    ax_gate.step(t_ax, gate_np, where="post", color="#6b7280", lw=1.0)
-    ax_gate.fill_between(t_ax, gate_np - half_w, gate_np + half_w,
-                         step="post", color="#bbf7d0", alpha=0.45)
-    ax_gate.axvline(freeze_step, color="#94a3b8", lw=0.8, ls="--", zorder=2)
+    if continuous_gate:
+        ax_gate.plot(t_ax, gate_np, color="#6b7280", lw=1.0)
+        ax_gate.fill_between(t_ax, gate_np - half_w, gate_np + half_w,
+                             color="#bbf7d0", alpha=0.45)
+    else:
+        ax_gate.step(t_ax, gate_np, where="post", color="#6b7280", lw=1.0)
+        ax_gate.fill_between(t_ax, gate_np - half_w, gate_np + half_w,
+                             step="post", color="#bbf7d0", alpha=0.45)
+        ax_gate.axvline(freeze_step, color="#94a3b8", lw=0.8, ls="--", zorder=2)
     for t_snap, cc in zip(snapshot_steps, cursor_colors):
         ax_gate.axvline(t_snap, color=cc, lw=1.2, ls=":", zorder=3)
         ax_gate.scatter([t_snap], [gate_np[min(t_snap, T - 1)]],
@@ -2944,7 +3164,8 @@ def plot_trajectory_storyboard_compact(
         columnspacing=0.8,
     )
 
-    fig.suptitle("Gate-switching navigation — storyboard", fontsize=8,
+    title = "Continuous-gate navigation - storyboard" if continuous_gate else "Gate-switching navigation - storyboard"
+    fig.suptitle(title, fontsize=8,
                  fontweight="bold", y=1.02)
 
     out = run_dir / "trajectory_storyboard_compact.pdf"
@@ -2988,10 +3209,17 @@ def main() -> None:
     torch.set_num_threads(max(1, torch.get_num_threads()))
 
     requested_device = args.device
-    if requested_device == "cuda" and not torch.cuda.is_available():
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
         print("CUDA requested but not available. Falling back to CPU.")
         requested_device = "cpu"
     device = torch.device(requested_device)
+
+    if device.type == "cuda":
+        print(f"Using CUDA device: {torch.cuda.get_device_name(device)}")
+        if bool(getattr(args, "tf32", True)):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            print("[cuda] TF32 matmul/cudnn kernels enabled.")
 
     # ── Plot-only mode ────────────────────────────────────────────────────────
     if args.plot_only:
@@ -3093,7 +3321,8 @@ def main() -> None:
 
     expected_cross_index = estimate_expected_cross_index(args)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = args.run_id or f"controlled_xy_{timestamp}"
+    _gate_tag = "continuous" if is_continuous_gate(args) else "controlled"
+    run_name = args.run_id or f"{_gate_tag}_xy_{timestamp}"
     run_dir = Path(__file__).resolve().parent / "runs" / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3263,29 +3492,30 @@ def _run_all_plots(
         test_metrics=test_metrics,
         show_plots=show_plots,
     )
-    animate_adversarial_sample(
-        args=args,
-        run_dir=run_dir,
-        variant_order=specs,
-        test_batch=test_batch,
-        test_metrics=test_metrics,
-        show_plots=show_plots,
-    )
-    plot_waiting_behavior(
-        args=args,
-        run_dir=run_dir,
-        test_batch=test_batch,
-        test_metrics=test_metrics,
-        show_plots=show_plots,
-    )
-    plot_adversarial_switching(
-        args=args,
-        run_dir=run_dir,
-        variant_order=specs,
-        test_batch=test_batch,
-        test_metrics=test_metrics,
-        show_plots=show_plots,
-    )
+    if not is_continuous_gate(args):
+        animate_adversarial_sample(
+            args=args,
+            run_dir=run_dir,
+            variant_order=specs,
+            test_batch=test_batch,
+            test_metrics=test_metrics,
+            show_plots=show_plots,
+        )
+        plot_waiting_behavior(
+            args=args,
+            run_dir=run_dir,
+            test_batch=test_batch,
+            test_metrics=test_metrics,
+            show_plots=show_plots,
+        )
+        plot_adversarial_switching(
+            args=args,
+            run_dir=run_dir,
+            variant_order=specs,
+            test_batch=test_batch,
+            test_metrics=test_metrics,
+            show_plots=show_plots,
+        )
     plot_sample_trajectory(
         args=args,
         run_dir=run_dir,
