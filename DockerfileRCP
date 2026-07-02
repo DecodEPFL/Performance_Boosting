@@ -1,0 +1,29 @@
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:23.11-py3
+FROM ${BASE_IMAGE}
+
+ARG LDAP_GROUPNAME=SCI-STI-GFT
+ARG LDAP_GID
+ARG LDAP_USERNAME
+ARG LDAP_UID
+
+SHELL ["/bin/bash", "-lc"]
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    MPLBACKEND=Agg \
+    PYTHONUNBUFFERED=1
+
+RUN test -n "${LDAP_GID}" && test -n "${LDAP_UID}" && test -n "${LDAP_USERNAME}"
+
+RUN if ! getent group "${LDAP_GID}" >/dev/null; then \
+        groupadd --badname --gid "${LDAP_GID}" "${LDAP_GROUPNAME}"; \
+    fi && \
+    if ! id -u "${LDAP_USERNAME}" >/dev/null 2>&1; then \
+        useradd --uid "${LDAP_UID}" --gid "${LDAP_GID}" --create-home --shell /bin/bash "${LDAP_USERNAME}"; \
+    fi
+
+COPY requirements-rcp.txt /tmp/requirements-rcp.txt
+RUN python3 -m pip install --no-cache-dir --upgrade pip && \
+    python3 -m pip install --no-cache-dir -r /tmp/requirements-rcp.txt
+
+USER ${LDAP_UID}:${LDAP_GID}
+WORKDIR /home/${LDAP_USERNAME}
