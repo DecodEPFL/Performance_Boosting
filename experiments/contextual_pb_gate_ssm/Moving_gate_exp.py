@@ -253,6 +253,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Include the ContextualDeepSSM variant (default on).")
     parser.add_argument("--no_contextual_comparison", dest="contextual_comparison", action="store_false")
     parser.set_defaults(contextual_comparison=True)
+    parser.add_argument("--match_to_contextual", dest="match_to_contextual", action="store_true",
+                        help="When contextual_ssm is among the variants, size every OTHER "
+                             "trainable variant's SSM d_model so its total parameter count "
+                             "matches contextual_ssm as closely as possible (fair comparison). "
+                             "Layers stay at --ssm_layers; only d_model is adjusted.")
+    parser.add_argument("--no_match_to_contextual", dest="match_to_contextual", action="store_false")
+    parser.set_defaults(match_to_contextual=False)
     parser.add_argument("--ctx_modes", type=str, default="mixer,input,gate",
                         help="Comma-separated context ports for ContextualDeepSSM: any of "
                              "mixer,input,gate,select.")
@@ -312,6 +319,26 @@ def build_parser() -> argparse.ArgumentParser:
                              + ",".join(CONTEXT_FEATURE_ORDER) + ". 'Fair' features "
                              "(observation + own state) vs 'privileged' (gate dynamics / "
                              "schedule = cheating) are documented in CONTEXT_FEATURE_META.")
+
+    # Context ablation: hold ONE architecture fixed and sweep context subsets to
+    # find the decisive context component (overrides the normal multi-variant run).
+    parser.add_argument("--ablate_context", action="store_true",
+                        help="Run a context-feature ablation: train --ablation_variant once "
+                             "per config in --ablation_configs (same data/seeds) and compare.")
+    parser.add_argument("--ablation_variant", type=str, default="context",
+                        choices=["context", "mad_context", "mp_only_context", "contextual_ssm"],
+                        help="Single architecture held fixed across the ablation.")
+    parser.add_argument("--ablation_configs", type=str, default="",
+                        help="Semicolon-separated context configs, each 'label:feat1,feat2' "
+                             "(label optional). Empty = leave-one-out over the fair default "
+                             "set. Example: 'full:gate_obs,gate_error,approach;"
+                             "-gate_obs:gate_error,approach'.")
+    parser.add_argument("--ablate_layers", action="store_true",
+                        help="Run an SSM-depth comparison: train --ablation_variant with the "
+                             "SAME context at each --ablation_layers depth (same data/seeds).")
+    parser.add_argument("--ablation_layers", type=str, default="",
+                        help="Comma-separated SSM layer counts to compare, e.g. '3,6,9,12'. "
+                             "Empty = sweep around --ssm_layers (base//2, base, base*2).")
     parser.add_argument("--mp_context_lift", dest="mp_context_lift", action="store_true")
     parser.add_argument("--no_mp_context_lift", dest="mp_context_lift", action="store_false")
     parser.set_defaults(mp_context_lift=True)
@@ -355,6 +382,43 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no_terminal_vel", dest="use_terminal_vel", action="store_false")
     parser.set_defaults(use_terminal_vel=True)
     parser.add_argument("--sample_traj_count", type=int, default=4)
+    # Overshoot control: deceleration-near-goal penalty (velocity weighted by a
+    # Gaussian in distance-to-goal). Raw-mode weight + radius live here with the
+    # other raw weights; its normalized-mode priority is alpha_settle_vel below.
+    parser.add_argument("--settle_vel_weight", type=float, default=0.0,
+                        help="Raw-mode weight on the deceleration-near-goal penalty: speed "
+                             "weighted by a Gaussian in distance-to-goal. 0 = off (default). "
+                             "Raise to curb overshoot at the target.")
+    parser.add_argument("--settle_sigma", type=float, default=0.35,
+                        help="Radius (std, in position units) of the near-goal region for the "
+                             "deceleration penalty; smaller = only very close to the goal.")
+
+    # Loss normalization: scale each term by its value on the nominal (no-boost)
+    # rollout, then weight by O(1) --alpha_* priorities (scale-free, regime-invariant).
+    parser.add_argument("--loss_normalize", dest="loss_normalize", action="store_true",
+                        help="Normalize each loss term by its nominal-rollout scale, then "
+                             "weight by --alpha_* (default 1 = equal). Decouples scale from "
+                             "priority and is invariant to the gate regime. Off (default) = "
+                             "legacy raw *_weight behavior.")
+    parser.add_argument("--no_loss_normalize", dest="loss_normalize", action="store_false")
+    parser.set_defaults(loss_normalize=False)
+    parser.add_argument("--alpha_goal_stage", type=float, default=1.0,
+                        help="--loss_normalize: priority on the goal-tracking stage cost.")
+    parser.add_argument("--alpha_goal_term", type=float, default=1.0,
+                        help="--loss_normalize: priority on the terminal goal-distance.")
+    parser.add_argument("--alpha_terminal_vel", type=float, default=1.0,
+                        help="--loss_normalize: priority on the terminal-velocity penalty.")
+    parser.add_argument("--alpha_wall_track", type=float, default=1.0,
+                        help="--loss_normalize: priority on the gate-tracking-near-wall cost.")
+    parser.add_argument("--alpha_wall_collision", type=float, default=1.0,
+                        help="--loss_normalize: priority on the wall-collision penalty.")
+    parser.add_argument("--alpha_control", type=float, default=1.0,
+                        help="--loss_normalize: priority on the control-effort cost.")
+    parser.add_argument("--alpha_corridor", type=float, default=1.0,
+                        help="--loss_normalize: priority on the corridor-limit penalty.")
+    parser.add_argument("--alpha_settle_vel", type=float, default=0.0,
+                        help="--loss_normalize: priority on the deceleration-near-goal "
+                             "penalty. 0 = off (default).")
     return parser
 
 
@@ -407,6 +471,44 @@ def find_matched_ssm_d_model(
         f"Cannot match param budget of {target_params} for M_p-only SSM "
         f"within d_model search range [{ start}, 1024)."
     )
+
+
+def find_matched_d_model(
+    *,
+    args: argparse.Namespace,
+    device: torch.device,
+    target_params: int,
+    mp_only: bool,
+    use_mad: bool,
+    d_min: int = 4,
+    d_max: int = 1024,
+    step: int = 2,
+) -> int:
+    """SSM d_model whose FULL-controller param count is closest to target_params
+    for the given variant shape (factorized / MAD / M_p-only).
+
+    Param count is monotone in d_model, so we sweep and keep the value minimizing
+    |count - target|. The whole controller is built each step, so M_b / lifter
+    params are included in the match.
+    """
+    best_d, best_err = d_min, None
+    for d in range(d_min, d_max, step):
+        try:
+            ctrl, _ = build_controller(
+                device, args, mp_only=mp_only,
+                factor_rank_override=1 if use_mad else None,
+                ssm_d_model_override=d,
+            )
+        except Exception:
+            continue
+        c = count_params(ctrl)
+        del ctrl
+        err = abs(c - target_params)
+        if best_err is None or err < best_err:
+            best_d, best_err = d, err
+        if c >= target_params:
+            break
+    return best_d
 
 
 def contextual_label(args=None) -> str:
@@ -1231,14 +1333,27 @@ def loss_gate_half_width(args: argparse.Namespace, training: bool) -> float:
     return half_width
 
 
-def compute_loss(
-    *,
+# Loss term key -> the legacy raw-mode *_weight argument that scales it.
+_LOSS_WEIGHT_ARG = {
+    "goal_stage": "goal_stage_weight",
+    "goal_term": "goal_terminal_weight",
+    "terminal_vel": "terminal_vel_weight",
+    "wall_track": "wall_track_weight",
+    "wall_collision": "wall_collision_weight",
+    "control": "control_weight",
+    "corridor": "corridor_weight",
+    "settle_vel": "settle_vel_weight",
+}
+
+
+def _raw_loss_terms(
     args: argparse.Namespace,
     batch: ScenarioBatch,
     rollout: RolloutArtifacts,
     collision_sharpness_override: float | None = None,
     training: bool = False,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> dict[str, torch.Tensor]:
+    """Unweighted per-sample (B,) loss terms — the building blocks of compute_loss."""
     goal = batch.goal.to(rollout.x_seq.device).unsqueeze(1)
     pos = rollout.x_seq[..., :2]
     x_pos = pos[..., 0]
@@ -1248,44 +1363,106 @@ def compute_loss(
     # Smooth L1 (Huber) for goal distance — more robust than pure L2
     goal_delta = pos - goal
     goal_dist = F.huber_loss(pos, goal.expand_as(pos), reduction="none", delta=0.5).sum(dim=-1)
-    goal_stage = float(args.goal_stage_weight) * goal_dist.mean(dim=1)
     goal_dist_l2 = torch.norm(goal_delta, dim=-1)
-    goal_term = float(args.goal_terminal_weight) * goal_dist_l2[:, -1]
 
     w_wall = wall_weights(x_pos, float(args.wall_x), float(args.wall_focus_sigma))
     gate_error = y_pos - gate
-    wall_track = float(args.wall_track_weight) * (w_wall * gate_error.square()).sum(dim=1)
-
     sharpness = collision_sharpness_override if collision_sharpness_override is not None else float(args.collision_sharpness)
     gate_half_width_loss = loss_gate_half_width(args, training=training)
     collision_soft = F.softplus(
         sharpness * (gate_error.abs() - gate_half_width_loss)
     ) / max(sharpness, 1e-6)
-    wall_collision = float(args.wall_collision_weight) * (w_wall * collision_soft).sum(dim=1)
-
-    control_mag_sq = torch.sum(rollout.u_seq.square(), dim=-1)
-    control_cost = float(args.control_weight) * control_mag_sq.mean(dim=1)
-
     corridor_soft = F.softplus(
         float(args.corridor_sharpness) * (y_pos.abs() - float(args.corridor_limit))
     ) / float(args.corridor_sharpness)
-    corridor_cost = float(args.corridor_weight) * corridor_soft.mean(dim=1)
 
-    vel_term = torch.zeros_like(goal_term)
+    terminal_vel = torch.zeros_like(goal_dist_l2[:, -1])
     if getattr(args, "use_terminal_vel", True):
-        vel_final = rollout.x_seq[:, -1, 2:]  # (B, 2) final velocity
-        vel_term = float(args.terminal_vel_weight) * torch.sum(vel_final.square(), dim=-1)
+        terminal_vel = torch.sum(rollout.x_seq[:, -1, 2:].square(), dim=-1)
 
-    total_per = goal_stage + goal_term + vel_term + wall_track + wall_collision + control_cost + corridor_cost
+    # Deceleration-near-goal penalty: speed weighted by a Gaussian in distance-to-
+    # goal (normalized over time). Penalizes carrying velocity into the target, so
+    # it curbs overshoot without slowing the far approach / gate crossing.
+    settle_sigma = max(float(getattr(args, "settle_sigma", 0.35)), 1e-6)
+    w_goal = torch.exp(-0.5 * goal_delta.square().sum(dim=-1) / (settle_sigma ** 2))
+    w_goal = w_goal / w_goal.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    vel_sq = rollout.x_seq[..., 2:].square().sum(dim=-1)
+    settle_vel = (w_goal * vel_sq).sum(dim=1)
+
+    return {
+        "goal_stage": goal_dist.mean(dim=1),
+        "goal_term": goal_dist_l2[:, -1],
+        "terminal_vel": terminal_vel,
+        "wall_track": (w_wall * gate_error.square()).sum(dim=1),
+        "wall_collision": (w_wall * collision_soft).sum(dim=1),
+        "control": torch.sum(rollout.u_seq.square(), dim=-1).mean(dim=1),
+        "corridor": corridor_soft.mean(dim=1),
+        "settle_vel": settle_vel,
+    }
+
+
+def _loss_scales_from_nominal(args: argparse.Namespace, batch: ScenarioBatch,
+                              device: torch.device) -> dict[str, float]:
+    """Per-term reference scales from the nominal (no-boost) rollout.
+
+    The nominal policy meaningfully incurs the *task* terms (goal distance, wall
+    tracking/collision), so those are scaled by "how bad is doing nothing." It does
+    NOT exercise the regularizers (control effort = 0, stays in the corridor, ends
+    slow), so any term whose nominal scale is negligible falls back to a unit
+    reference — its alpha then acts as a direct O(1) weight on the raw term instead
+    of exploding by dividing by ~0.
+    """
+    nominal = rollout_nominal(args=args, batch=batch, device=device)
+    raw = _raw_loss_terms(args, batch, nominal)  # default (full) half-width, no override
+    scales = {k: float(v.mean().item()) for k, v in raw.items()}
+    thresh = 0.05 * (max(scales.values()) if scales else 1.0)
+    return {k: (v if v >= thresh else 1.0) for k, v in scales.items()}
+
+
+def compute_loss(
+    *,
+    args: argparse.Namespace,
+    batch: ScenarioBatch,
+    rollout: RolloutArtifacts,
+    collision_sharpness_override: float | None = None,
+    training: bool = False,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Multi-objective loss. Two modes:
+
+      raw (default):  total = Σ_i  (*_weight)_i · term_i        (legacy behavior)
+      normalized:     total = Σ_i  (alpha_*)_i · term_i / s_i   (--loss_normalize)
+
+    where s_i is term_i's scale on the nominal rollout (computed once, cached on
+    args). Normalization decouples each objective's scale from its priority, so the
+    --alpha_* weights are interpretable and the balance is invariant to the gate
+    regime. Raw mode is bit-for-bit the previous behavior.
+    """
+    raw = _raw_loss_terms(args, batch, rollout, collision_sharpness_override, training)
+    if bool(getattr(args, "loss_normalize", False)):
+        scales = getattr(args, "_loss_scales", None)
+        if scales is None:
+            scales = _loss_scales_from_nominal(args, batch, rollout.x_seq.device)
+            args._loss_scales = scales  # cache: one scenario-level reference, shared
+        contrib = {
+            k: float(getattr(args, f"alpha_{k}", 1.0)) * (raw[k] / max(float(scales.get(k, 1.0)), 1e-6))
+            for k in raw
+        }
+    else:
+        contrib = {k: float(getattr(args, _LOSS_WEIGHT_ARG[k])) * raw[k] for k in raw}
+
+    total_per = (contrib["goal_stage"] + contrib["goal_term"] + contrib["terminal_vel"]
+                 + contrib["wall_track"] + contrib["wall_collision"]
+                 + contrib["control"] + contrib["corridor"] + contrib["settle_vel"])
     parts = {
         "loss_total": to_python_float(total_per.mean()),
-        "loss_goal_stage": to_python_float(goal_stage.mean()),
-        "loss_goal_term": to_python_float(goal_term.mean()),
-        "loss_terminal_vel": to_python_float(vel_term.mean()),
-        "loss_wall_track": to_python_float(wall_track.mean()),
-        "loss_wall_collision": to_python_float(wall_collision.mean()),
-        "loss_control": to_python_float(control_cost.mean()),
-        "loss_corridor": to_python_float(corridor_cost.mean()),
+        "loss_goal_stage": to_python_float(contrib["goal_stage"].mean()),
+        "loss_goal_term": to_python_float(contrib["goal_term"].mean()),
+        "loss_terminal_vel": to_python_float(contrib["terminal_vel"].mean()),
+        "loss_wall_track": to_python_float(contrib["wall_track"].mean()),
+        "loss_wall_collision": to_python_float(contrib["wall_collision"].mean()),
+        "loss_control": to_python_float(contrib["control"].mean()),
+        "loss_corridor": to_python_float(contrib["corridor"].mean()),
+        "loss_settle_vel": to_python_float(contrib["settle_vel"].mean()),
     }
     return total_per.mean(), parts
 
@@ -1630,8 +1807,20 @@ def setup_plot_style(plt) -> None:
     )
 
 
+class _VariantColorMap(dict):
+    """Color map that auto-assigns a distinct fallback color to any unknown key
+    (e.g. context-ablation config labels) so every plot works without changes."""
+    _FALLBACK = ["#0891b2", "#ca8a04", "#9333ea", "#dc2626", "#059669", "#1d4ed8",
+                 "#db2777", "#65a30d", "#0f766e", "#ea580c", "#4f46e5", "#be123c"]
+
+    def __missing__(self, key):
+        color = self._FALLBACK[len(self) % len(self._FALLBACK)]
+        self[key] = color
+        return color
+
+
 def variant_colors() -> dict[str, str]:
-    return {
+    return _VariantColorMap({
         "nominal": "#4b5563",
         "disturbance_only": "#d97706",
         "context": "#0f766e",
@@ -1639,7 +1828,7 @@ def variant_colors() -> dict[str, str]:
         "mp_only_context": "#7c3aed",
         "context_no_lift": "#db2777",
         "contextual_ssm": "#16a34a",
-    }
+    })
 
 
 def reference_rollout_metrics(test_metrics: dict[str, dict]) -> dict:
@@ -3203,6 +3392,197 @@ def build_interpretation(test_metrics: dict[str, dict]) -> str:
     return " | ".join(lines)
 
 
+def parse_ablation_configs(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
+    """Parse --ablation_configs into [(label, [features])], features in canonical order.
+
+    Empty string -> default leave-one-out sweep over the fair default context set.
+    """
+    raw = str(getattr(args, "ablation_configs", "") or "").strip()
+    if not raw:
+        base = [k for k in CONTEXT_FEATURE_ORDER if k in set(FAIR_CONTEXT_DEFAULT)]
+        return [("full", base)] + [(f"-{f}", [x for x in base if x != f]) for f in base]
+    out: list[tuple[str, list[str]]] = []
+    for chunk in raw.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        label, feats_s = chunk.split(":", 1) if ":" in chunk else (chunk, chunk)
+        feats = {f.strip() for f in feats_s.split(",") if f.strip()}
+        unknown = feats - set(CONTEXT_FEATURE_ORDER)
+        if unknown:
+            raise ValueError(f"Ablation config {label.strip()!r}: unknown features {sorted(unknown)}.")
+        if not feats:
+            raise ValueError(f"Ablation config {label.strip()!r} has no features.")
+        out.append((label.strip(), [k for k in CONTEXT_FEATURE_ORDER if k in feats]))
+    if not out:
+        raise ValueError("No valid ablation configs parsed from --ablation_configs.")
+    return out
+
+
+def plot_ablation_comparison(*, run_dir: Path, title: str, labels: list[str],
+                             test_metrics: dict, show_plots: bool, fname: str) -> None:
+    plt = get_plt(show_plots)
+    setup_plot_style(plt)
+    succ = [float(test_metrics[l]["success_rate"]) for l in labels]
+    wall = [float(test_metrics[l]["wall_success_rate"]) for l in labels]
+    cross = [float(test_metrics[l]["avg_abs_cross_error"]) for l in labels]
+    x = np.arange(len(labels))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(max(8.0, 1.5 * len(labels)), 4.8))
+    bw = 0.4
+    ax1.bar(x - bw / 2, succ, bw, label="success", color="#2563eb")
+    ax1.bar(x + bw / 2, wall, bw, label="wall-clear", color="#93c5fd")
+    if "full" in labels:
+        ax1.axhline(succ[labels.index("full")], color="#1e3a8a", ls=":", lw=1.2, alpha=0.7)
+    ax1.set_xticks(x); ax1.set_xticklabels(labels, rotation=35, ha="right", fontsize=8)
+    ax1.set_ylim(0, 1.0); ax1.set_ylabel("rate")
+    ax1.set_title(title); ax1.legend(loc="lower left", fontsize=8)
+    ax2.bar(x, cross, color="#ef4444")
+    ax2.set_xticks(x); ax2.set_xticklabels(labels, rotation=35, ha="right", fontsize=8)
+    ax2.set_ylabel("avg |gate cross-error|"); ax2.set_title("Gate cross-error (lower = better)")
+    fig.suptitle(title, fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(run_dir / fname, bbox_inches="tight")
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+
+def _run_ablation_sweep(args: argparse.Namespace, device: torch.device, *,
+                        items: list, run_prefix: str, title: str,
+                        extra_config: dict) -> None:
+    """Train ONE architecture once per item (same data/seeds) and compare.
+
+    ``items`` is a list of ``(label, mutate)`` where ``mutate(args)`` applies that
+    config's change (e.g. set context_features, or set ssm_layers). Produces the
+    comparison bar chart, the full trajectory/GIF suite, and a ranked summary.
+    """
+    arch = str(args.ablation_variant)
+    expected_cross_index = estimate_expected_cross_index(args)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = args.run_id or f"{run_prefix}_{arch}_{timestamp}"
+    run_dir = Path(__file__).resolve().parent / "runs" / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    val_batch = sample_batch(args=args, batch_size=int(args.val_batch), seed=int(args.seed) + 50_000,
+                             paired=True, shuffle=False, expected_cross_index=expected_cross_index)
+    test_batch = sample_batch(args=args, batch_size=int(args.test_batch), seed=int(args.seed) + 60_000,
+                              paired=True, shuffle=False, expected_cross_index=expected_cross_index)
+
+    use_mp_only = (arch == "mp_only_context")
+    use_mad = (arch == "mad_context")
+    use_contextual = (arch == "contextual_ssm")
+
+    print(f"[{run_prefix}] architecture={arch}; {len(items)} configs; run -> {run_dir}")
+    controllers: dict = {}
+    plants: dict = {}
+    test_metrics: dict[str, dict] = {}
+    val_metrics: dict[str, dict] = {}
+    histories: dict[str, list[dict]] = {}
+    labels: list[str] = []
+    for label, mutate in items:
+        mutate(args)
+        labels.append(label)
+        print(f"\n[{run_prefix}] '{label}'  (context_dim={context_dim(args)}, ssm_layers={args.ssm_layers})")
+        controller, plant_true, history, best_val = train_controller(
+            args=args, device=device, mode=arch, val_batch=val_batch,
+            expected_cross_index=expected_cross_index,
+            mp_only=use_mp_only, factor_rank_override=1 if use_mad else None,
+            contextual=use_contextual,
+        )
+        controllers[label] = controller
+        plants[label] = plant_true
+        test_metrics[label] = evaluate_variant(
+            args=args, batch=test_batch, device=device, mode=arch,
+            controller=controller, plant_true=plant_true, expected_cross_index=expected_cross_index)
+        val_metrics[label] = best_val
+        histories[label] = history
+        if controller is not None:
+            torch.save(controller.state_dict(), run_dir / f"{label}_controller.pt")
+
+    config_payload = dict(vars(args))
+    config_payload["expected_cross_index"] = int(expected_cross_index)
+    config_payload.update(extra_config)
+    save_json(run_dir / "config.json", config_payload)
+    save_json(run_dir / "metrics.json", {lab: strip_rollout(test_metrics[lab]) for lab in labels})
+    save_json(run_dir / "val_metrics.json", {lab: strip_rollout(val_metrics[lab]) for lab in labels})
+    save_json(run_dir / "train_history.json", histories)
+    plot_ablation_comparison(run_dir=run_dir, title=title, labels=labels,
+                             test_metrics=test_metrics, show_plots=not args.no_show_plots,
+                             fname=f"{run_prefix}_comparison.png")
+    # Full comparison suite (trajectory overlays, control curves, storyboards, GIFs),
+    # each config treated as a "variant" (its stored rollout carries its own setup).
+    _run_all_plots(
+        args=args, run_dir=run_dir, specs=[(lab, lab) for lab in labels],
+        controllers=controllers, plants=plants,
+        val_batch=val_batch, test_batch=test_batch,
+        val_metrics=val_metrics, test_metrics=test_metrics, histories=histories,
+        show_plots=not args.no_show_plots, expected_cross_index=expected_cross_index,
+    )
+
+    print("\n" + "=" * 76)
+    print(title)
+    print("=" * 76)
+    for label in sorted(labels, key=lambda l: test_metrics[l]["success_rate"], reverse=True):
+        m = test_metrics[label]
+        print(f"{label:22s} success={m['success_rate']:.3f} wall={m['wall_success_rate']:.3f} "
+              f"goal={m['goal_success_rate']:.3f} cross_err={m['avg_abs_cross_error']:.3f}")
+    print("=" * 76)
+
+
+def run_context_ablation(args: argparse.Namespace, device: torch.device) -> None:
+    """Sweep context-feature subsets for one architecture (same data/seeds)."""
+    configs = parse_ablation_configs(args)
+
+    def _mk(feats):
+        return lambda a: setattr(a, "context_features", ",".join(feats))
+
+    items = [(lab, _mk(feats)) for lab, feats in configs]
+    _run_ablation_sweep(
+        args, device, items=items, run_prefix="ablation",
+        title=f"Context ablation — {args.ablation_variant}",
+        extra_config={"ablation_configs_parsed": {lab: feats for lab, feats in configs}},
+    )
+
+
+def parse_ablation_layers(args: argparse.Namespace) -> list[int]:
+    """Parse --ablation_layers 'n1,n2,...' into a de-duplicated list of layer counts.
+
+    Empty -> a small sweep around the current --ssm_layers (base//2, base, base*2).
+    """
+    raw = str(getattr(args, "ablation_layers", "") or "").strip()
+    if not raw:
+        base = max(1, int(args.ssm_layers))
+        return sorted({max(1, base // 2), base, base * 2})
+    out: list[int] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        n = int(tok)
+        if n < 1:
+            raise ValueError(f"--ablation_layers entries must be >= 1 (got {n}).")
+        if n not in out:
+            out.append(n)
+    if not out:
+        raise ValueError("No valid layer counts parsed from --ablation_layers.")
+    return out
+
+
+def run_layers_ablation(args: argparse.Namespace, device: torch.device) -> None:
+    """Sweep SSM depth (--ssm_layers) for one architecture; same context/data/seeds."""
+    layers = parse_ablation_layers(args)
+
+    def _mk(n):
+        return lambda a: setattr(a, "ssm_layers", int(n))
+
+    items = [(f"L{n}", _mk(n)) for n in layers]
+    _run_ablation_sweep(
+        args, device, items=items, run_prefix="layers",
+        title=f"SSM depth comparison — {args.ablation_variant}",
+        extra_config={"ablation_layers": layers},
+    )
+
+
 def main() -> None:
     args = parse_args()
     set_seeds(int(args.seed))
@@ -3220,6 +3600,16 @@ def main() -> None:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             print("[cuda] TF32 matmul/cudnn kernels enabled.")
+
+    # ── Context-ablation mode ─────────────────────────────────────────────────
+    if getattr(args, "ablate_context", False):
+        run_context_ablation(args, device)
+        return
+
+    # ── SSM-depth comparison mode ─────────────────────────────────────────────
+    if getattr(args, "ablate_layers", False):
+        run_layers_ablation(args, device)
+        return
 
     # ── Plot-only mode ────────────────────────────────────────────────────────
     if args.plot_only:
@@ -3386,6 +3776,32 @@ def main() -> None:
                   f"(target >= {factorized_total:,} params).")
         mp_only_layers = int(args.mp_only_ssm_layers or args.ssm_layers)
 
+    # Optional: size every OTHER trainable variant so its total param count matches
+    # contextual_ssm as closely as possible (fair comparison; layers stay fixed).
+    matched_d_model: dict[str, int] = {}
+    if getattr(args, "match_to_contextual", False) and any(m == "contextual_ssm" for m, _ in specs):
+        _ctx_ctrl, _ = build_controller(device, args, contextual=True)
+        _target = count_params(_ctx_ctrl)
+        del _ctx_ctrl
+        print(f"[match] target = contextual_ssm params = {_target:,}")
+        _shape_cache: dict = {}
+        for _mode, _ in specs:
+            if _mode in ("nominal", "contextual_ssm"):
+                continue
+            shape = (_mode == "mp_only_context", _mode == "mad_context")  # (mp_only, use_mad)
+            if shape not in _shape_cache:
+                _shape_cache[shape] = find_matched_d_model(
+                    args=args, device=device, target_params=_target,
+                    mp_only=shape[0], use_mad=shape[1])
+            matched_d_model[_mode] = _shape_cache[shape]
+            _c, _ = build_controller(
+                device, args, mp_only=shape[0],
+                factor_rank_override=1 if shape[1] else None,
+                ssm_d_model_override=matched_d_model[_mode])
+            print(f"[match] {_mode}: ssm_d_model={matched_d_model[_mode]} -> "
+                  f"{count_params(_c):,} params (target {_target:,})")
+            del _c
+
     for mode, label in specs:
         print(f"\nTraining/evaluating {label}...")
         # Warm-start the context mode from the disturbance_only checkpoint.
@@ -3408,8 +3824,8 @@ def main() -> None:
             mp_only=use_mp_only,
             force_no_lift=use_no_lift,
             factor_rank_override=1 if use_mad else None,
-            ssm_d_model_override=mp_only_d_model if use_mp_only else None,
-            ssm_layers_override=mp_only_layers if use_mp_only else None,
+            ssm_d_model_override=matched_d_model.get(mode, mp_only_d_model if use_mp_only else None),
+            ssm_layers_override=(mp_only_layers if (use_mp_only and mode not in matched_d_model) else None),
             contextual=use_contextual,
         )
         controllers[mode] = controller

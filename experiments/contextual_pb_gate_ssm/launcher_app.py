@@ -54,7 +54,7 @@ GROUPS = [
         "train_batch", "val_batch", "test_batch", "epochs", "disturbance_only_epochs",
         "eval_every", "lr", "lr_min", "grad_clip", "warm_start"}, True),
     ("Plots & storyboards", lambda d: d in {"use_storyboard", "use_storyboard_compact"}, False),
-    ("Contextual SSM (new variant)", lambda d: d.startswith("ctx_") or d == "contextual_comparison", True),
+    ("Contextual SSM (new variant)", lambda d: d.startswith("ctx_") or d in {"contextual_comparison", "match_to_contextual"}, True),
     ("SSM core", lambda d: d.startswith("ssm_") or d.startswith("mp_only_ssm"), False),
     ("PB architecture", lambda d: d in {
         "feat_dim", "mb_hidden", "mb_layers", "z_scale", "z_residual_gain", "mb_bound",
@@ -67,8 +67,9 @@ GROUPS = [
         "wall_focus_sigma", "gate_settle_steps"}, False),
     ("Gate schedule / motion", lambda d: d.startswith("gate_dwell") or d in {"gate_corr_time", "gate_range", "gate_center_range"}, False),
     ("Disturbance process", lambda d: d.startswith("noise_") or d.startswith("gust_"), False),
-    ("Loss weights", lambda d: d.endswith("_weight") or d.endswith("_sharpness")
-        or d in {"use_terminal_vel", "sample_traj_count", "gate_margin_train"}, False),
+    ("Loss weights & normalization", lambda d: d.endswith("_weight") or d.endswith("_sharpness")
+        or d.startswith("alpha_") or d == "loss_normalize"
+        or d in {"use_terminal_vel", "sample_traj_count", "gate_margin_train", "settle_sigma"}, False),
 ]
 
 
@@ -372,42 +373,114 @@ def main():
                     return feature in fair_default
                 return feature in ("gate_error", "approach", "switch_age")  # legacy minimal
 
+            # Run mode + ablation controls live OUTSIDE the form so toggling them
+            # re-renders ① immediately (forms don't rerun on widget change).
+            run_mode = st.radio(
+                "⚙️ Run mode", ["Single run", "Context ablation", "Layer comparison"],
+                horizontal=True, key="run_mode_radio",
+                help="Single run = train the ticked variants once. Context ablation = one arch, "
+                     "sweep context subsets. Layer comparison = one arch + same context, sweep "
+                     "SSM depth. Both sweeps share data/seeds and produce one comparison plot.",
+            )
+            is_ablation = (run_mode == "Context ablation")
+            is_layers = (run_mode == "Layer comparison")
+            abl_arch_opts = [(k, lab) for k, lab in get_variant_options()
+                             if k in ("context", "mad_context", "mp_only_context", "contextual_ssm")]
+            abl_type = None
+            abl_n_sets = 3
+            if is_ablation:
+                abl_type = st.radio(
+                    "Ablation type", ["Leave-one-out", "Single-feature", "Custom sets"],
+                    horizontal=True, key="abl_type",
+                    help="Leave-one-out: full set vs full-minus-each (largest success drop = the "
+                         "decisive feature). Single-feature: each feature alone. Custom sets: "
+                         "define your own comparison sets with checkboxes.",
+                )
+                if abl_type == "Custom sets":
+                    abl_n_sets = st.slider("How many sets to compare", 2, 6, 3, key="abl_n_sets")
+
             assigned: set[str] = set()
             with st.form("launch_form", border=False):
-                st.markdown("#### ① Variants to run")
-                st.caption("Tick the controllers to train & compare in this run.")
-                vopts = get_variant_options()
-                vcols = st.columns(3)
-                for i, (vkey, vlabel) in enumerate(vopts):
-                    vcols[i % 3].checkbox(
-                        vlabel,
-                        value=bool(variant_overrides.get(vkey, vkey in VARIANT_DEFAULT_ON)),
-                        help=VARIANT_HELP.get(vkey),
-                        key=f"var_{vkey}",
-                    )
+                if is_ablation:
+                    st.markdown("#### ① Architecture to ablate")
+                    _arch_labels = [lab for _, lab in abl_arch_opts]
+                    st.selectbox("Architecture (held fixed across the sweep)", _arch_labels,
+                                 index=0, key="abl_arch_label")
+                    if abl_type == "Custom sets":
+                        st.markdown("**Define comparison sets** — tick which features go in each "
+                                    "set (empty sets are skipped; ⚠️ = privileged / cheating).")
+                        _hdr = st.columns([2] + [1] * abl_n_sets)
+                        _hdr[0].markdown("**feature**")
+                        for s in range(abl_n_sets):
+                            _hdr[s + 1].text_input(f"name {s + 1}", value=f"set{s + 1}",
+                                                   key=f"abl_set_name_{s}",
+                                                   label_visibility="collapsed")
+                        for f in ctx_feats:
+                            _row = st.columns([2] + [1] * abl_n_sets)
+                            _tag = " ⚠️" if ctx_meta[f][0] == "privileged" else ""
+                            _row[0].markdown(f"`{f}`{_tag}")
+                            for s in range(abl_n_sets):
+                                _row[s + 1].checkbox(
+                                    f"{f} in set {s + 1}",
+                                    value=(s == 0 and ctx_meta[f][0] == "fair"),
+                                    key=f"abl_set_{s}_{f}", label_visibility="collapsed")
+                    else:
+                        st.caption("The context checkboxes in ② define the **base feature set** "
+                                   "the sweep ablates from.")
+                elif is_layers:
+                    st.markdown("#### ① SSM depth comparison")
+                    _arch_labels = [lab for _, lab in abl_arch_opts]
+                    st.selectbox("Architecture (held fixed across the sweep)", _arch_labels,
+                                 index=0, key="abl_arch_label")
+                    st.text_input("SSM layer counts to compare (comma-separated)",
+                                  value="", key="layers_list", placeholder="3,6,9,12")
+                    st.caption("Same architecture + same context (②) trained at each depth. "
+                               "Blank = a sweep around the SSM n_layers value in ③; overrides it.")
+                else:
+                    st.markdown("#### ① Variants to run")
+                    st.caption("Tick the controllers to train & compare in this run.")
+                    vopts = get_variant_options()
+                    vcols = st.columns(3)
+                    for i, (vkey, vlabel) in enumerate(vopts):
+                        vcols[i % 3].checkbox(
+                            vlabel,
+                            value=bool(variant_overrides.get(vkey, vkey in VARIANT_DEFAULT_ON)),
+                            help=VARIANT_HELP.get(vkey),
+                            key=f"var_{vkey}",
+                        )
                 st.divider()
 
-                st.markdown("#### ② Context signal")
-                st.caption("Pick what information the controller receives. Causal gate-motion "
-                           "signals are fair; schedule/noncausal features stay privileged.")
-                fair_keys = [k for k in ctx_feats if ctx_meta[k][0] == "fair"]
-                priv_keys = [k for k in ctx_feats if ctx_meta[k][0] == "privileged"]
-                xc1, xc2 = st.columns(2)
-                xc1.markdown("**Fair** — observation, causal motion + own state")
-                for k in fair_keys:
-                    xc1.checkbox(
-                        ctx_meta[k][1],
-                        value=bool(ctx_overrides.get(k, _ctx_default(k))),
-                        key=f"ctx_{k}",
-                    )
-                xc2.markdown("**Privileged** — schedule / noncausal ⚠️ cheating")
-                for k in priv_keys:
-                    xc2.checkbox(
-                        "⚠️ " + ctx_meta[k][1],
-                        value=bool(ctx_overrides.get(k, _ctx_default(k))),
-                        key=f"ctx_{k}",
-                    )
-                st.divider()
+                # ② is the context picker for single runs / the base set for LOO &
+                # Single-feature ablations. Custom-sets ablation defines its sets in ①.
+                if not (is_ablation and abl_type == "Custom sets"):
+                    st.markdown("#### ② Context signal")
+                    if is_ablation:
+                        st.caption("These define the **base feature set** the sweep ablates from. "
+                                   "Causal gate-motion signals are fair; schedule/noncausal stay privileged.")
+                    elif is_layers:
+                        st.caption("This is the **fixed context** used at every SSM depth. "
+                                   "Causal gate-motion signals are fair; schedule/noncausal stay privileged.")
+                    else:
+                        st.caption("Pick what information the controller receives. Causal gate-motion "
+                                   "signals are fair; schedule/noncausal features stay privileged.")
+                    fair_keys = [k for k in ctx_feats if ctx_meta[k][0] == "fair"]
+                    priv_keys = [k for k in ctx_feats if ctx_meta[k][0] == "privileged"]
+                    xc1, xc2 = st.columns(2)
+                    xc1.markdown("**Fair** — observation, causal motion + own state")
+                    for k in fair_keys:
+                        xc1.checkbox(
+                            ctx_meta[k][1],
+                            value=bool(ctx_overrides.get(k, _ctx_default(k))),
+                            key=f"ctx_{k}",
+                        )
+                    xc2.markdown("**Privileged** — schedule / noncausal ⚠️ cheating")
+                    for k in priv_keys:
+                        xc2.checkbox(
+                            "⚠️ " + ctx_meta[k][1],
+                            value=bool(ctx_overrides.get(k, _ctx_default(k))),
+                            key=f"ctx_{k}",
+                        )
+                    st.divider()
 
                 st.markdown("#### ③ Parameters")
                 c1, c2 = st.columns(2)
@@ -470,24 +543,92 @@ def main():
             if submitted:
                 widget_vals = {d: st.session_state.get(f"w_{d}") for d in active_order}
                 run_id = (widget_vals.get("run_id") or "").strip() or f"ui_{datetime.now():%Y%m%d_%H%M%S}"
-                selected = [k for k, _ in get_variant_options() if st.session_state.get(f"var_{k}")]
-                ctx_selected = [k for k in ctx_feats if st.session_state.get(f"ctx_{k}")]
-                if not selected:
-                    st.error("Select at least one variant to run under ① above.")
-                elif not ctx_selected:
-                    st.error("Select at least one context feature under ② above.")
+
+                if is_ablation:
+                    _arch_label = st.session_state.get("abl_arch_label")
+                    arch = next((k for k, lab in abl_arch_opts if lab == _arch_label), "context")
+                    err = None
+                    configs_str = ""
+                    if abl_type == "Custom sets":
+                        cfgs = []
+                        for s in range(abl_n_sets):
+                            fs = [f for f in ctx_order if f in ctx_feats
+                                  and st.session_state.get(f"abl_set_{s}_{f}")]
+                            if not fs:
+                                continue
+                            nm = (st.session_state.get(f"abl_set_name_{s}") or f"set{s + 1}").strip() or f"set{s + 1}"
+                            cfgs.append((nm, fs))
+                        if len(cfgs) < 2:
+                            err = "Tick features for at least 2 non-empty sets in ①."
+                        else:
+                            configs_str = ";".join(f"{lab}:{','.join(fs)}" for lab, fs in cfgs)
+                    else:
+                        base = [k for k in ctx_order if k in ctx_feats and st.session_state.get(f"ctx_{k}")]
+                        if not base:
+                            err = "Tick ≥1 context feature in ② to define the base set."
+                        elif abl_type == "Leave-one-out" and len(base) < 2:
+                            err = "Leave-one-out needs ≥2 base features (in ②)."
+                        elif abl_type == "Leave-one-out":
+                            cfgs = [("full", base)] + [(f"-{f}", [x for x in base if x != f]) for f in base]
+                            configs_str = ";".join(f"{lab}:{','.join(fs)}" for lab, fs in cfgs)
+                        else:  # Single-feature
+                            cfgs = [(f, [f]) for f in base]
+                            configs_str = ";".join(f"{lab}:{','.join(fs)}" for lab, fs in cfgs)
+                    if err:
+                        st.error(err)
+                    else:
+                        argv, warns = build_argv(active_order, bools, values, widget_vals, run_id)
+                        argv += ["--gate_motion", exp_key, "--ablate_context",
+                                 "--ablation_variant", arch, "--ablation_configs", configs_str]
+                        for w in warns:
+                            st.warning(w)
+                        launch(argv, run_id)
+                        st.success(
+                            f"Launched ablation **{run_id}** — {exp_label}; arch=`{arch}`; "
+                            f"{abl_type}  (PID {st.session_state['proc'].pid}). See Browse for results.")
+                elif is_layers:
+                    _arch_label = st.session_state.get("abl_arch_label")
+                    arch = next((k for k, lab in abl_arch_opts if lab == _arch_label), "context")
+                    ctx_selected = [k for k in ctx_feats if st.session_state.get(f"ctx_{k}")]
+                    layers_str = (st.session_state.get("layers_list") or "").strip()
+                    nlayers = [t.strip() for t in layers_str.split(",") if t.strip()]
+                    if not ctx_selected:
+                        st.error("Select at least one context feature under ② above.")
+                    elif layers_str and len(nlayers) < 2:
+                        st.error("Give at least 2 layer counts to compare (or leave blank for an auto sweep).")
+                    else:
+                        argv, warns = build_argv(active_order, bools, values, widget_vals, run_id)
+                        argv += ["--gate_motion", exp_key,
+                                 "--context_features", ",".join(ctx_selected),
+                                 "--ablate_layers", "--ablation_variant", arch]
+                        if layers_str:
+                            argv += ["--ablation_layers", layers_str]
+                        for w in warns:
+                            st.warning(w)
+                        launch(argv, run_id)
+                        st.success(
+                            f"Launched depth sweep **{run_id}** — {exp_label}; arch=`{arch}`; "
+                            f"layers=[{layers_str or 'auto'}]  (PID {st.session_state['proc'].pid}). "
+                            "See Browse for results.")
                 else:
-                    argv, warns = build_argv(active_order, bools, values, widget_vals, run_id)
-                    argv += ["--gate_motion", exp_key]
-                    argv += ["--context_features", ",".join(ctx_selected)]
-                    argv += ["--variants", ",".join(selected)]
-                    for w in warns:
-                        st.warning(w)
-                    launch(argv, run_id)
-                    st.success(
-                        f"Launched **{run_id}** — {exp_label}; {len(selected)} variant(s): "
-                        f"{', '.join(selected)}; context [{', '.join(ctx_selected)}]  "
-                        f"(PID {st.session_state['proc'].pid}).")
+                    selected = [k for k, _ in get_variant_options() if st.session_state.get(f"var_{k}")]
+                    ctx_selected = [k for k in ctx_feats if st.session_state.get(f"ctx_{k}")]
+                    if not selected:
+                        st.error("Select at least one variant to run under ① above.")
+                    elif not ctx_selected:
+                        st.error("Select at least one context feature under ② above.")
+                    else:
+                        argv, warns = build_argv(active_order, bools, values, widget_vals, run_id)
+                        argv += ["--gate_motion", exp_key]
+                        argv += ["--context_features", ",".join(ctx_selected)]
+                        argv += ["--variants", ",".join(selected)]
+                        for w in warns:
+                            st.warning(w)
+                        launch(argv, run_id)
+                        st.success(
+                            f"Launched **{run_id}** — {exp_label}; {len(selected)} variant(s): "
+                            f"{', '.join(selected)}; context [{', '.join(ctx_selected)}]  "
+                            f"(PID {st.session_state['proc'].pid}).")
 
             proc = st.session_state.get("proc")
             if proc is not None:
