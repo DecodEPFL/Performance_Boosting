@@ -13,14 +13,29 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shutil
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+
+from rcp_backend import (
+    RCPConfig,
+    build_delete_command,
+    build_describe_command,
+    build_logs_command,
+    build_scp_command,
+    build_submit_command,
+    infer_job_state,
+    is_terminal_success,
+    remote_run_dir,
+)
 
 EXP_DIR = Path(__file__).resolve().parent
 ROOT = EXP_DIR.parents[1]
@@ -214,12 +229,14 @@ def load_ui_defaults() -> dict:
 
 
 def save_ui_defaults(params: dict, variants: dict, context: dict | None = None,
-                     experiment: str | None = None) -> None:
+                     experiment: str | None = None, rcp: dict | None = None) -> None:
     payload = {"params": params, "variants": variants}
     if context is not None:
         payload["context"] = context
     if experiment is not None:
         payload["experiment"] = experiment
+    if rcp is not None:
+        payload["rcp"] = rcp
     DEFAULTS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -320,6 +337,96 @@ def launch(argv, run_id):
     )
 
 
+RCP_DEFAULTS = {
+    "gaspar": "lmassai",
+    "harbor_project": "context_leo",
+    "image": "context",
+    "tag": "v1.1",
+    "runai_project": "sci-sti-gft-lmassai",
+    "gpu": "0.1",
+    "cpu": "4",
+    "cpu_memory": "16G",
+    "code_dir": "/home/lmassai/Performance_Boosting",
+    "home_claim": "home",
+    "scratch_claim": "sci-sti-gft-scratch",
+    "job_name": "",
+    "jumphost": "lmassai@jumphost.rcp.epfl.ch",
+    "runai_bin": "~/.local/bin/runai",
+}
+
+
+def rcp_values() -> dict:
+    return {key: str(st.session_state.get(f"rcp_{key}", value)).strip()
+            for key, value in RCP_DEFAULTS.items()}
+
+
+def rcp_config(job_name: str | None = None) -> RCPConfig:
+    values = rcp_values()
+    if job_name is not None:
+        values["job_name"] = job_name
+    return RCPConfig(**values)
+
+
+def start_rcp_submission(argv: list[str], run_id: str, config: RCPConfig) -> None:
+    """Start the short Run:AI submit request asynchronously."""
+    logfile = LOG_DIR / f"rcp_submit_{config.job_name}.log"
+    cmd = build_submit_command(config, argv)
+    logf = open(logfile, "w", buffering=1)
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                            stdout=logf, stderr=subprocess.STDOUT,
+                            cwd=str(ROOT), text=True)
+    st.session_state.update(
+        rcp_submit_proc=proc, rcp_submit_logf=logf, rcp_submit_log=str(logfile),
+        rcp_active_job_name=config.job_name, rcp_run_id=run_id,
+        rcp_active_config=config, rcp_submit_cmd=shlex.join(cmd),
+        rcp_last_state="Submitting", rcp_status_output="", rcp_logs_output="",
+    )
+
+
+def run_rcp_cli(cmd: list[str], purpose: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, cwd=str(ROOT), text=True, capture_output=True,
+                              timeout=30, check=False)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"{purpose} failed: Run:AI CLI was not found at `{cmd[0]}`. "
+            "Install/configure it or update the CLI path in RCP settings.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{purpose} timed out after 30 seconds; check network/VPN access.") from exc
+
+
+def cli_error(purpose: str, result: subprocess.CompletedProcess) -> str:
+    detail = (result.stderr or result.stdout or "No CLI output").strip()
+    hint = "Check `runai login`, the selected project/context, workload name, image, and PVC claims."
+    return f"{purpose} failed (exit {result.returncode}). {hint}\n\n{detail}"
+
+
+def sync_rcp_results(config: RCPConfig, run_id: str) -> Path:
+    """Copy to staging first, then merge only after scp succeeds."""
+    staging = Path(tempfile.mkdtemp(prefix=f"gate_{run_id}_", dir=str(LOG_DIR)))
+    try:
+        cmd = build_scp_command(config, run_id, staging)
+        result = subprocess.run(cmd, cwd=str(ROOT), text=True, capture_output=True,
+                                timeout=900, check=False)
+        if result.returncode:
+            raise RuntimeError(
+                "SSH transfer failed. Confirm VPN/jumphost access, your existing SSH session, "
+                f"and that `{remote_run_dir(config, run_id)}` exists.\n\n"
+                + (result.stderr or result.stdout or "No scp output").strip())
+        downloaded = staging / run_id
+        if not downloaded.is_dir():
+            raise RuntimeError(f"scp finished but did not create the expected `{downloaded}` directory.")
+        destination = RUNS_DIR / run_id
+        shutil.copytree(downloaded, destination, dirs_exist_ok=True)
+        return destination
+    except FileNotFoundError as exc:
+        raise RuntimeError("`scp` was not found on this Mac.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("SSH transfer timed out after 15 minutes.") from exc
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def tail(path, max_lines=500):
     try:
         lines = Path(path).read_text(errors="replace").splitlines()
@@ -352,6 +459,64 @@ def main():
             variant_overrides = saved_defaults.get("variants", {}) or {}
             ctx_overrides = saved_defaults.get("context", {}) or {}
             exp_override = saved_defaults.get("experiment")
+            rcp_overrides = {**RCP_DEFAULTS, **(saved_defaults.get("rcp", {}) or {})}
+
+            target_widget = getattr(st, "segmented_control", None)
+            if target_widget:
+                execution_target = target_widget(
+                    "Execution target", ["Local", "EPFL RCP"], default="Local",
+                    key="execution_target", width="stretch")
+            else:  # compatibility with older Streamlit releases
+                execution_target = st.radio(
+                    "Execution target", ["Local", "EPFL RCP"], horizontal=True,
+                    key="execution_target")
+
+            # A fresh RCP selection should actually use its requested GPU. Restore
+            # the parser default when returning to Local so local behavior remains
+            # unchanged unless the user explicitly chooses another device.
+            previous_target = st.session_state.get("_previous_execution_target")
+            parser_device = values.get("device", {}).get("default", "cpu")
+            if execution_target == "EPFL RCP" and previous_target != "EPFL RCP":
+                if st.session_state.get("w_device", parser_device) == parser_device:
+                    st.session_state["w_device"] = "cuda"
+                    st.session_state["_rcp_device_auto"] = True
+            elif (execution_target == "Local" and previous_target == "EPFL RCP"
+                  and st.session_state.get("_rcp_device_auto")
+                  and st.session_state.get("w_device") == "cuda"):
+                st.session_state["w_device"] = parser_device
+                st.session_state["_rcp_device_auto"] = False
+            st.session_state["_previous_execution_target"] = execution_target
+
+            if execution_target == "EPFL RCP":
+                with st.expander("☁️ EPFL RCP / Run:AI settings", expanded=True):
+                    st.caption(
+                        "Uses your existing Run:AI and SSH sessions. No password or token is "
+                        "requested or saved. The experiment argv below is passed through unchanged.")
+                    ra, rb, rc = st.columns(3)
+                    ra.text_input("GASPAR", value=rcp_overrides["gaspar"], key="rcp_gaspar")
+                    rb.text_input("Harbor project", value=rcp_overrides["harbor_project"],
+                                  key="rcp_harbor_project")
+                    rc.text_input("Image", value=rcp_overrides["image"], key="rcp_image")
+                    ra.text_input("Image tag", value=rcp_overrides["tag"], key="rcp_tag")
+                    rb.text_input("Run:AI project", value=rcp_overrides["runai_project"],
+                                  key="rcp_runai_project")
+                    rc.text_input("GPU request", value=rcp_overrides["gpu"], key="rcp_gpu",
+                                  help="0.1 = fractional GPU; 1 (or more) = whole device(s); 0 = none.")
+                    ra.text_input("CPU cores", value=rcp_overrides["cpu"], key="rcp_cpu",
+                                  help="CPU requested for simulation, data loading, and plotting.")
+                    rb.text_input("CPU memory", value=rcp_overrides["cpu_memory"],
+                                  key="rcp_cpu_memory", help="For example 16G or 32000M.")
+                    st.text_input("Remote code directory", value=rcp_overrides["code_dir"],
+                                  key="rcp_code_dir")
+                    ra.text_input("Home PVC claim", value=rcp_overrides["home_claim"],
+                                  key="rcp_home_claim")
+                    rb.text_input("Scratch PVC claim", value=rcp_overrides["scratch_claim"],
+                                  key="rcp_scratch_claim")
+                    rc.text_input("Job name (blank = run ID)", value=rcp_overrides["job_name"],
+                                  key="rcp_job_name")
+                    st.text_input("Jumphost", value=rcp_overrides["jumphost"], key="rcp_jumphost")
+                    st.text_input("Run:AI CLI path", value=rcp_overrides["runai_bin"],
+                                  key="rcp_runai_bin")
 
             # Experiment selector lives OUTSIDE the form so changing it re-renders
             # the form (different gate params + context options) immediately.
@@ -507,7 +672,8 @@ def main():
                                               param_overrides.get(d, _NO_OVERRIDE))
                 _bc1, _bc2 = st.columns([2, 2])
                 submitted = _bc1.form_submit_button(
-                    "🚀 Launch run", type="primary", width="stretch")
+                    "☁️ Submit to RCP" if execution_target == "EPFL RCP" else "🚀 Launch run",
+                    type="primary", width="stretch")
                 save_clicked = _bc2.form_submit_button(
                     "💾 Save current values as defaults", width="stretch")
 
@@ -519,7 +685,8 @@ def main():
                 variants = {k: bool(st.session_state.get(f"var_{k}"))
                             for k, _ in get_variant_options()}
                 context = {k: bool(st.session_state.get(f"ctx_{k}")) for k in ctx_feats}
-                save_ui_defaults(params, variants, context=context, experiment=exp_label)
+                save_ui_defaults(params, variants, context=context, experiment=exp_label,
+                                 rcp=rcp_values())
                 st.success(
                     f"Saved current values as defaults → `{DEFAULTS_FILE.name}` "
                     f"(experiment: {exp_label}). New launcher sessions start from these; "
@@ -539,6 +706,36 @@ def main():
                     st.session_state.pop("experiment_radio", None)
                     st.toast("Reset to built-in defaults.")
                     _rerun()
+
+            def launch_selected(argv: list[str], run_id: str, summary: str) -> None:
+                if execution_target == "Local":
+                    launch(argv, run_id)
+                    st.success(
+                        f"Launched **{run_id}** locally — {summary} "
+                        f"(PID {st.session_state['proc'].pid}).")
+                    return
+                raw_job = rcp_values()["job_name"] or run_id
+                job_name = re.sub(r"[^a-z0-9-]+", "-", raw_job.lower()).strip("-")[:63]
+                if not job_name:
+                    st.error("Choose a job name containing letters or numbers.")
+                    return
+                try:
+                    config = rcp_config(job_name)
+                    gpu_amount = float(config.gpu)
+                    selected_device = st.session_state.get("w_device", parser_device)
+                    if gpu_amount > 0 and selected_device != "cuda":
+                        st.error(
+                            f"GPU `{config.gpu}` was requested, but experiment device is "
+                            f"`{selected_device}`. Choose `cuda` under Parameters → Run & I/O; "
+                            "otherwise the allocated GPU will sit unused.")
+                        return
+                    start_rcp_submission(argv, run_id, config)
+                except (TypeError, ValueError, OSError) as exc:
+                    st.error(f"Could not start RCP submission: {exc}")
+                    return
+                st.success(
+                    f"Submitting Run:AI job **{job_name}** for run **{run_id}** — {summary}. "
+                    "The submit request is running in the background; use the controls below.")
 
             if submitted:
                 widget_vals = {d: st.session_state.get(f"w_{d}") for d in active_order}
@@ -582,10 +779,9 @@ def main():
                                  "--ablation_variant", arch, "--ablation_configs", configs_str]
                         for w in warns:
                             st.warning(w)
-                        launch(argv, run_id)
-                        st.success(
-                            f"Launched ablation **{run_id}** — {exp_label}; arch=`{arch}`; "
-                            f"{abl_type}  (PID {st.session_state['proc'].pid}). See Browse for results.")
+                        launch_selected(
+                            argv, run_id,
+                            f"{exp_label}; arch=`{arch}`; {abl_type} ablation")
                 elif is_layers:
                     _arch_label = st.session_state.get("abl_arch_label")
                     arch = next((k for k, lab in abl_arch_opts if lab == _arch_label), "context")
@@ -605,11 +801,9 @@ def main():
                             argv += ["--ablation_layers", layers_str]
                         for w in warns:
                             st.warning(w)
-                        launch(argv, run_id)
-                        st.success(
-                            f"Launched depth sweep **{run_id}** — {exp_label}; arch=`{arch}`; "
-                            f"layers=[{layers_str or 'auto'}]  (PID {st.session_state['proc'].pid}). "
-                            "See Browse for results.")
+                        launch_selected(
+                            argv, run_id,
+                            f"{exp_label}; arch=`{arch}`; layers=[{layers_str or 'auto'}]")
                 else:
                     selected = [k for k, _ in get_variant_options() if st.session_state.get(f"var_{k}")]
                     ctx_selected = [k for k in ctx_feats if st.session_state.get(f"ctx_{k}")]
@@ -624,11 +818,10 @@ def main():
                         argv += ["--variants", ",".join(selected)]
                         for w in warns:
                             st.warning(w)
-                        launch(argv, run_id)
-                        st.success(
-                            f"Launched **{run_id}** — {exp_label}; {len(selected)} variant(s): "
-                            f"{', '.join(selected)}; context [{', '.join(ctx_selected)}]  "
-                            f"(PID {st.session_state['proc'].pid}).")
+                        launch_selected(
+                            argv, run_id,
+                            f"{exp_label}; {len(selected)} variant(s): {', '.join(selected)}; "
+                            f"context [{', '.join(ctx_selected)}]")
 
             proc = st.session_state.get("proc")
             if proc is not None:
@@ -650,6 +843,122 @@ def main():
                 st.code(tail(st.session_state.get("proc_log", "")), language="text")
                 if auto and running:
                     time.sleep(2)
+                    _rerun()
+
+            submit_proc = st.session_state.get("rcp_submit_proc")
+            active_rcp = st.session_state.get("rcp_active_config")
+            if submit_proc is not None and active_rcp is not None:
+                st.divider()
+                st.subheader("☁️ Run:AI workload")
+                submit_ret = submit_proc.poll()
+                submit_running = submit_ret is None
+                if not submit_running:
+                    logf = st.session_state.pop("rcp_submit_logf", None)
+                    if logf and not logf.closed:
+                        logf.close()
+                    if submit_ret == 0 and st.session_state.get("rcp_last_state") == "Submitting":
+                        st.session_state["rcp_last_state"] = "Submitted"
+                hdr = st.columns([2, 2, 1])
+                hdr[0].markdown(f"**Job:** `{active_rcp.job_name}`")
+                hdr[1].markdown(f"**Run ID:** `{st.session_state.get('rcp_run_id', '?')}`")
+                hdr[2].markdown(f"**{st.session_state.get('rcp_last_state', 'Unknown')}**")
+
+                submit_output = tail(st.session_state.get("rcp_submit_log", ""), max_lines=100)
+                if submit_running:
+                    st.info("Submission request is in progress…")
+                elif submit_ret != 0:
+                    st.error(
+                        f"Submission failed (exit {submit_ret}). Check `runai login`, the current "
+                        "cluster context/project, image visibility, code path, and PVC claim names.\n\n"
+                        f"{submit_output}")
+                else:
+                    st.success("Run:AI accepted the workload.")
+                with st.expander("Submission command and result", expanded=submit_ret not in (None, 0)):
+                    st.code(st.session_state.get("rcp_submit_cmd", ""), language="bash")
+                    st.code(submit_output, language="text")
+
+                controls = st.columns(3)
+                refresh_status = controls[0].button("↻ Refresh status", width="stretch",
+                                                    disabled=submit_running)
+                refresh_logs = controls[1].button("↻ Refresh logs", width="stretch",
+                                                  disabled=submit_running)
+                delete_job = controls[2].button("🗑 Delete / cancel", width="stretch",
+                                                disabled=submit_running)
+                try:
+                    if refresh_status:
+                        result = run_rcp_cli(build_describe_command(active_rcp), "Status refresh")
+                        if result.returncode:
+                            st.error(cli_error("Status refresh", result))
+                        else:
+                            output = result.stdout or result.stderr
+                            st.session_state["rcp_status_output"] = output
+                            st.session_state["rcp_last_state"] = infer_job_state(output)
+                    if refresh_logs:
+                        result = run_rcp_cli(build_logs_command(active_rcp), "Log refresh")
+                        if result.returncode:
+                            st.error(cli_error("Log refresh", result))
+                        else:
+                            st.session_state["rcp_logs_output"] = result.stdout or result.stderr
+                    if delete_job:
+                        result = run_rcp_cli(build_delete_command(active_rcp), "Delete/cancel")
+                        if result.returncode:
+                            st.error(cli_error("Delete/cancel", result))
+                        else:
+                            st.session_state["rcp_last_state"] = "Deleted"
+                            st.success(result.stdout or "Delete request accepted.")
+                except RuntimeError as exc:
+                    st.error(str(exc))
+
+                status_output = st.session_state.get("rcp_status_output", "")
+                if status_output:
+                    with st.expander("Latest workload status", expanded=True):
+                        st.code(status_output, language="text")
+                logs_output = st.session_state.get("rcp_logs_output", "")
+                if logs_output:
+                    st.caption("Latest log snapshot (press Refresh logs to tail current output)")
+                    st.code("\n".join(logs_output.splitlines()[-500:]), language="text")
+
+                auto_rcp = st.checkbox("Auto-refresh status and logs (5s)", value=False,
+                                       disabled=submit_running, key="rcp_auto_refresh")
+                state = st.session_state.get("rcp_last_state", "")
+                allow_partial = st.checkbox(
+                    "Allow partial sync (run is not complete)", value=False,
+                    help="Normally sync is enabled only after Run:AI reports Completed/Succeeded. "
+                         "Partial files are staged first, but may not contain final metrics.")
+                can_sync = is_terminal_success(state) or allow_partial
+                run_id = st.session_state.get("rcp_run_id", "")
+                if st.button("⇣ Sync results into Browse runs", type="primary", disabled=not can_sync,
+                             width="stretch"):
+                    try:
+                        with st.spinner("Copying remote artifacts over SSH…"):
+                            destination = sync_rcp_results(active_rcp, run_id)
+                        st.success(f"Synced into `{destination.relative_to(ROOT)}`. Open Browse runs.")
+                    except RuntimeError as exc:
+                        st.error(str(exc))
+                if not can_sync:
+                    st.caption("Sync unlocks after a successful terminal state. Refresh status first, "
+                               "or explicitly allow a partial sync.")
+
+                if auto_rcp and not submit_running and not is_terminal_success(state):
+                    try:
+                        status_result = run_rcp_cli(build_describe_command(active_rcp), "Status refresh")
+                        logs_result = run_rcp_cli(build_logs_command(active_rcp), "Log refresh")
+                        if status_result.returncode == 0:
+                            output = status_result.stdout or status_result.stderr
+                            st.session_state["rcp_status_output"] = output
+                            st.session_state["rcp_last_state"] = infer_job_state(output)
+                        if logs_result.returncode == 0:
+                            st.session_state["rcp_logs_output"] = logs_result.stdout or logs_result.stderr
+                    except RuntimeError as exc:
+                        st.error(str(exc))
+                    time.sleep(5)
+                    _rerun()
+
+                # The submit CLI normally exits within a few seconds. Poll it with
+                # short reruns so the page transitions from "Submitting" without
+                # requiring an unrelated click from the user.
+                if submit_running:
+                    time.sleep(1)
                     _rerun()
 
     # ── Browse tab ──────────────────────────────────────────────
@@ -693,6 +1002,8 @@ def main():
             gifs = sorted(run_dir.glob("*.gif"))
             pngs = sorted(run_dir.glob("*.png"))
             pdfs = sorted(run_dir.glob("*.pdf"))
+            videos = sorted(p for ext in ("*.mp4", "*.webm", "*.mov")
+                            for p in run_dir.glob(ext))
             if gifs:
                 st.subheader("Animations")
                 for g in gifs:
@@ -707,6 +1018,11 @@ def main():
                 for p in pdfs:
                     st.download_button(f"⬇ {p.name}", p.read_bytes(),
                                        file_name=p.name, key=f"dl_{p.name}")
+            if videos:
+                st.subheader("Videos")
+                for p in videos:
+                    st.video(str(p))
+                    st.caption(p.name)
 
 
 if __name__ == "__main__":

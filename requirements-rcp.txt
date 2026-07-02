@@ -1,7 +1,7 @@
 # RCP image dependencies.
 # PyTorch is intentionally not listed: the RCP tutorial uses an NVIDIA PyTorch
 # base image, and installing another torch wheel here can silently mismatch CUDA.
-matplotlib==3.11.0
-neural_ssm==0.4
-numpy==2.5.0
-streamlit==1.58.0
+jax==0.4.30
+jaxlib==0.4.30
+matplotlib==3.10.8
+numpy==1.24.4

@@ -87,6 +87,9 @@ Key outputs per run:
 
 ## Running on EPFL RCP / Run:AI
 
+For a beginner-friendly explanation of every component and the complete workflow,
+see [EPFL RCP From Zero](docs/EPFL_RCP_FROM_ZERO.md).
+
 The RCP tutorial uses Docker plus Run:AI, not `sbatch`. The one-time setup is:
 install `docker`, `kubectl`, and `runai`; create a public Harbor project; then
 configure RCP access:
@@ -96,7 +99,10 @@ mkdir -p ~/.kube
 curl https://wiki.rcp.epfl.ch/public/files/kube-config.yaml -o ~/.kube/config
 chmod 600 ~/.kube/config
 runai login
-runai config project <runai-project-name>
+runai cluster list
+runai cluster set <cluster-name>
+runai project list
+runai project set <runai-project-name>
 ```
 
 Build and push the Docker image from your laptop. Use the UID/GID values from
@@ -104,7 +110,7 @@ EPFL, and the Harbor project name you created:
 
 ```bash
 GASPAR=<gaspar> LDAP_UID=<uid> LDAP_GID=<gid> PROJECT=<harbor-project> \
-  IMAGE=performance-boosting TAG=v1.0 \
+  IMAGE=performance-boosting TAG=v1.1 \
   scripts/rcp_build_push_image.sh
 ```
 
@@ -112,19 +118,21 @@ The image uses `DockerfileRCP` and `requirements-rcp.txt`. PyTorch is not in the
 RCP requirements file because the NVIDIA PyTorch base image provides the CUDA
 matched torch build.
 
-On the RCP jumphost, clone or update this repository:
+On the RCP jumphost, clone or update this repository, then return to the Mac:
 
 ```bash
 ssh <gaspar>@jumphost.rcp.epfl.ch
 git clone <repo-url> ~/Performance_Boosting
 cd ~/Performance_Boosting
-git pull
+git pull --ff-only
+exit
 ```
 
-Submit a short moving-gate smoke test from the jumphost:
+Submit a short moving-gate smoke test from the Mac where Run:AI is configured:
 
 ```bash
-GASPAR=<gaspar> PROJECT=<harbor-project> IMAGE=performance-boosting TAG=v1.0 \
+GASPAR=<gaspar> PROJECT=<harbor-project> IMAGE=performance-boosting TAG=v1.1 \
+  RUNAI_PROJECT=<runai-project-name> \
   GPU=0.1 scripts/rcp_runai_submit.sh \
   --epochs 2 --disturbance_only_epochs 1 \
   --train_batch 16 --val_batch 16 --test_batch 16 \
@@ -135,7 +143,8 @@ GASPAR=<gaspar> PROJECT=<harbor-project> IMAGE=performance-boosting TAG=v1.0 \
 Submit a full moving-gate run:
 
 ```bash
-GASPAR=<gaspar> PROJECT=<harbor-project> IMAGE=performance-boosting TAG=v1.0 \
+GASPAR=<gaspar> PROJECT=<harbor-project> IMAGE=performance-boosting TAG=v1.1 \
+  RUNAI_PROJECT=<runai-project-name> \
   JOB_NAME=pb-gate-full RUN_ID=rcp_gate_full GPU=1 \
   scripts/rcp_runai_submit.sh --epochs 250
 ```
@@ -144,19 +153,19 @@ Submit the moving-obstacles variant. Set `--epochs` explicitly because its
 default is intentionally large:
 
 ```bash
-GASPAR=<gaspar> PROJECT=<harbor-project> IMAGE=performance-boosting TAG=v1.0 \
+GASPAR=<gaspar> PROJECT=<harbor-project> IMAGE=performance-boosting TAG=v1.1 \
+  RUNAI_PROJECT=<runai-project-name> \
   EXPERIMENT=obstacles JOB_NAME=pb-obstacles-full RUN_ID=rcp_obstacles_full GPU=1 \
   scripts/rcp_runai_submit.sh --epochs 250
 ```
 
-Useful Run:AI commands from the jumphost:
+Useful current Run:AI commands from the Mac:
 
 ```bash
-runai list jobs
-runai describe <job-name>
-runai bash <job-name>
-runai logs <job-name> --loglevel debug
-runai delete job <job-name>
+runai training list -p <runai-project-name>
+runai training standard describe <job-name> -p <runai-project-name>
+runai training standard logs <job-name> -p <runai-project-name> --follow
+runai training standard delete <job-name> -p <runai-project-name>
 ```
 
 Copy results back from a local terminal:

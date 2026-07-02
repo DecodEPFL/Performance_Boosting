@@ -14,8 +14,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN test -n "${LDAP_GID}" && test -n "${LDAP_UID}" && test -n "${LDAP_USERNAME}"
 
-RUN if ! getent group "${LDAP_GID}" >/dev/null; then \
-        groupadd --badname --gid "${LDAP_GID}" "${LDAP_GROUPNAME}"; \
+RUN group_name="${LDAP_GROUPNAME,,}" && \
+    if ! getent group "${LDAP_GID}" >/dev/null; then \
+        groupadd --gid "${LDAP_GID}" "${group_name}"; \
     fi && \
     if ! id -u "${LDAP_USERNAME}" >/dev/null 2>&1; then \
         useradd --uid "${LDAP_UID}" --gid "${LDAP_GID}" --create-home --shell /bin/bash "${LDAP_USERNAME}"; \
@@ -23,7 +24,11 @@ RUN if ! getent group "${LDAP_GID}" >/dev/null; then \
 
 COPY requirements-rcp.txt /tmp/requirements-rcp.txt
 RUN python3 -m pip install --no-cache-dir --upgrade pip && \
-    python3 -m pip install --no-cache-dir -r /tmp/requirements-rcp.txt
+    python3 -m pip install --no-cache-dir -r /tmp/requirements-rcp.txt && \
+    python3 -m pip install --no-cache-dir --no-deps deel-torchlip==1.0.5 && \
+    python3 -m pip install --no-cache-dir --no-deps \
+        "neural_ssm @ git+https://github.com/DecodEPFL/SSM.git@32fa0e468b818593b7cb69d5483587759de3ae16" && \
+    python3 -c "from importlib.metadata import version; print('torch', version('torch')); print('neural_ssm', version('neural_ssm'))"
 
 USER ${LDAP_UID}:${LDAP_GID}
 WORKDIR /home/${LDAP_USERNAME}
