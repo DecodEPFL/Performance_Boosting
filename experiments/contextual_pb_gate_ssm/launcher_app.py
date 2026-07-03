@@ -59,15 +59,18 @@ SKIP_DESTS = {
     "contextual_comparison", "lift_comparison",
     # Handled by the custom Experiment selector + Context-signal checkboxes.
     "gate_motion", "context_features", "context_mode",
+    # Managed by the launcher itself (RCP submissions / per-variant fan-out).
+    "require_cuda", "skip_plots",
 }
 DEVICE_CHOICES = ["cpu", "cuda", "mps"]
 
 # Ordered UI groups: (title, predicate over dest, expanded-by-default).
 GROUPS = [
-    ("Run & I/O", lambda d: d in {"seed", "device", "run_id"}, True),
+    ("Run & I/O", lambda d: d in {"seed", "device", "run_id", "fresh"}, True),
     ("Training", lambda d: d in {
         "train_batch", "val_batch", "test_batch", "epochs", "disturbance_only_epochs",
-        "eval_every", "lr", "lr_min", "grad_clip", "warm_start"}, True),
+        "eval_every", "lr", "lr_min", "grad_clip", "warm_start", "cuda_amp",
+        "prefetch_batches"}, True),
     ("Plots & storyboards", lambda d: d in {"use_storyboard", "use_storyboard_compact"}, False),
     ("Contextual SSM (new variant)", lambda d: d.startswith("ctx_") or d in {"contextual_comparison", "match_to_contextual"}, True),
     ("SSM core", lambda d: d.startswith("ssm_") or d.startswith("mp_only_ssm"), False),
@@ -368,19 +371,27 @@ def rcp_config(job_name: str | None = None) -> RCPConfig:
 
 
 def start_rcp_submission(argv: list[str], run_id: str, config: RCPConfig) -> None:
-    """Start the short Run:AI submit request asynchronously."""
+    """Start one short Run:AI submit request asynchronously.
+
+    Appends a job record to ``st.session_state['rcp_jobs']`` so several
+    workloads (e.g. one per variant) can be tracked side by side.
+    """
     logfile = LOG_DIR / f"rcp_submit_{config.job_name}.log"
     cmd = build_submit_command(config, argv)
     logf = open(logfile, "w", buffering=1)
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                             stdout=logf, stderr=subprocess.STDOUT,
                             cwd=str(ROOT), text=True)
-    st.session_state.update(
-        rcp_submit_proc=proc, rcp_submit_logf=logf, rcp_submit_log=str(logfile),
-        rcp_active_job_name=config.job_name, rcp_run_id=run_id,
-        rcp_active_config=config, rcp_submit_cmd=shlex.join(cmd),
-        rcp_last_state="Submitting", rcp_status_output="", rcp_logs_output="",
-    )
+    job = {
+        "job_name": config.job_name, "run_id": run_id, "config": config,
+        "submit_proc": proc, "submit_logf": logf, "submit_log": str(logfile),
+        "submit_cmd": shlex.join(cmd), "submit_ret": None,
+        "state": "Submitting", "status_output": "", "logs_output": "",
+    }
+    jobs = [j for j in st.session_state.get("rcp_jobs", [])
+            if j["job_name"] != config.job_name]  # resubmit replaces the old entry
+    jobs.append(job)
+    st.session_state["rcp_jobs"] = jobs
 
 
 def run_rcp_cli(cmd: list[str], purpose: str) -> subprocess.CompletedProcess:
@@ -517,6 +528,15 @@ def main():
                     st.text_input("Jumphost", value=rcp_overrides["jumphost"], key="rcp_jumphost")
                     st.text_input("Run:AI CLI path", value=rcp_overrides["runai_bin"],
                                   key="rcp_runai_bin")
+                    st.checkbox(
+                        "⚡ One job per variant (parallel fan-out)", value=False,
+                        key="rcp_fanout",
+                        help="Single-run mode with ≥2 ticked variants: submit each variant "
+                             "as its own Run:AI workload sharing one run ID/directory. "
+                             "Each job trains one variant, saves its checkpoint+metrics, "
+                             "and skips the combined figures. When ALL jobs are done, "
+                             "Sync once and use Re-plot in Browse runs to build the "
+                             "comparison figures. Cuts wall-clock by ~#variants.")
 
             # Experiment selector lives OUTSIDE the form so changing it re-renders
             # the form (different gate params + context options) immediately.
@@ -707,7 +727,8 @@ def main():
                     st.toast("Reset to built-in defaults.")
                     _rerun()
 
-            def launch_selected(argv: list[str], run_id: str, summary: str) -> None:
+            def launch_selected(argv: list[str], run_id: str, summary: str,
+                                fanout_variants: list[str] | None = None) -> None:
                 if execution_target == "Local":
                     launch(argv, run_id)
                     st.success(
@@ -728,6 +749,24 @@ def main():
                             f"GPU `{config.gpu}` was requested, but experiment device is "
                             f"`{selected_device}`. Choose `cuda` under Parameters → Run & I/O; "
                             "otherwise the allocated GPU will sit unused.")
+                        return
+                    argv = list(argv)
+                    if gpu_amount > 0 and "--require_cuda" not in argv:
+                        # Fail fast on a broken image/driver instead of silently
+                        # training on the pod's few CPU cores for hours.
+                        argv.append("--require_cuda")
+                    if fanout_variants:
+                        for variant in fanout_variants:
+                            slug = re.sub(r"[^a-z0-9-]+", "-",
+                                          variant.lower().replace("_", "-")).strip("-")
+                            v_job = f"{job_name[: max(1, 62 - len(slug))]}-{slug}".strip("-")[:63]
+                            v_argv = argv + ["--variants", variant, "--skip_plots"]
+                            start_rcp_submission(v_argv, run_id, rcp_config(v_job))
+                        st.success(
+                            f"Submitting **{len(fanout_variants)}** Run:AI jobs (one per "
+                            f"variant) for run **{run_id}** — {summary}. When ALL jobs have "
+                            "completed, Sync once below, then use 🔁 Re-plot in Browse runs "
+                            "to build the combined comparison figures.")
                         return
                     start_rcp_submission(argv, run_id, config)
                 except (TypeError, ValueError, OSError) as exc:
@@ -807,21 +846,36 @@ def main():
                 else:
                     selected = [k for k, _ in get_variant_options() if st.session_state.get(f"var_{k}")]
                     ctx_selected = [k for k in ctx_feats if st.session_state.get(f"ctx_{k}")]
+                    fanout = (execution_target == "EPFL RCP"
+                              and bool(st.session_state.get("rcp_fanout"))
+                              and len(selected) >= 2)
                     if not selected:
                         st.error("Select at least one variant to run under ① above.")
                     elif not ctx_selected:
                         st.error("Select at least one context feature under ② above.")
+                    elif fanout and bool(st.session_state.get("w_warm_start")):
+                        st.error(
+                            "One-job-per-variant fan-out is incompatible with `warm_start`: "
+                            "the context variant would warm-start from a disturbance_only "
+                            "checkpoint that trains in a different job. Untick one of them.")
+                    elif fanout and bool(st.session_state.get("w_match_to_contextual")):
+                        st.error(
+                            "One-job-per-variant fan-out is incompatible with "
+                            "`match_to_contextual`: parameter matching needs all variants "
+                            "in one process to share the sizing target. Untick one of them.")
                     else:
                         argv, warns = build_argv(active_order, bools, values, widget_vals, run_id)
                         argv += ["--gate_motion", exp_key]
                         argv += ["--context_features", ",".join(ctx_selected)]
-                        argv += ["--variants", ",".join(selected)]
+                        if not fanout:
+                            argv += ["--variants", ",".join(selected)]
                         for w in warns:
                             st.warning(w)
                         launch_selected(
                             argv, run_id,
                             f"{exp_label}; {len(selected)} variant(s): {', '.join(selected)}; "
-                            f"context [{', '.join(ctx_selected)}]")
+                            f"context [{', '.join(ctx_selected)}]",
+                            fanout_variants=selected if fanout else None)
 
             proc = st.session_state.get("proc")
             if proc is not None:
@@ -845,110 +899,151 @@ def main():
                     time.sleep(2)
                     _rerun()
 
-            submit_proc = st.session_state.get("rcp_submit_proc")
-            active_rcp = st.session_state.get("rcp_active_config")
-            if submit_proc is not None and active_rcp is not None:
+            rcp_jobs = st.session_state.get("rcp_jobs", [])
+            if rcp_jobs:
                 st.divider()
-                st.subheader("☁️ Run:AI workload")
-                submit_ret = submit_proc.poll()
-                submit_running = submit_ret is None
-                if not submit_running:
-                    logf = st.session_state.pop("rcp_submit_logf", None)
+                st.subheader("☁️ Run:AI workloads")
+
+                # Poll pending submit CLIs (they normally exit within seconds).
+                any_submitting = False
+                for job in rcp_jobs:
+                    sproc = job.get("submit_proc")
+                    if sproc is None:
+                        continue
+                    sret = sproc.poll()
+                    if sret is None:
+                        any_submitting = True
+                        continue
+                    logf = job.pop("submit_logf", None)
                     if logf and not logf.closed:
                         logf.close()
-                    if submit_ret == 0 and st.session_state.get("rcp_last_state") == "Submitting":
-                        st.session_state["rcp_last_state"] = "Submitted"
-                hdr = st.columns([2, 2, 1])
-                hdr[0].markdown(f"**Job:** `{active_rcp.job_name}`")
-                hdr[1].markdown(f"**Run ID:** `{st.session_state.get('rcp_run_id', '?')}`")
-                hdr[2].markdown(f"**{st.session_state.get('rcp_last_state', 'Unknown')}**")
+                    job["submit_proc"] = None
+                    job["submit_ret"] = sret
+                    if sret == 0:
+                        if job["state"] == "Submitting":
+                            job["state"] = "Submitted"
+                    else:
+                        job["state"] = "Submit failed"
 
-                submit_output = tail(st.session_state.get("rcp_submit_log", ""), max_lines=100)
-                if submit_running:
-                    st.info("Submission request is in progress…")
-                elif submit_ret != 0:
-                    st.error(
-                        f"Submission failed (exit {submit_ret}). Check `runai login`, the current "
-                        "cluster context/project, image visibility, code path, and PVC claim names.\n\n"
-                        f"{submit_output}")
-                else:
-                    st.success("Run:AI accepted the workload.")
-                with st.expander("Submission command and result", expanded=submit_ret not in (None, 0)):
-                    st.code(st.session_state.get("rcp_submit_cmd", ""), language="bash")
-                    st.code(submit_output, language="text")
+                def _refresh_job(job: dict) -> None:
+                    """Update one job's Run:AI state and log snapshot in place."""
+                    result = run_rcp_cli(build_describe_command(job["config"]), "Status refresh")
+                    if result.returncode:
+                        st.error(cli_error(f"Status refresh (`{job['job_name']}`)", result))
+                    else:
+                        output = result.stdout or result.stderr
+                        job["status_output"] = output
+                        job["state"] = infer_job_state(output)
+                    logs = run_rcp_cli(build_logs_command(job["config"]), "Log refresh")
+                    if logs.returncode == 0:
+                        job["logs_output"] = logs.stdout or logs.stderr
+                    # A failing logs call is normal while the pod is Pending —
+                    # keep the previous snapshot instead of raising noise.
 
-                controls = st.columns(3)
-                refresh_status = controls[0].button("↻ Refresh status", width="stretch",
-                                                    disabled=submit_running)
-                refresh_logs = controls[1].button("↻ Refresh logs", width="stretch",
-                                                  disabled=submit_running)
-                delete_job = controls[2].button("🗑 Delete / cancel", width="stretch",
-                                                disabled=submit_running)
-                try:
-                    if refresh_status:
-                        result = run_rcp_cli(build_describe_command(active_rcp), "Status refresh")
-                        if result.returncode:
-                            st.error(cli_error("Status refresh", result))
-                        else:
-                            output = result.stdout or result.stderr
-                            st.session_state["rcp_status_output"] = output
-                            st.session_state["rcp_last_state"] = infer_job_state(output)
-                    if refresh_logs:
-                        result = run_rcp_cli(build_logs_command(active_rcp), "Log refresh")
-                        if result.returncode:
-                            st.error(cli_error("Log refresh", result))
-                        else:
-                            st.session_state["rcp_logs_output"] = result.stdout or result.stderr
-                    if delete_job:
-                        result = run_rcp_cli(build_delete_command(active_rcp), "Delete/cancel")
-                        if result.returncode:
-                            st.error(cli_error("Delete/cancel", result))
-                        else:
-                            st.session_state["rcp_last_state"] = "Deleted"
-                            st.success(result.stdout or "Delete request accepted.")
-                except RuntimeError as exc:
-                    st.error(str(exc))
+                def _refreshable(job: dict) -> bool:
+                    return (job.get("submit_proc") is None
+                            and job.get("submit_ret") == 0
+                            and not is_terminal_success(job["state"])
+                            and job["state"] not in ("Deleted", "Failed"))
 
-                status_output = st.session_state.get("rcp_status_output", "")
-                if status_output:
-                    with st.expander("Latest workload status", expanded=True):
-                        st.code(status_output, language="text")
-                logs_output = st.session_state.get("rcp_logs_output", "")
-                if logs_output:
-                    st.caption("Latest log snapshot (press Refresh logs to tail current output)")
-                    st.code("\n".join(logs_output.splitlines()[-500:]), language="text")
+                head = st.columns([2, 1, 1, 1])
+                head[0].caption(f"{len(rcp_jobs)} workload(s) tracked this session")
+                refresh_all = head[1].button("↻ Refresh all", width="stretch",
+                                             disabled=any_submitting)
+                auto_rcp = head[2].checkbox("Auto (5s)", value=False, key="rcp_auto_refresh",
+                                            disabled=any_submitting)
+                if head[3].button("🧹 Clear list", width="stretch",
+                                  help="Forget these entries in the UI (does not touch "
+                                       "the remote workloads)."):
+                    st.session_state["rcp_jobs"] = []
+                    _rerun()
 
-                auto_rcp = st.checkbox("Auto-refresh status and logs (5s)", value=False,
-                                       disabled=submit_running, key="rcp_auto_refresh")
-                state = st.session_state.get("rcp_last_state", "")
-                allow_partial = st.checkbox(
-                    "Allow partial sync (run is not complete)", value=False,
-                    help="Normally sync is enabled only after Run:AI reports Completed/Succeeded. "
-                         "Partial files are staged first, but may not contain final metrics.")
-                can_sync = is_terminal_success(state) or allow_partial
-                run_id = st.session_state.get("rcp_run_id", "")
-                if st.button("⇣ Sync results into Browse runs", type="primary", disabled=not can_sync,
-                             width="stretch"):
+                if refresh_all:
                     try:
-                        with st.spinner("Copying remote artifacts over SSH…"):
-                            destination = sync_rcp_results(active_rcp, run_id)
-                        st.success(f"Synced into `{destination.relative_to(ROOT)}`. Open Browse runs.")
+                        for job in rcp_jobs:
+                            if job.get("submit_proc") is None and job.get("submit_ret") == 0:
+                                _refresh_job(job)
                     except RuntimeError as exc:
                         st.error(str(exc))
-                if not can_sync:
-                    st.caption("Sync unlocks after a successful terminal state. Refresh status first, "
-                               "or explicitly allow a partial sync.")
 
-                if auto_rcp and not submit_running and not is_terminal_success(state):
+                for job in rcp_jobs:
+                    state = job["state"]
+                    if is_terminal_success(state):
+                        icon = "✅"
+                    elif state in ("Failed", "Submit failed", "Deleted"):
+                        icon = "❌"
+                    else:
+                        icon = "🔵"
+                    with st.expander(
+                            f"{icon} `{job['job_name']}` — **{state}**  ·  run `{job['run_id']}`",
+                            expanded=(len(rcp_jobs) == 1 or state in ("Failed", "Submit failed"))):
+                        submit_output = tail(job.get("submit_log", ""), max_lines=100)
+                        if job.get("submit_proc") is not None:
+                            st.info("Submission request is in progress…")
+                        elif job.get("submit_ret") != 0:
+                            st.error(
+                                f"Submission failed (exit {job.get('submit_ret')}). Check "
+                                "`runai login`, the current cluster context/project, image "
+                                f"visibility, code path, and PVC claim names.\n\n{submit_output}")
+                        row = st.columns([1, 3])
+                        if row[0].button("🗑 Delete / cancel", key=f"del_{job['job_name']}",
+                                         width="stretch",
+                                         disabled=job.get("submit_proc") is not None):
+                            try:
+                                result = run_rcp_cli(build_delete_command(job["config"]),
+                                                     "Delete/cancel")
+                                if result.returncode:
+                                    st.error(cli_error("Delete/cancel", result))
+                                else:
+                                    job["state"] = "Deleted"
+                                    st.success(result.stdout or "Delete request accepted.")
+                            except RuntimeError as exc:
+                                st.error(str(exc))
+                        st.code(job.get("submit_cmd", ""), language="bash")
+                        if job.get("status_output"):
+                            st.code(job["status_output"], language="text")
+                        if job.get("logs_output"):
+                            st.caption("Latest log snapshot (↻ Refresh all to update)")
+                            st.code("\n".join(job["logs_output"].splitlines()[-400:]),
+                                    language="text")
+
+                # ── Sync per run (fan-out jobs share one run directory) ─────
+                st.markdown("**Sync results into Browse runs**")
+                allow_partial = st.checkbox(
+                    "Allow partial sync (run is not complete)", value=False,
+                    help="Normally sync is enabled only after every job of the run reports "
+                         "Completed/Succeeded. Partial files are staged first, but may not "
+                         "contain final metrics.")
+                run_ids: list[str] = []
+                for job in rcp_jobs:
+                    if job["run_id"] not in run_ids:
+                        run_ids.append(job["run_id"])
+                for rid in run_ids:
+                    group = [j for j in rcp_jobs if j["run_id"] == rid]
+                    done = sum(1 for j in group if is_terminal_success(j["state"]))
+                    can_sync = (done == len(group)) or allow_partial
+                    row = st.columns([3, 1])
+                    row[0].markdown(f"`{rid}` — {done}/{len(group)} job(s) completed")
+                    if row[1].button("⇣ Sync", key=f"sync_{rid}", type="primary",
+                                     width="stretch", disabled=not can_sync):
+                        try:
+                            with st.spinner("Copying remote artifacts over SSH…"):
+                                destination = sync_rcp_results(group[0]["config"], rid)
+                            note = (" Then hit 🔁 Re-plot in Browse runs to build the "
+                                    "combined comparison figures." if len(group) > 1 else "")
+                            st.success(f"Synced into `{destination.relative_to(ROOT)}`. "
+                                       f"Open Browse runs.{note}")
+                        except RuntimeError as exc:
+                            st.error(str(exc))
+                if not all(is_terminal_success(j["state"]) for j in rcp_jobs):
+                    st.caption("Sync unlocks once all jobs of a run reach a successful "
+                               "terminal state (refresh status), or tick partial sync.")
+
+                pending_jobs = [j for j in rcp_jobs if _refreshable(j)]
+                if auto_rcp and not any_submitting and pending_jobs:
                     try:
-                        status_result = run_rcp_cli(build_describe_command(active_rcp), "Status refresh")
-                        logs_result = run_rcp_cli(build_logs_command(active_rcp), "Log refresh")
-                        if status_result.returncode == 0:
-                            output = status_result.stdout or status_result.stderr
-                            st.session_state["rcp_status_output"] = output
-                            st.session_state["rcp_last_state"] = infer_job_state(output)
-                        if logs_result.returncode == 0:
-                            st.session_state["rcp_logs_output"] = logs_result.stdout or logs_result.stderr
+                        for job in pending_jobs:
+                            _refresh_job(job)
                     except RuntimeError as exc:
                         st.error(str(exc))
                     time.sleep(5)
@@ -957,7 +1052,7 @@ def main():
                 # The submit CLI normally exits within a few seconds. Poll it with
                 # short reruns so the page transitions from "Submitting" without
                 # requiring an unrelated click from the user.
-                if submit_running:
+                if any_submitting:
                     time.sleep(1)
                     _rerun()
 
@@ -973,7 +1068,25 @@ def main():
             run_dir = RUNS_DIR / sel
             top = st.columns([1, 1, 2])
             if top[0].button("🔁 Re-plot (plot_only)"):
-                launch(["--no_show_plots", "--plot_only", sel], f"replot_{sel}")
+                replot_argv = ["--no_show_plots", "--plot_only", sel]
+                # Fan-out runs: each job's config.json names only its own variant,
+                # so rebuild the full variant list from the merged metrics.json.
+                try:
+                    cfg_data, metric_keys = {}, []
+                    cfg_file = run_dir / "config.json"
+                    metrics_file = run_dir / "metrics.json"
+                    if cfg_file.exists():
+                        cfg_data = json.loads(cfg_file.read_text(encoding="utf-8"))
+                    if metrics_file.exists():
+                        metric_keys = list(json.loads(metrics_file.read_text(encoding="utf-8")))
+                    known = {k for k, _ in get_variant_options()}
+                    if (metric_keys and all(k in known for k in metric_keys)
+                            and not cfg_data.get("ablate_context")
+                            and not cfg_data.get("ablate_layers")):
+                        replot_argv += ["--variants", ",".join(metric_keys)]
+                except Exception:
+                    pass  # fall back to the run's saved config
+                launch(replot_argv, f"replot_{sel}")
                 st.success(f"Re-plotting `{sel}` — see the Launch tab for progress.")
             top[1].markdown(f"📁 `{run_dir.relative_to(ROOT)}`")
 

@@ -7,6 +7,8 @@ import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -43,18 +45,26 @@ class ScenarioBatch:
     is_adversarial: torch.Tensor  # bool (B,): True if episode has a late adversarial switch
 
     def to(self, device: torch.device) -> "ScenarioBatch":
+        non_blocking = device.type == "cuda"
         return ScenarioBatch(
-            start=self.start.to(device),
-            goal=self.goal.to(device),
-            gate_y=self.gate_y.to(device),
-            gate_v=self.gate_v.to(device),
-            gate_ema=self.gate_ema.to(device),
-            gate_slow_ema=self.gate_slow_ema.to(device),
-            switch_age=self.switch_age.to(device),
-            process_noise=self.process_noise.to(device),
-            pair_id=self.pair_id.to(device),
-            is_adversarial=self.is_adversarial.to(device),
+            start=self.start.to(device, non_blocking=non_blocking),
+            goal=self.goal.to(device, non_blocking=non_blocking),
+            gate_y=self.gate_y.to(device, non_blocking=non_blocking),
+            gate_v=self.gate_v.to(device, non_blocking=non_blocking),
+            gate_ema=self.gate_ema.to(device, non_blocking=non_blocking),
+            gate_slow_ema=self.gate_slow_ema.to(device, non_blocking=non_blocking),
+            switch_age=self.switch_age.to(device, non_blocking=non_blocking),
+            process_noise=self.process_noise.to(device, non_blocking=non_blocking),
+            pair_id=self.pair_id.to(device, non_blocking=non_blocking),
+            is_adversarial=self.is_adversarial.to(device, non_blocking=non_blocking),
         )
+
+    def pin_memory(self) -> "ScenarioBatch":
+        """Pin CPU tensors so CUDA copies can overlap with host work."""
+        return ScenarioBatch(**{
+            name: getattr(self, name).pin_memory()
+            for name in self.__dataclass_fields__
+        })
 
 
 @dataclass
@@ -91,6 +101,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no_tf32", dest="tf32", action="store_false",
                         help="Disable TF32; use full FP32 matmuls on CUDA.")
     parser.set_defaults(tf32=True)
+    parser.add_argument("--cuda_amp", dest="cuda_amp", action="store_true",
+                        help="Use CUDA BF16 autocast for rollout/loss (default on).")
+    parser.add_argument("--no_cuda_amp", dest="cuda_amp", action="store_false",
+                        help="Keep CUDA training/evaluation in FP32.")
+    parser.set_defaults(cuda_amp=True)
+    parser.add_argument("--prefetch_batches", dest="prefetch_batches", action="store_true",
+                        help="Generate the next training batch concurrently with training.")
+    parser.add_argument("--no_prefetch_batches", dest="prefetch_batches", action="store_false")
+    parser.set_defaults(prefetch_batches=True)
+    parser.add_argument("--require_cuda", action="store_true",
+                        help="Fail fast when --device cuda is requested but CUDA is "
+                             "unavailable, instead of silently training on CPU "
+                             "(recommended for cluster jobs).")
+    parser.add_argument("--skip_plots", action="store_true",
+                        help="Skip all figure/GIF generation at the end of the run. "
+                             "Metrics and checkpoints are still saved incrementally; "
+                             "regenerate figures later with --plot_only <run_id> "
+                             "(used by per-variant cluster jobs).")
+    parser.add_argument("--fresh", action="store_true",
+                        help="Retrain every variant even when its checkpoint and metrics "
+                             "already exist in the run directory. Default behavior "
+                             "resumes: completed variants are loaded and skipped "
+                             "(preemption/restart safety on the cluster).")
     parser.add_argument("--train_batch", type=int, default=512)
     parser.add_argument("--val_batch", type=int, default=512)
     parser.add_argument("--test_batch", type=int, default=1024)
@@ -437,6 +470,55 @@ def to_python_float(value) -> float:
     return float(value.item() if torch.is_tensor(value) else value)
 
 
+def tensor_scalars_to_floats(values: dict[str, torch.Tensor]) -> dict[str, float]:
+    """Transfer multiple scalar tensors with a single device synchronization."""
+    if not values:
+        return {}
+    names = list(values)
+    packed = torch.stack([values[name].detach().float().reshape(()) for name in names])
+    return dict(zip(names, packed.cpu().tolist()))
+
+
+def cuda_autocast(args: argparse.Namespace, device: torch.device):
+    if (device.type == "cuda" and bool(getattr(args, "cuda_amp", True))
+            and torch.cuda.is_bf16_supported()):
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
+def iter_training_batches(
+    *, args: argparse.Namespace, epochs: int, expected_cross_index: int,
+    pin_memory: bool,
+):
+    """Yield deterministic epoch batches, optionally producing one ahead."""
+    def make(epoch: int) -> ScenarioBatch:
+        batch = sample_batch(
+            args=args,
+            batch_size=int(args.train_batch),
+            seed=int(args.seed) + 1000 + epoch,
+            paired=True,
+            shuffle=True,
+            expected_cross_index=expected_cross_index,
+        )
+        return batch.pin_memory() if pin_memory else batch
+
+    # Prefetch also pays off on CPU-only runs: batch generation (numpy loops)
+    # overlaps with the torch training step. Pinning stays CUDA-only.
+    prefetch = bool(getattr(args, "prefetch_batches", True))
+    if not prefetch:
+        for epoch in range(1, epochs + 1):
+            yield epoch, make(epoch)
+        return
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="gate-batch") as pool:
+        future = pool.submit(make, 1)
+        for epoch in range(1, epochs + 1):
+            batch = future.result()
+            if epoch < epochs:
+                future = pool.submit(make, epoch + 1)
+            yield epoch, batch
+
+
 def count_params(module: torch.nn.Module) -> int:
     return sum(p.numel() for p in module.parameters())
 
@@ -444,12 +526,15 @@ def count_params(module: torch.nn.Module) -> int:
 def find_matched_ssm_d_model(
     *,
     args: argparse.Namespace,
-    device: torch.device,
     target_params: int,
     mp_in_dim: int,
 ) -> int:
     """Return the smallest d_model (stepping by 4) such that
-    MpDeepSSM(mp_in_dim, nu=2, d_model=d_model, ...) has >= target_params."""
+    MpDeepSSM(mp_in_dim, nu=2, d_model=d_model, ...) has >= target_params.
+
+    Throwaway probe modules stay on CPU — parameter counts are device-independent
+    and this avoids churning GPU memory/startup time on the cluster.
+    """
     nu = 2
     n_layers = int(args.mp_only_ssm_layers or args.ssm_layers)
     start = int(args.ssm_d_model)
@@ -464,7 +549,7 @@ def find_matched_ssm_d_model(
             d_state=int(args.ssm_d_state),
             ff=args.ssm_ff,
             bcd_nonlinearity=args.ssm_bcd_nonlinearity,
-        ).to(device)
+        )
         if count_params(mp) >= target_params:
             return d_model
     raise RuntimeError(
@@ -476,7 +561,6 @@ def find_matched_ssm_d_model(
 def find_matched_d_model(
     *,
     args: argparse.Namespace,
-    device: torch.device,
     target_params: int,
     mp_only: bool,
     use_mad: bool,
@@ -489,13 +573,16 @@ def find_matched_d_model(
 
     Param count is monotone in d_model, so we sweep and keep the value minimizing
     |count - target|. The whole controller is built each step, so M_b / lifter
-    params are included in the match.
+    params are included in the match. Probe controllers are built on CPU:
+    param counts are device-independent and this keeps the (potentially hundreds
+    of) throwaway builds off the GPU.
     """
+    probe_device = torch.device("cpu")
     best_d, best_err = d_min, None
     for d in range(d_min, d_max, step):
         try:
             ctrl, _ = build_controller(
-                device, args, mp_only=mp_only,
+                probe_device, args, mp_only=mp_only,
                 factor_rank_override=1 if use_mad else None,
                 ssm_d_model_override=d,
             )
@@ -668,15 +755,15 @@ def build_gate_features(gates: np.ndarray, ema_alpha: float) -> tuple[np.ndarray
     for t in range(1, gates.shape[1]):
         gate_slow_ema[:, t] = slow_alpha * gates[:, t] + (1.0 - slow_alpha) * gate_slow_ema[:, t - 1]
 
-    switch_age = np.zeros_like(gates, dtype=np.float32)
-    for b in range(gates.shape[0]):
-        age = 0.0
-        for t in range(1, gates.shape[1]):
-            if abs(float(gates[b, t] - gates[b, t - 1])) > 1e-6:
-                age = 0.0
-            else:
-                age += 1.0
-            switch_age[b, t] = age
+    # Age since the most recent discrete change, vectorized over the batch and
+    # horizon. At a change its age is zero; otherwise it increments by one.
+    width = gates.shape[1]
+    steps = np.arange(width, dtype=np.int64)[None, :]
+    changed = np.zeros_like(gates, dtype=bool)
+    changed[:, 1:] = np.abs(gates[:, 1:] - gates[:, :-1]) > 1e-6
+    last_change = np.maximum.accumulate(np.where(changed, steps, 0), axis=1)
+    switch_age = (steps - last_change).astype(np.float32)
+    switch_age[:, 0] = 0.0
     return gate_velocity, gate_ema, gate_slow_ema, switch_age
 
 
@@ -1453,30 +1540,29 @@ def compute_loss(
     total_per = (contrib["goal_stage"] + contrib["goal_term"] + contrib["terminal_vel"]
                  + contrib["wall_track"] + contrib["wall_collision"]
                  + contrib["control"] + contrib["corridor"] + contrib["settle_vel"])
-    parts = {
-        "loss_total": to_python_float(total_per.mean()),
-        "loss_goal_stage": to_python_float(contrib["goal_stage"].mean()),
-        "loss_goal_term": to_python_float(contrib["goal_term"].mean()),
-        "loss_terminal_vel": to_python_float(contrib["terminal_vel"].mean()),
-        "loss_wall_track": to_python_float(contrib["wall_track"].mean()),
-        "loss_wall_collision": to_python_float(contrib["wall_collision"].mean()),
-        "loss_control": to_python_float(contrib["control"].mean()),
-        "loss_corridor": to_python_float(contrib["corridor"].mean()),
-        "loss_settle_vel": to_python_float(contrib["settle_vel"].mean()),
-    }
-    return total_per.mean(), parts
+    total = total_per.mean()
+    parts = tensor_scalars_to_floats({
+        "loss_total": total,
+        "loss_goal_stage": contrib["goal_stage"].mean(),
+        "loss_goal_term": contrib["goal_term"].mean(),
+        "loss_terminal_vel": contrib["terminal_vel"].mean(),
+        "loss_wall_track": contrib["wall_track"].mean(),
+        "loss_wall_collision": contrib["wall_collision"].mean(),
+        "loss_control": contrib["control"].mean(),
+        "loss_corridor": contrib["corridor"].mean(),
+        "loss_settle_vel": contrib["settle_vel"].mean(),
+    })
+    return total, parts
 
 
 def crossing_indices(x_pos: torch.Tensor, wall_x: float) -> torch.Tensor:
-    x_cpu = x_pos.detach().cpu()
-    idx = torch.zeros(x_cpu.shape[0], dtype=torch.long)
-    for b in range(x_cpu.shape[0]):
-        crossed = torch.nonzero(x_cpu[b] <= float(wall_x), as_tuple=False).squeeze(-1)
-        if crossed.numel() > 0:
-            idx[b] = int(crossed[0].item())
-        else:
-            idx[b] = int(torch.argmin(torch.abs(x_cpu[b] - float(wall_x))).item())
-    return idx.to(x_pos.device)
+    crossed = x_pos <= float(wall_x)
+    has_crossing = crossed.any(dim=1)
+    # argmax returns the first True for boolean-as-integer rows; all-False rows
+    # are replaced by the nearest-to-wall index below.
+    first_crossing = crossed.to(torch.int8).argmax(dim=1)
+    nearest = torch.abs(x_pos - float(wall_x)).argmin(dim=1)
+    return torch.where(has_crossing, first_crossing, nearest)
 
 
 def interpolated_wall_crossing(
@@ -1489,22 +1575,24 @@ def interpolated_wall_crossing(
     """Return discrete crossing indices plus y/g interpolated at x == wall_x."""
     cross_idx = crossing_indices(x_pos, wall_x)
     row = torch.arange(x_pos.shape[0], device=x_pos.device)
-    y_cross = y_pos[row, cross_idx].clone()
-    g_cross = gate[row, cross_idx].clone()
-
+    y1 = y_pos[row, cross_idx]
+    g1 = gate[row, cross_idx]
+    prev_idx = (cross_idx - 1).clamp_min(0)
+    x0 = x_pos[row, prev_idx]
+    x1 = x_pos[row, cross_idx]
+    y0 = y_pos[row, prev_idx]
+    g0 = gate[row, prev_idx]
+    denom = x1 - x0
     wall = float(wall_x)
-    for b in range(x_pos.shape[0]):
-        i = int(cross_idx[b].item())
-        if i <= 0:
-            continue
-        x0 = x_pos[b, i - 1]
-        x1 = x_pos[b, i]
-        denom = x1 - x0
-        bracketed = (x0 - wall) * (x1 - wall) <= 0
-        if bool(bracketed.item()) and abs(float(denom.item())) > 1e-8:
-            alpha = torch.clamp((wall - x0) / denom, 0.0, 1.0)
-            y_cross[b] = y_pos[b, i - 1] + alpha * (y_pos[b, i] - y_pos[b, i - 1])
-            g_cross[b] = gate[b, i - 1] + alpha * (gate[b, i] - gate[b, i - 1])
+    valid = ((cross_idx > 0)
+             & (((x0 - wall) * (x1 - wall)) <= 0)
+             & (denom.abs() > 1e-8))
+    safe_denom = torch.where(valid, denom, torch.ones_like(denom))
+    alpha = ((wall - x0) / safe_denom).clamp(0.0, 1.0)
+    y_interp = y0 + alpha * (y1 - y0)
+    g_interp = g0 + alpha * (g1 - g0)
+    y_cross = torch.where(valid, y_interp, y1)
+    g_cross = torch.where(valid, g_interp, g1)
     return cross_idx, y_cross, g_cross
 
 
@@ -1519,50 +1607,54 @@ def evaluate_variant(
     plant_true: DoubleIntegratorTrue | None,
     expected_cross_index: int = 0,
 ) -> dict:
-    rollout = rollout_variant(
-        args=args,
-        batch=batch,
-        device=device,
-        mode=mode,
-        controller=controller,
-        plant_true=plant_true,
-        expected_cross_index=expected_cross_index,
-    )
-    avg_cost, loss_parts = compute_loss(args=args, batch=batch, rollout=rollout)
-    batch_dev = batch.to(rollout.x_seq.device)
-    pos = rollout.x_seq[..., :2]
-    x_pos = pos[..., 0]
-    y_pos = pos[..., 1]
-    cross_idx, y_cross, g_cross = interpolated_wall_crossing(
-        x_pos=x_pos,
-        y_pos=y_pos,
-        gate=batch_dev.gate_y,
-        wall_x=float(args.wall_x),
-    )
-    cross_error = y_cross - g_cross
-    collided = cross_error.abs() > float(args.gate_half_width)
-    terminal_dist = torch.norm(pos[:, -1, :] - batch_dev.goal, dim=-1)
-    goal_success = terminal_dist < float(args.goal_tol)
-    success = (~collided) & goal_success
+    # Pure evaluation: no autograd graph. Halves eval peak memory (important on
+    # fractional-GPU cluster slices where VRAM is capped) and speeds it up.
+    with torch.no_grad():
+        batch_dev = batch.to(device)
+        with cuda_autocast(args, device):
+            rollout = rollout_variant(
+                args=args,
+                batch=batch_dev,
+                device=device,
+                mode=mode,
+                controller=controller,
+                plant_true=plant_true,
+                expected_cross_index=expected_cross_index,
+            )
+            avg_cost, loss_parts = compute_loss(args=args, batch=batch_dev, rollout=rollout)
+        pos = rollout.x_seq[..., :2]
+        x_pos = pos[..., 0]
+        y_pos = pos[..., 1]
+        cross_idx, y_cross, g_cross = interpolated_wall_crossing(
+            x_pos=x_pos,
+            y_pos=y_pos,
+            gate=batch_dev.gate_y,
+            wall_x=float(args.wall_x),
+        )
+        cross_error = y_cross - g_cross
+        collided = cross_error.abs() > float(args.gate_half_width)
+        terminal_dist = torch.norm(pos[:, -1, :] - batch_dev.goal, dim=-1)
+        goal_success = terminal_dist < float(args.goal_tol)
+        success = (~collided) & goal_success
 
-    metrics = {
-        "avg_cost": to_python_float(avg_cost),
-        "success_rate": to_python_float(success.float().mean()),
-        "wall_success_rate": to_python_float((~collided).float().mean()),
-        "goal_success_rate": to_python_float(goal_success.float().mean()),
-        "collision_rate": to_python_float(collided.float().mean()),
-        "avg_abs_cross_error": to_python_float(cross_error.abs().mean()),
-        "avg_terminal_dist": to_python_float(terminal_dist.mean()),
-        "avg_control_energy": to_python_float(torch.sum(rollout.u_seq.square(), dim=-1).mean()),
-        "avg_abs_reconstructed_w": to_python_float(rollout.w_seq.abs().mean()),
-    }
-    metrics.update(loss_parts)
-    metrics["rollout"] = {
-        "x_seq": rollout.x_seq.detach().cpu(),
-        "u_seq": rollout.u_seq.detach().cpu(),
-        "w_seq": rollout.w_seq.detach().cpu(),
-        "cross_idx": cross_idx.detach().cpu(),
-    }
+        metrics = tensor_scalars_to_floats({
+            "avg_cost": avg_cost,
+            "success_rate": success.float().mean(),
+            "wall_success_rate": (~collided).float().mean(),
+            "goal_success_rate": goal_success.float().mean(),
+            "collision_rate": collided.float().mean(),
+            "avg_abs_cross_error": cross_error.abs().mean(),
+            "avg_terminal_dist": terminal_dist.mean(),
+            "avg_control_energy": torch.sum(rollout.u_seq.square(), dim=-1).mean(),
+            "avg_abs_reconstructed_w": rollout.w_seq.abs().mean(),
+        })
+        metrics.update(loss_parts)
+        metrics["rollout"] = {
+            "x_seq": rollout.x_seq.detach().cpu(),
+            "u_seq": rollout.u_seq.detach().cpu(),
+            "w_seq": rollout.w_seq.detach().cpu(),
+            "cross_idx": cross_idx.detach().cpu(),
+        }
     return metrics
 
 
@@ -1622,7 +1714,16 @@ def train_controller(
     ssm_d_model_override: int | None = None,
     ssm_layers_override: int | None = None,
     contextual: bool = False,
+    run_dir: Path | None = None,
+    save_tag: str | None = None,
 ) -> tuple[PBController | None, DoubleIntegratorTrue | None, list[dict], dict]:
+    """Train one variant. When ``run_dir`` is given, the best checkpoint and the
+    training history are additionally persisted at every eval (as
+    ``{tag}_controller.partial.pt`` / ``train_history_partial.json``) so a
+    preempted or killed cluster job never loses a finished-so-far state."""
+    # Upload the validation batch once; evaluate_variant's own .to(device) then
+    # becomes a no-op instead of a fresh H2D copy at every eval.
+    val_batch = val_batch.to(device)
     if mode == "nominal":
         metrics = evaluate_variant(
             args=args,
@@ -1634,6 +1735,7 @@ def train_controller(
             expected_cross_index=expected_cross_index,
         )
         return None, None, [], metrics
+    save_tag = save_tag or mode
 
     mode_epochs = epochs_for_mode(args, mode)
     controller, plant_true = build_controller(
@@ -1694,38 +1796,37 @@ def train_controller(
     best_score = None
     best_val_metrics = None
 
-    for epoch in range(1, mode_epochs + 1):
+    for epoch, train_batch in iter_training_batches(
+        args=args,
+        epochs=mode_epochs,
+        expected_cross_index=expected_cross_index,
+        pin_memory=(device.type == "cuda"),
+    ):
         controller.train()
-        train_batch = sample_batch(
-            args=args,
-            batch_size=int(args.train_batch),
-            seed=int(args.seed) + 1000 + epoch,
-            paired=True,
-            shuffle=True,
-            expected_cross_index=expected_cross_index,
-        )
+        train_batch_dev = train_batch.to(device)
 
         # Curriculum: ramp collision sharpness from 20% to 100% over first 40% of training
         sharpness_frac = min(1.0, epoch / max(1, 0.4 * mode_epochs))
         curr_sharpness = float(args.collision_sharpness) * (0.2 + 0.8 * sharpness_frac)
 
-        rollout = rollout_variant(
-            args=args,
-            batch=train_batch,
-            device=device,
-            mode=mode,
-            controller=controller,
-            plant_true=plant_true,
-            expected_cross_index=expected_cross_index,
-            training=True,
-        )
-        loss, parts = compute_loss(
-            args=args,
-            batch=train_batch,
-            rollout=rollout,
-            collision_sharpness_override=curr_sharpness,
-            training=True,
-        )
+        with cuda_autocast(args, device):
+            rollout = rollout_variant(
+                args=args,
+                batch=train_batch_dev,
+                device=device,
+                mode=mode,
+                controller=controller,
+                plant_true=plant_true,
+                expected_cross_index=expected_cross_index,
+                training=True,
+            )
+            loss, parts = compute_loss(
+                args=args,
+                batch=train_batch_dev,
+                rollout=rollout,
+                collision_sharpness_override=curr_sharpness,
+                training=True,
+            )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if float(args.grad_clip) > 0.0:
@@ -1736,7 +1837,7 @@ def train_controller(
 
         record = {
             "epoch": epoch,
-            "train_loss": to_python_float(loss),
+            "train_loss": parts["loss_total"],
             "lr": to_python_float(scheduler.get_last_lr()[0]),
             "curr_sharpness": curr_sharpness,
         }
@@ -1766,6 +1867,13 @@ def train_controller(
                 best_val_metrics = val_metrics
                 best_state = {k: v.detach().cpu().clone() for k, v in controller.state_dict().items()}
                 is_best = True
+                if run_dir is not None:
+                    # Preemption safety: persist the best-so-far weights and the
+                    # training history immediately. A restarted job can salvage
+                    # them; the final save replaces the partial file.
+                    torch.save(best_state, run_dir / f"{save_tag}_controller.partial.pt")
+                    merge_json(run_dir / "train_history_partial.json",
+                               {save_tag: history + [record]})
             print_train_epoch_status(
                 mode=mode,
                 epoch=epoch,
@@ -3370,6 +3478,42 @@ def save_json(path: Path, payload: dict) -> None:
         json.dump(payload, handle, indent=2)
 
 
+def merge_json(path: Path, updates: dict) -> None:
+    """Read-modify-write a JSON dict, atomically (tmp file + os.replace).
+
+    Lets each variant persist its results the moment it finishes (preemption
+    safety) and lets parallel per-variant cluster jobs share one run directory.
+    """
+    data: dict = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                data = existing
+        except (OSError, json.JSONDecodeError):
+            pass
+    data.update(updates)
+    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+    tmp.replace(path)
+
+
+def load_saved_history(run_dir: Path, tag: str) -> list[dict]:
+    """Best-effort recovery of a variant's training history from a previous run."""
+    for name in ("train_history.json", "train_history_partial.json"):
+        path = run_dir / name
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get(tag), list):
+            return data[tag]
+    return []
+
+
 def strip_rollout(metrics: dict) -> dict:
     return {k: v for k, v in metrics.items() if k != "rollout"}
 
@@ -3483,12 +3627,41 @@ def _run_ablation_sweep(args: argparse.Namespace, device: torch.device, *,
         mutate(args)
         labels.append(label)
         print(f"\n[{run_prefix}] '{label}'  (context_dim={context_dim(args)}, ssm_layers={args.ssm_layers})")
-        controller, plant_true, history, best_val = train_controller(
-            args=args, device=device, mode=arch, val_batch=val_batch,
-            expected_cross_index=expected_cross_index,
-            mp_only=use_mp_only, factor_rank_override=1 if use_mad else None,
-            contextual=use_contextual,
-        )
+
+        # Resume: reuse a config's checkpoint from a previous (e.g. preempted)
+        # run of the same run_id instead of retraining. --fresh forces retrain.
+        controller = plant_true = None
+        resumed = False
+        pt_path = run_dir / f"{label}_controller.pt"
+        if pt_path.exists() and not getattr(args, "fresh", False):
+            try:
+                controller, plant_true = build_controller(
+                    device, args, mp_only=use_mp_only,
+                    factor_rank_override=1 if use_mad else None,
+                    contextual=use_contextual,
+                )
+                controller.load_state_dict(torch.load(pt_path, map_location=device))
+                controller.eval()
+                resumed = True
+                print(f"[resume] Loaded {pt_path.name} — skipping training for "
+                      f"'{label}' (pass --fresh to retrain).")
+            except Exception as exc:
+                controller = plant_true = None
+                print(f"[resume] Could not reuse {pt_path.name} ({exc}); retraining from scratch.")
+        if resumed:
+            history = load_saved_history(run_dir, label)
+            best_val = evaluate_variant(
+                args=args, batch=val_batch, device=device, mode=arch,
+                controller=controller, plant_true=plant_true,
+                expected_cross_index=expected_cross_index)
+        else:
+            controller, plant_true, history, best_val = train_controller(
+                args=args, device=device, mode=arch, val_batch=val_batch,
+                expected_cross_index=expected_cross_index,
+                mp_only=use_mp_only, factor_rank_override=1 if use_mad else None,
+                contextual=use_contextual,
+                run_dir=run_dir, save_tag=label,
+            )
         controllers[label] = controller
         plants[label] = plant_true
         test_metrics[label] = evaluate_variant(
@@ -3496,8 +3669,13 @@ def _run_ablation_sweep(args: argparse.Namespace, device: torch.device, *,
             controller=controller, plant_true=plant_true, expected_cross_index=expected_cross_index)
         val_metrics[label] = best_val
         histories[label] = history
-        if controller is not None:
-            torch.save(controller.state_dict(), run_dir / f"{label}_controller.pt")
+        if controller is not None and not resumed:
+            torch.save(controller.state_dict(), pt_path)
+            (run_dir / f"{label}_controller.partial.pt").unlink(missing_ok=True)
+        # Persist each config's results as soon as it finishes (preemption safety).
+        merge_json(run_dir / "metrics.json", {label: strip_rollout(test_metrics[label])})
+        merge_json(run_dir / "val_metrics.json", {label: strip_rollout(best_val)})
+        merge_json(run_dir / "train_history.json", {label: history})
 
     config_payload = dict(vars(args))
     config_payload["expected_cross_index"] = int(expected_cross_index)
@@ -3509,15 +3687,18 @@ def _run_ablation_sweep(args: argparse.Namespace, device: torch.device, *,
     plot_ablation_comparison(run_dir=run_dir, title=title, labels=labels,
                              test_metrics=test_metrics, show_plots=not args.no_show_plots,
                              fname=f"{run_prefix}_comparison.png")
-    # Full comparison suite (trajectory overlays, control curves, storyboards, GIFs),
-    # each config treated as a "variant" (its stored rollout carries its own setup).
-    _run_all_plots(
-        args=args, run_dir=run_dir, specs=[(lab, lab) for lab in labels],
-        controllers=controllers, plants=plants,
-        val_batch=val_batch, test_batch=test_batch,
-        val_metrics=val_metrics, test_metrics=test_metrics, histories=histories,
-        show_plots=not args.no_show_plots, expected_cross_index=expected_cross_index,
-    )
+    if getattr(args, "skip_plots", False):
+        print(f"[skip_plots] Full plot suite skipped; kept {run_prefix}_comparison.png.")
+    else:
+        # Full comparison suite (trajectory overlays, control curves, storyboards, GIFs),
+        # each config treated as a "variant" (its stored rollout carries its own setup).
+        _run_all_plots(
+            args=args, run_dir=run_dir, specs=[(lab, lab) for lab in labels],
+            controllers=controllers, plants=plants,
+            val_batch=val_batch, test_batch=test_batch,
+            val_metrics=val_metrics, test_metrics=test_metrics, histories=histories,
+            show_plots=not args.no_show_plots, expected_cross_index=expected_cross_index,
+        )
 
     print("\n" + "=" * 76)
     print(title)
@@ -3586,10 +3767,25 @@ def run_layers_ablation(args: argparse.Namespace, device: torch.device) -> None:
 def main() -> None:
     args = parse_args()
     set_seeds(int(args.seed))
-    torch.set_num_threads(max(1, torch.get_num_threads()))
+    # Respect the cluster CPU allocation: on a K8s node torch defaults its
+    # thread pool to the NODE's core count, not the cgroup request, causing
+    # CFS throttling. The launcher exports OMP_NUM_THREADS with the requested
+    # cores; honor it explicitly (belt and braces with the env var itself).
+    _omp_threads = os.environ.get("OMP_NUM_THREADS", "").strip()
+    if _omp_threads:
+        try:
+            torch.set_num_threads(max(1, int(float(_omp_threads))))
+        except ValueError:
+            pass
+    print(f"[cpu] torch intra-op threads: {torch.get_num_threads()}")
 
     requested_device = args.device
     if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        if getattr(args, "require_cuda", False):
+            raise RuntimeError(
+                "CUDA was requested with --require_cuda but no CUDA device is "
+                "available in this environment. Failing fast instead of silently "
+                "training on CPU (check the image/driver or drop --require_cuda).")
         print("CUDA requested but not available. Falling back to CPU.")
         requested_device = "cpu"
     device = torch.device(requested_device)
@@ -3600,6 +3796,13 @@ def main() -> None:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             print("[cuda] TF32 matmul/cudnn kernels enabled.")
+        if bool(getattr(args, "cuda_amp", True)):
+            if torch.cuda.is_bf16_supported():
+                print("[cuda] BF16 autocast enabled for rollout and loss.")
+            else:
+                print("[cuda] BF16 is not supported by this GPU; using FP32.")
+        if bool(getattr(args, "prefetch_batches", True)):
+            print("[cuda] Pinned-memory training-batch prefetch enabled.")
 
     # ── Context-ablation mode ─────────────────────────────────────────────────
     if getattr(args, "ablate_context", False):
@@ -3754,8 +3957,9 @@ def main() -> None:
     # Skipped in --simple_comparison mode (no mp_only_context variant).
     mp_only_d_model: int = int(args.ssm_d_model)
     mp_only_layers: int = int(args.ssm_layers)
+    _probe_device = torch.device("cpu")  # param counting is device-independent
     if any(m == "mp_only_context" for m, _ in specs):
-        _tmp_ctrl, _ = build_controller(device, args, mp_only=False)
+        _tmp_ctrl, _ = build_controller(_probe_device, args, mp_only=False)
         factorized_total = count_params(_tmp_ctrl)
         del _tmp_ctrl
 
@@ -3768,7 +3972,6 @@ def main() -> None:
         else:
             mp_only_d_model = find_matched_ssm_d_model(
                 args=args,
-                device=device,
                 target_params=factorized_total,
                 mp_in_dim=mp_in_dim_with_lift,
             )
@@ -3780,7 +3983,7 @@ def main() -> None:
     # contextual_ssm as closely as possible (fair comparison; layers stay fixed).
     matched_d_model: dict[str, int] = {}
     if getattr(args, "match_to_contextual", False) and any(m == "contextual_ssm" for m, _ in specs):
-        _ctx_ctrl, _ = build_controller(device, args, contextual=True)
+        _ctx_ctrl, _ = build_controller(_probe_device, args, contextual=True)
         _target = count_params(_ctx_ctrl)
         del _ctx_ctrl
         print(f"[match] target = contextual_ssm params = {_target:,}")
@@ -3791,11 +3994,11 @@ def main() -> None:
             shape = (_mode == "mp_only_context", _mode == "mad_context")  # (mp_only, use_mad)
             if shape not in _shape_cache:
                 _shape_cache[shape] = find_matched_d_model(
-                    args=args, device=device, target_params=_target,
+                    args=args, target_params=_target,
                     mp_only=shape[0], use_mad=shape[1])
             matched_d_model[_mode] = _shape_cache[shape]
             _c, _ = build_controller(
-                device, args, mp_only=shape[0],
+                _probe_device, args, mp_only=shape[0],
                 factor_rank_override=1 if shape[1] else None,
                 ssm_d_model_override=matched_d_model[_mode])
             print(f"[match] {_mode}: ssm_d_model={matched_d_model[_mode]} -> "
@@ -3814,13 +4017,7 @@ def main() -> None:
         use_no_lift = (mode == "context_no_lift")
         use_mad = (mode == "mad_context")
         use_contextual = (mode == "contextual_ssm")
-        controller, plant_true, history, best_val_metrics = train_controller(
-            args=args,
-            device=device,
-            mode=mode,
-            val_batch=val_batch,
-            expected_cross_index=expected_cross_index,
-            warm_start_state=warm_start,
+        mode_overrides = dict(
             mp_only=use_mp_only,
             force_no_lift=use_no_lift,
             factor_rank_override=1 if use_mad else None,
@@ -3828,6 +4025,42 @@ def main() -> None:
             ssm_layers_override=(mp_only_layers if (use_mp_only and mode not in matched_d_model) else None),
             contextual=use_contextual,
         )
+
+        # Resume: a completed variant (checkpoint already in the run dir, e.g.
+        # after a preempted-and-restarted cluster job) is loaded and re-evaluated
+        # instead of retrained. --fresh forces retraining.
+        controller = plant_true = None
+        resumed = False
+        pt_path = run_dir / f"{mode}_controller.pt"
+        if mode != "nominal" and pt_path.exists() and not getattr(args, "fresh", False):
+            try:
+                controller, plant_true = build_controller(device, args, **mode_overrides)
+                controller.load_state_dict(torch.load(pt_path, map_location=device))
+                controller.eval()
+                resumed = True
+                print(f"[resume] Loaded {pt_path.name} — skipping training for "
+                      f"{mode} (pass --fresh to retrain).")
+            except Exception as exc:
+                controller = plant_true = None
+                print(f"[resume] Could not reuse {pt_path.name} ({exc}); retraining from scratch.")
+        if resumed:
+            history = load_saved_history(run_dir, mode)
+            best_val_metrics = evaluate_variant(
+                args=args, batch=val_batch, device=device, mode=mode,
+                controller=controller, plant_true=plant_true,
+                expected_cross_index=expected_cross_index,
+            )
+        else:
+            controller, plant_true, history, best_val_metrics = train_controller(
+                args=args,
+                device=device,
+                mode=mode,
+                val_batch=val_batch,
+                expected_cross_index=expected_cross_index,
+                warm_start_state=warm_start,
+                run_dir=run_dir,
+                **mode_overrides,
+            )
         controllers[mode] = controller
         plants[mode] = plant_true
         histories[mode] = history
@@ -3841,10 +4074,35 @@ def main() -> None:
             plant_true=plant_true,
             expected_cross_index=expected_cross_index,
         )
-        if controller is not None:
-            torch.save(controller.state_dict(), run_dir / f"{mode}_controller.pt")
+        if controller is not None and not resumed:
+            torch.save(controller.state_dict(), pt_path)
+            (run_dir / f"{mode}_controller.partial.pt").unlink(missing_ok=True)
+        # Persist this variant's results immediately (preemption safety; also
+        # lets parallel per-variant jobs merge into one shared run directory).
+        merge_json(run_dir / "metrics.json", {mode: strip_rollout(test_metrics[mode])})
+        merge_json(run_dir / "val_metrics.json", {mode: strip_rollout(best_val_metrics)})
+        merge_json(run_dir / "train_history.json", {mode: history})
 
     show_plots = not args.no_show_plots
+    if getattr(args, "skip_plots", False):
+        print("\n[skip_plots] Figures/animations skipped; metrics and checkpoints "
+              "were saved incrementally.")
+        print(f"Re-generate all plots later with: --plot_only {run_dir.name}")
+        print("\n" + "=" * 76)
+        print("RESULTS OVERVIEW")
+        print("=" * 76)
+        for mode, label in specs:
+            metrics = test_metrics[mode]
+            print(
+                f"{label:30s} "
+                f"success={metrics['success_rate']:.3f} "
+                f"wall={metrics['wall_success_rate']:.3f} "
+                f"goal={metrics['goal_success_rate']:.3f} "
+                f"term={metrics['avg_terminal_dist']:.3f} "
+                f"cross_err={metrics['avg_abs_cross_error']:.3f}"
+            )
+        print("=" * 76)
+        return
     _run_all_plots(
         args=args, run_dir=run_dir, specs=specs,
         controllers=controllers, plants=plants,
