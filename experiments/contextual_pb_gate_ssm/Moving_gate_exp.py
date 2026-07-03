@@ -1651,10 +1651,13 @@ def evaluate_variant(
             "avg_abs_reconstructed_w": rollout.w_seq.abs().mean(),
         })
         metrics.update(loss_parts)
+        # Under CUDA BF16 autocast the rollout comes out bfloat16, which numpy
+        # (hence every plot function calling .numpy()) cannot represent — store
+        # rollouts as float32. No-op on CPU/FP32 runs.
         metrics["rollout"] = {
-            "x_seq": rollout.x_seq.detach().cpu(),
-            "u_seq": rollout.u_seq.detach().cpu(),
-            "w_seq": rollout.w_seq.detach().cpu(),
+            "x_seq": rollout.x_seq.detach().cpu().float(),
+            "u_seq": rollout.u_seq.detach().cpu().float(),
+            "w_seq": rollout.w_seq.detach().cpu().float(),
             "cross_idx": cross_idx.detach().cpu(),
         }
     return metrics
