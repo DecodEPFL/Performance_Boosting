@@ -1,0 +1,4 @@
+# Runtime artifacts — never track.
+.mplconfig/
+.launch_logs/
+ui_defaults.json
