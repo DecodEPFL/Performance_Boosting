@@ -258,8 +258,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mb_bound", type=float, default=8.0)
     parser.add_argument("--ssm_param", type=str, default="lru", choices=["lru", "tv", "tvc"],
                         help="SSM core parametrization: 'lru' (default), 'tv' (time-varying "
-                             "selective), or 'tvc' (time-varying selective, context-conditionable "
-                             "— required to use the contextual operator's 'select' port).")
+                             "selective), or 'tvc' (time-varying selective with a richer "
+                             "parametrization: MLP selector, signed transitions + feedthrough). "
+                             "The contextual 'select' port conditions the selective dynamics on "
+                             "context with EITHER tv or tvc (lru is rejected).")
     parser.add_argument("--ssm_bcd_nonlinearity", type=str, default="tanh",
                         choices=["tanh", "identity"],
                         help="tvc only: nonlinearity bounding b,c,d before normalization. "
