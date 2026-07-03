@@ -110,9 +110,29 @@ def build_delete_command(config: RCPConfig) -> list[str]:
             config.job_name, "-p", config.runai_project]
 
 
+# The launcher runs scp without a TTY, so it can never answer a password
+# prompt: fail fast (BatchMode) and reuse a shared master session when the
+# user has opened one with the matching ControlPath (see ssh_master_command).
+SSH_SHARED_OPTS = [
+    "-o", "BatchMode=yes",
+    "-o", "ControlMaster=auto",
+    "-o", "ControlPath=%d/.ssh/sockets/%r@%h-%p",
+]
+
+
+def ssh_master_command(config: RCPConfig) -> str:
+    """One-liner the user runs in a terminal to open a shared SSH session.
+
+    Prompts for the password once; the connection then stays available for
+    4 hours so the launcher's non-interactive scp can piggyback on it.
+    """
+    return ("ssh -o ControlMaster=auto -o ControlPath='%d/.ssh/sockets/%r@%h-%p' "
+            f"-o ControlPersist=4h {config.jumphost} true")
+
+
 def build_scp_command(config: RCPConfig, run_id: str, staging_dir: Path) -> list[str]:
     source = f"{config.jumphost}:{shlex.quote(str(remote_run_dir(config, run_id)))}"
-    return ["scp", "-r", source, str(staging_dir)]
+    return ["scp", *SSH_SHARED_OPTS, "-r", source, str(staging_dir)]
 
 
 def infer_job_state(describe_output: str) -> str:

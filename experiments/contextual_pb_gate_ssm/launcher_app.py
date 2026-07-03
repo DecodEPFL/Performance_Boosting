@@ -35,6 +35,7 @@ from rcp_backend import (
     infer_job_state,
     is_terminal_success,
     remote_run_dir,
+    ssh_master_command,
 )
 
 EXP_DIR = Path(__file__).resolve().parent
@@ -421,8 +422,12 @@ def sync_rcp_results(config: RCPConfig, run_id: str) -> Path:
                                 timeout=900, check=False)
         if result.returncode:
             raise RuntimeError(
-                "SSH transfer failed. Confirm VPN/jumphost access, your existing SSH session, "
-                f"and that `{remote_run_dir(config, run_id)}` exists.\n\n"
+                "SSH transfer failed. The launcher's scp runs without a terminal, so it "
+                "cannot type your password. Open a shared SSH session first — run this in "
+                "Terminal and enter your GASPAR password once (stays valid for 4 hours):\n\n"
+                f"    {ssh_master_command(config)}\n\n"
+                "then press Sync again. Also confirm VPN/jumphost access and that "
+                f"`{remote_run_dir(config, run_id)}` exists.\n\n"
                 + (result.stderr or result.stdout or "No scp output").strip())
         downloaded = staging / run_id
         if not downloaded.is_dir():
@@ -1009,6 +1014,11 @@ def main():
 
                 # ── Sync per run (fan-out jobs share one run directory) ─────
                 st.markdown("**Sync results into Browse runs**")
+                st.caption(
+                    "Sync piggybacks on a shared SSH session (scp cannot ask for your "
+                    "password). If none is open yet, run this in Terminal first — one "
+                    "password, valid 4 h: "
+                    f"`{ssh_master_command(rcp_jobs[0]['config'])}`")
                 allow_partial = st.checkbox(
                     "Allow partial sync (run is not complete)", value=False,
                     help="Normally sync is enabled only after every job of the run reports "
