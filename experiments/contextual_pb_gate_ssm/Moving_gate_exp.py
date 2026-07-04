@@ -179,6 +179,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start_x_min", type=float, default=1.7)
     parser.add_argument("--start_x_max", type=float, default=2.1)
     parser.add_argument("--start_y_max", type=float, default=0.40)
+    parser.add_argument("--start_y_min", type=float, default=None,
+                        help="Start y lower bound (blank = -start_y_max, i.e. the legacy "
+                             "symmetric band). Set both bounds for an asymmetric band, "
+                             "e.g. 0.5/1.0 to start strictly above the gate's home region. "
+                             "Keep |y| below --corridor_limit.")
     # Generalization over initial positions: widen the training box via the
     # start_* flags above, and/or evaluate out-of-distribution by giving the
     # TEST batch its own start ranges (validation stays on the training
@@ -191,7 +196,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="TEST-batch start x upper bound (blank = same as training). "
                              "Keep the implied wall-crossing time inside --horizon.")
     parser.add_argument("--test_start_y_max", type=float, default=None,
-                        help="TEST-batch |start y| bound (blank = same as training).")
+                        help="TEST-batch start y upper bound (blank = same as training).")
+    parser.add_argument("--test_start_y_min", type=float, default=None,
+                        help="TEST-batch start y lower bound (blank = same as training, "
+                             "which itself defaults to -start_y_max).")
     parser.add_argument("--freeze_per_episode", action="store_true",
                         help="switch only: freeze each episode's gate before that episode's "
                              "OWN predicted wall-crossing time (from its start x) instead of "
@@ -807,11 +815,17 @@ def estimate_expected_cross_index(args: argparse.Namespace) -> int:
     return idx
 
 
-def resolve_start_ranges(args: argparse.Namespace, *, test: bool = False) -> tuple[float, float, float]:
-    """(x_min, x_max, y_max) for start sampling; TEST overrides when given."""
+def resolve_start_ranges(args: argparse.Namespace, *, test: bool = False) -> tuple[float, float, float, float]:
+    """(x_min, x_max, y_min, y_max) for start sampling; TEST overrides when given.
+
+    y_min defaults to -y_max (legacy symmetric band) unless --start_y_min /
+    --test_start_y_min are set.
+    """
     x_min = float(args.start_x_min)
     x_max = float(args.start_x_max)
     y_max = float(args.start_y_max)
+    y_min = (-y_max if getattr(args, "start_y_min", None) is None
+             else float(args.start_y_min))
     if test:
         if getattr(args, "test_start_x_min", None) is not None:
             x_min = float(args.test_start_x_min)
@@ -819,7 +833,16 @@ def resolve_start_ranges(args: argparse.Namespace, *, test: bool = False) -> tup
             x_max = float(args.test_start_x_max)
         if getattr(args, "test_start_y_max", None) is not None:
             y_max = float(args.test_start_y_max)
-    return x_min, x_max, y_max
+            if getattr(args, "test_start_y_min", None) is None and getattr(args, "start_y_min", None) is None:
+                y_min = -y_max  # stay symmetric around 0 unless a y_min was given
+        if getattr(args, "test_start_y_min", None) is not None:
+            y_min = float(args.test_start_y_min)
+    where = "test" if test else "training"
+    if x_min > x_max:
+        raise ValueError(f"{where} start x range is empty: [{x_min}, {x_max}].")
+    if y_min > y_max:
+        raise ValueError(f"{where} start y range is empty: [{y_min}, {y_max}].")
+    return x_min, x_max, y_min, y_max
 
 
 def cross_index_interpolator(args: argparse.Namespace, x_lo: float, x_hi: float):
@@ -1025,7 +1048,7 @@ def sample_batch(
     rng = np.random.default_rng(seed)
     base_count = batch_size // 2 if paired else batch_size
     freeze_step = max(1, expected_cross_index - int(args.gate_settle_steps))
-    x_min, x_max, y_max = resolve_start_ranges(args, test=use_test_starts)
+    x_min, x_max, y_min, y_max = resolve_start_ranges(args, test=use_test_starts)
     # Per-episode gate freeze: align each episode's freeze with ITS start's
     # predicted crossing instead of the global mean-start crossing.
     cross_of_x = None
@@ -1040,7 +1063,7 @@ def sample_batch(
 
     for pair_idx in range(base_count):
         start_x = float(rng.uniform(x_min, x_max))
-        start_y = float(rng.uniform(-y_max, y_max))
+        start_y = float(rng.uniform(y_min, y_max))
         if is_continuous_gate(args):
             gate, is_adv = sample_continuous_gate(args, rng)
         else:
@@ -4030,8 +4053,9 @@ def main() -> None:
     _tr = resolve_start_ranges(args)
     _te = resolve_start_ranges(args, test=True)
     if _te != _tr:
-        print(f"[generalization] TEST starts: x in [{_te[0]:.2f}, {_te[1]:.2f}], |y| <= {_te[2]:.2f} "
-              f"(training: x in [{_tr[0]:.2f}, {_tr[1]:.2f}], |y| <= {_tr[2]:.2f}).")
+        print(f"[generalization] TEST starts: x in [{_te[0]:.2f}, {_te[1]:.2f}], "
+              f"y in [{_te[2]:.2f}, {_te[3]:.2f}] (training: x in [{_tr[0]:.2f}, {_tr[1]:.2f}], "
+              f"y in [{_tr[2]:.2f}, {_tr[3]:.2f}]).")
 
     specs = variant_specs(args)
     controllers: dict[str, PBController | None] = {}
@@ -4232,7 +4256,7 @@ def plot_start_generalization(
     fig, axes = plt.subplots(1, n, figsize=(3.6 * n + 0.8, 4.2),
                              sharex=True, sharey=True, squeeze=False)
     starts = test_batch.start.numpy()
-    tr_x_min, tr_x_max, tr_y_max = resolve_start_ranges(args)
+    tr_x_min, tr_x_max, tr_y_min, tr_y_max = resolve_start_ranges(args)
     for ax, (mode, label) in zip(axes[0], variant_order):
         roll = test_metrics[mode]["rollout"]
         succ = roll["success"].numpy().astype(bool)
@@ -4246,8 +4270,8 @@ def plot_start_generalization(
                    edgecolors="#f59e0b", alpha=0.85, label="missed goal", zorder=3)
         ax.axvline(float(args.wall_x), color="#475569", lw=1.2, ls="--")
         ax.scatter([0.0], [0.0], marker="*", s=90, color="#2563eb", zorder=4)
-        ax.add_patch(Rectangle((tr_x_min, -tr_y_max), tr_x_max - tr_x_min,
-                               2.0 * tr_y_max, fill=False, ls=":", lw=1.3,
+        ax.add_patch(Rectangle((tr_x_min, tr_y_min), tr_x_max - tr_x_min,
+                               tr_y_max - tr_y_min, fill=False, ls=":", lw=1.3,
                                ec="#64748b", zorder=2))
         ax.set_title(f"{label}\nsuccess {100.0 * float(succ.mean()):.1f}%", fontsize=10)
         ax.set_xlabel("start x")
