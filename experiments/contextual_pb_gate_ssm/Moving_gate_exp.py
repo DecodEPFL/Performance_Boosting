@@ -3139,6 +3139,99 @@ def plot_sample_trajectory(
     plt.close(fig)
 
 
+def _storyboard_ref_mode(test_metrics: dict, variant_order: list[tuple[str, str]]) -> str:
+    """Reference variant for the storyboards: prefer a context-bearing controller
+    (its crossing time anchors the snapshots and it should be the showcased,
+    non-colliding trajectory), falling back to the first plotted variant."""
+    for mode in ("context", "contextual_ssm", "mad_context", "mp_only_context", "context_no_lift"):
+        if mode in test_metrics:
+            return mode
+    return variant_order[0][0]
+
+
+def _storyboard_pick_episode(
+    *,
+    test_batch: ScenarioBatch,
+    test_metrics: dict,
+    ref_mode: str,
+    sample_idx: int,
+    continuous_gate: bool,
+    analysis_end: int,
+) -> int:
+    """Showcase episode for the storyboards.
+
+    Preference order: the reference controller SUCCEEDS on it; else at least
+    does not hit the wall; else any episode. Switching-gate runs additionally
+    require >= 3 gate switches so the panels show visibly different gate
+    levels. Falls back to legacy behavior when per-episode outcomes are not
+    stored (runs evaluated with older code)."""
+    roll = test_metrics[ref_mode]["rollout"]
+    n = int(test_batch.gate_y.shape[0])
+
+    def rich_schedule(i: int) -> bool:
+        if continuous_gate:
+            return True
+        g = test_batch.gate_y[i].numpy()
+        return int(np.sum(np.abs(np.diff(g[:analysis_end])) > 0.05)) >= 3
+
+    tiers = []
+    if "success" in roll:
+        tiers.append(lambda i: rich_schedule(i) and bool(roll["success"][i]))
+    if "collided" in roll:
+        tiers.append(lambda i: rich_schedule(i) and not bool(roll["collided"][i]))
+    tiers.append(rich_schedule)
+    for ok in tiers:
+        if ok(sample_idx):
+            return sample_idx
+        for i in range(n):
+            if ok(i):
+                return i
+    return sample_idx
+
+
+def _storyboard_snapshot_steps(
+    *,
+    gate_np: np.ndarray,
+    cross_idx: int,
+    analysis_end: int,
+    T: int,
+    continuous_gate: bool,
+) -> tuple[list[int], int]:
+    """Chronologically ordered snapshot steps plus the crossing step.
+
+    Three pre-crossing samples (gate-level mids for switching runs; quartiles
+    of the episode's OWN crossing time for continuous runs), the crossing
+    step, and the final step — sorted and de-duplicated. Sorting matters:
+    with diverse/OOD starts an episode can cross the wall earlier than the
+    schedule-derived sample points, which previously put the crossing panel
+    out of time order."""
+    cross_step = int(np.clip(cross_idx, 1, T - 1))
+    if continuous_gate:
+        base = max(cross_step, 4)
+        pre = [max(1, base // 4), max(2, base // 2), max(3, (3 * base) // 4)]
+    else:
+        switch_pts = np.where(np.abs(np.diff(gate_np[:analysis_end])) > 0.05)[0] + 1
+        seg_starts = np.concatenate([[0], switch_pts])
+        seg_ends = np.concatenate([switch_pts, [analysis_end]])
+        mids = [int(s + max(1, (e - s) // 2)) for s, e in zip(seg_starts, seg_ends)]
+        pre = [
+            mids[0] if len(mids) > 0 else max(1, analysis_end // 6),
+            mids[1] if len(mids) > 1 else analysis_end // 3,
+            mids[2] if len(mids) > 2 else 2 * analysis_end // 3,
+        ]
+    steps = sorted({int(np.clip(t, 0, T - 1)) for t in (*pre, cross_step, T - 1)})
+    # De-duplication may leave < 5 panels; refill midpoints of the widest gaps
+    # to keep the 5-frame rhythm whenever the horizon allows it.
+    while len(steps) < 5:
+        gaps = [(b - a, i) for i, (a, b) in enumerate(zip(steps, steps[1:]))]
+        width, i = max(gaps)
+        if width < 2:
+            break
+        steps.insert(i + 1, steps[i] + width // 2)
+        steps = sorted(set(steps))
+    return steps, cross_step
+
+
 def plot_trajectory_storyboard(
     *,
     args: argparse.Namespace,
@@ -3191,53 +3284,35 @@ def plot_trajectory_storyboard(
     continuous_gate = is_continuous_gate(args)
     analysis_end = expected_cross_index if continuous_gate else freeze_step
     analysis_end = int(np.clip(analysis_end, 1, T - 1))
-    ref_mode    = "context" if "context" in test_metrics else variant_order[0][0]
+    ref_mode = _storyboard_ref_mode(test_metrics, variant_order)
 
-    # ── Find a sample with a rich switching schedule for switching-gate runs ───
-    def _count_switches(gate: np.ndarray) -> int:
-        return int(np.sum(np.abs(np.diff(gate[:analysis_end])) > 0.05))
-
-    chosen = sample_idx
-    if not continuous_gate and _count_switches(test_batch.gate_y[sample_idx].numpy()) < 3:
-        n_batch = test_batch.gate_y.shape[0]
-        for i in range(n_batch):
-            if _count_switches(test_batch.gate_y[i].numpy()) >= 3:
-                chosen = i
-                break
+    # Showcase episode: prefer one the reference controller finishes cleanly
+    # (and, for switching runs, with a rich schedule so the panels differ).
+    chosen = _storyboard_pick_episode(
+        test_batch=test_batch, test_metrics=test_metrics, ref_mode=ref_mode,
+        sample_idx=sample_idx, continuous_gate=continuous_gate,
+        analysis_end=analysis_end,
+    )
 
     gate_np  = test_batch.gate_y[chosen].numpy()   # (T,)
     start_np = test_batch.start[chosen].numpy()
     cross_idx = int(test_metrics[ref_mode]["rollout"]["cross_idx"][chosen].item())
 
-    if continuous_gate:
-        # Smooth OU motion has no level segments; use evenly spaced pre-wall samples.
-        t1 = max(1, analysis_end // 4)
-        t2 = max(t1 + 1, analysis_end // 2)
-        t3 = max(t2 + 1, (3 * analysis_end) // 4)
-    else:
-        # switch_pts: indices where the gate value changes before freeze.
-        switch_pts = np.where(np.abs(np.diff(gate_np[:analysis_end])) > 0.05)[0] + 1
-        seg_starts = np.concatenate([[0], switch_pts])
-        seg_ends   = np.concatenate([switch_pts, [analysis_end]])
-
-        def _mid(s, e):
-            return int(s + max(1, (e - s) // 2))
-
-        level_mids = [_mid(s, e) for s, e in zip(seg_starts, seg_ends)]
-        t1 = level_mids[0] if len(level_mids) > 0 else max(1, analysis_end // 6)
-        t2 = level_mids[1] if len(level_mids) > 1 else analysis_end // 3
-        t3 = level_mids[2] if len(level_mids) > 2 else 2 * analysis_end // 3
-    t4 = min(cross_idx, T - 1)
-    t5 = T - 1
-
-    snapshot_steps = [t1, t2, t3, t4, t5]
-    snapshot_labels = [
-        f"$t={t1}$\n$g={gate_np[t1]:+.2f}$",
-        f"$t={t2}$\n$g={gate_np[t2]:+.2f}$",
-        f"$t={t3}$\n$g={gate_np[t3]:+.2f}$",
-        f"$t={t4}$  (crossing)\n$g={gate_np[min(t4, T-1)]:+.2f}$",
-        f"$t={t5}$  (final)",
-    ]
+    snapshot_steps, cross_step = _storyboard_snapshot_steps(
+        gate_np=gate_np, cross_idx=cross_idx, analysis_end=analysis_end,
+        T=T, continuous_gate=continuous_gate,
+    )
+    snapshot_labels = []
+    for t in snapshot_steps:
+        if t == cross_step and t == T - 1:
+            tag = "  (crossing, final)"
+        elif t == cross_step:
+            tag = "  (crossing)"
+        elif t == T - 1:
+            tag = "  (final)"
+        else:
+            tag = ""
+        snapshot_labels.append(f"$t={t}${tag}\n$g={gate_np[t]:+.2f}$")
     # Cursor colors for the gate strip (one per snapshot)
     cursor_colors = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#7c3aed"]
 
@@ -3318,6 +3393,9 @@ def plot_trajectory_storyboard(
         else:
             ax.set_yticklabels([])
         ax.tick_params(labelsize=7)
+
+    for ax in arena_axes[len(snapshot_steps):]:
+        ax.set_visible(False)
 
     # ── Gate schedule strip ────────────────────────────────────────────────────
     t_ax = np.arange(T)
@@ -3424,50 +3502,29 @@ def plot_trajectory_storyboard_compact(
     continuous_gate = is_continuous_gate(args)
     analysis_end = expected_cross_index if continuous_gate else freeze_step
     analysis_end = int(np.clip(analysis_end, 1, T - 1))
-    ref_mode    = "context" if "context" in test_metrics else variant_order[0][0]
+    ref_mode = _storyboard_ref_mode(test_metrics, variant_order)
 
-    def _count_switches(gate: np.ndarray) -> int:
-        return int(np.sum(np.abs(np.diff(gate[:analysis_end])) > 0.05))
-
-    # Reuse same sample-selection logic as full storyboard for switching runs.
-    chosen = sample_idx
-    if not continuous_gate and _count_switches(test_batch.gate_y[sample_idx].numpy()) < 3:
-        for i in range(test_batch.gate_y.shape[0]):
-            if _count_switches(test_batch.gate_y[i].numpy()) >= 3:
-                chosen = i
-                break
+    # Same episode/snapshot policy as the full storyboard: prefer an episode
+    # the reference controller finishes cleanly; panels in chronological order.
+    chosen = _storyboard_pick_episode(
+        test_batch=test_batch, test_metrics=test_metrics, ref_mode=ref_mode,
+        sample_idx=sample_idx, continuous_gate=continuous_gate,
+        analysis_end=analysis_end,
+    )
 
     gate_np   = test_batch.gate_y[chosen].numpy()
     start_np  = test_batch.start[chosen].numpy()
     cross_idx = int(test_metrics[ref_mode]["rollout"]["cross_idx"][chosen].item())
 
-    if continuous_gate:
-        t1 = max(1, analysis_end // 4)
-        t2 = max(t1 + 1, analysis_end // 2)
-        t3 = max(t2 + 1, (3 * analysis_end) // 4)
-    else:
-        switch_pts = np.where(np.abs(np.diff(gate_np[:analysis_end])) > 0.05)[0] + 1
-        seg_starts = np.concatenate([[0], switch_pts])
-        seg_ends   = np.concatenate([switch_pts, [analysis_end]])
-
-        def _mid(s, e):
-            return int(s + max(1, (e - s) // 2))
-
-        level_mids  = [_mid(s, e) for s, e in zip(seg_starts, seg_ends)]
-        t1 = level_mids[0] if len(level_mids) > 0 else max(1, analysis_end // 6)
-        t2 = level_mids[1] if len(level_mids) > 1 else analysis_end // 3
-        t3 = level_mids[2] if len(level_mids) > 2 else 2 * analysis_end // 3
-    t4 = min(cross_idx, T - 1)
-    t5 = T - 1
-
-    snapshot_steps  = [t1, t2, t3, t4, t5]
-    # Compact titles: single line, no gate value (shown in strip instead)
+    snapshot_steps, cross_step = _storyboard_snapshot_steps(
+        gate_np=gate_np, cross_idx=cross_idx, analysis_end=analysis_end,
+        T=T, continuous_gate=continuous_gate,
+    )
+    # Compact titles: single line, letters in chronological order; the gate
+    # value is shown in the strip below instead.
     snapshot_titles = [
-        f"(a) $t={t1}$",
-        f"(b) $t={t2}$",
-        f"(c) $t={t3}$",
-        f"(d) $t={t4}$",
-        f"(e) $t={t5}$",
+        f"({chr(ord('a') + i)}) $t={t}$" + (" — cross" if t == cross_step else "")
+        for i, t in enumerate(snapshot_steps)
     ]
     cursor_colors = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#7c3aed"]
 
@@ -3542,6 +3599,9 @@ def plot_trajectory_storyboard_compact(
             ax.set_ylabel("$y$ (m)", fontsize=6)
         else:
             ax.set_yticklabels([])
+
+    for ax in arena_axes[len(snapshot_steps):]:
+        ax.set_visible(False)
 
     # ── Gate strip ────────────────────────────────────────────────────────────
     t_ax = np.arange(T)
