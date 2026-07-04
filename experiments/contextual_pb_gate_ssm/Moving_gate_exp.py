@@ -179,6 +179,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start_x_min", type=float, default=1.7)
     parser.add_argument("--start_x_max", type=float, default=2.1)
     parser.add_argument("--start_y_max", type=float, default=0.40)
+    # Generalization over initial positions: widen the training box via the
+    # start_* flags above, and/or evaluate out-of-distribution by giving the
+    # TEST batch its own start ranges (validation stays on the training
+    # distribution so model selection is unaffected).
+    parser.add_argument("--test_start_x_min", type=float, default=None,
+                        help="TEST-batch start x lower bound (blank = same as training). "
+                             "Use with the other test_start_* flags to measure "
+                             "generalization to initial positions never seen in training.")
+    parser.add_argument("--test_start_x_max", type=float, default=None,
+                        help="TEST-batch start x upper bound (blank = same as training). "
+                             "Keep the implied wall-crossing time inside --horizon.")
+    parser.add_argument("--test_start_y_max", type=float, default=None,
+                        help="TEST-batch |start y| bound (blank = same as training).")
+    parser.add_argument("--freeze_per_episode", action="store_true",
+                        help="switch only: freeze each episode's gate before that episode's "
+                             "OWN predicted wall-crossing time (from its start x) instead of "
+                             "one global freeze at the mean start's crossing. Recommended "
+                             "whenever the start x range is wide.")
     parser.add_argument("--wall_x", type=float, default=0.55)
     parser.add_argument("--gate_half_width", type=float, default=0.20)
     parser.add_argument("--gate_amplitude", type=float, default=0.95)
@@ -789,6 +807,55 @@ def estimate_expected_cross_index(args: argparse.Namespace) -> int:
     return idx
 
 
+def resolve_start_ranges(args: argparse.Namespace, *, test: bool = False) -> tuple[float, float, float]:
+    """(x_min, x_max, y_max) for start sampling; TEST overrides when given."""
+    x_min = float(args.start_x_min)
+    x_max = float(args.start_x_max)
+    y_max = float(args.start_y_max)
+    if test:
+        if getattr(args, "test_start_x_min", None) is not None:
+            x_min = float(args.test_start_x_min)
+        if getattr(args, "test_start_x_max", None) is not None:
+            x_max = float(args.test_start_x_max)
+        if getattr(args, "test_start_y_max", None) is not None:
+            y_max = float(args.test_start_y_max)
+    return x_min, x_max, y_max
+
+
+def cross_index_interpolator(args: argparse.Namespace, x_lo: float, x_hi: float):
+    """Map a start x to its expected nominal wall-crossing step.
+
+    One batched nominal rollout over a 17-point grid of start positions, then
+    linear interpolation per episode. Crossing steps are clamped to
+    [1, horizon-1] so extreme starts degrade gracefully instead of raising.
+    Used by --freeze_per_episode to align each episode's gate freeze with its
+    own crossing time when the start x range is wide.
+    """
+    horizon = int(args.horizon)
+    lo, hi = float(min(x_lo, x_hi)), float(max(x_lo, x_hi))
+    grid = np.linspace(lo, hi, num=17, dtype=np.float64)
+    plant = DoubleIntegratorTrue(dt=float(args.dt), pre_kp=float(args.pre_kp),
+                                 pre_kd=float(args.pre_kd), drag_coeff=float(args.drag_coeff))
+    x = torch.zeros(len(grid), 1, 4, dtype=torch.float32)
+    x[:, 0, 0] = torch.from_numpy(grid.astype(np.float32))
+    u = torch.zeros(len(grid), 1, 2, dtype=torch.float32)
+    steps = []
+    for _ in range(horizon):
+        x = plant.forward(x, u)
+        steps.append(x[:, 0, 0].clone())
+    traj = torch.stack(steps, dim=1).numpy()                     # (G, horizon)
+    wall = float(args.wall_x)
+    crossed = traj <= wall
+    idx = np.where(crossed.any(axis=1), crossed.argmax(axis=1),
+                   np.abs(traj - wall).argmin(axis=1)).astype(np.float64)
+    idx = np.clip(idx, 1, horizon - 1)
+
+    def expected_cross(start_x: float) -> int:
+        return int(round(float(np.interp(float(start_x), grid, idx))))
+
+    return expected_cross
+
+
 def sample_switching_gate(
     args: argparse.Namespace,
     rng: np.random.Generator,
@@ -950,6 +1017,7 @@ def sample_batch(
     paired: bool,
     shuffle: bool,
     expected_cross_index: int,
+    use_test_starts: bool = False,
 ) -> ScenarioBatch:
     if paired and batch_size % 2 != 0:
         raise ValueError("Paired batches require an even batch size.")
@@ -957,6 +1025,12 @@ def sample_batch(
     rng = np.random.default_rng(seed)
     base_count = batch_size // 2 if paired else batch_size
     freeze_step = max(1, expected_cross_index - int(args.gate_settle_steps))
+    x_min, x_max, y_max = resolve_start_ranges(args, test=use_test_starts)
+    # Per-episode gate freeze: align each episode's freeze with ITS start's
+    # predicted crossing instead of the global mean-start crossing.
+    cross_of_x = None
+    if not is_continuous_gate(args) and bool(getattr(args, "freeze_per_episode", False)):
+        cross_of_x = cross_index_interpolator(args, x_min, x_max)
 
     starts = []
     goals = []
@@ -965,12 +1039,14 @@ def sample_batch(
     adv_flags = []
 
     for pair_idx in range(base_count):
-        start_x = float(rng.uniform(float(args.start_x_min), float(args.start_x_max)))
-        start_y = float(rng.uniform(-float(args.start_y_max), float(args.start_y_max)))
+        start_x = float(rng.uniform(x_min, x_max))
+        start_y = float(rng.uniform(-y_max, y_max))
         if is_continuous_gate(args):
             gate, is_adv = sample_continuous_gate(args, rng)
         else:
-            gate, is_adv = sample_switching_gate(args, rng, freeze_step)
+            fs = freeze_step if cross_of_x is None else max(
+                1, cross_of_x(start_x) - int(args.gate_settle_steps))
+            gate, is_adv = sample_switching_gate(args, rng, fs)
 
         if paired:
             starts.extend([[start_x, start_y], [start_x, start_y]])
@@ -1659,6 +1735,9 @@ def evaluate_variant(
             "u_seq": rollout.u_seq.detach().cpu().float(),
             "w_seq": rollout.w_seq.detach().cpu().float(),
             "cross_idx": cross_idx.detach().cpu(),
+            # Per-episode outcomes (bool, (B,)) for the start-generalization map.
+            "success": success.detach().cpu(),
+            "collided": collided.detach().cpu(),
         }
     return metrics
 
@@ -3615,7 +3694,8 @@ def _run_ablation_sweep(args: argparse.Namespace, device: torch.device, *,
     val_batch = sample_batch(args=args, batch_size=int(args.val_batch), seed=int(args.seed) + 50_000,
                              paired=True, shuffle=False, expected_cross_index=expected_cross_index)
     test_batch = sample_batch(args=args, batch_size=int(args.test_batch), seed=int(args.seed) + 60_000,
-                              paired=True, shuffle=False, expected_cross_index=expected_cross_index)
+                              paired=True, shuffle=False, expected_cross_index=expected_cross_index,
+                              use_test_starts=True)
 
     use_mp_only = (arch == "mp_only_context")
     use_mad = (arch == "mad_context")
@@ -3854,6 +3934,7 @@ def main() -> None:
             paired=True,
             shuffle=False,
             expected_cross_index=expected_cross_index,
+            use_test_starts=True,
         )
         val_batch = sample_batch(
             args=args,
@@ -3944,7 +4025,13 @@ def main() -> None:
         paired=True,
         shuffle=False,
         expected_cross_index=expected_cross_index,
+        use_test_starts=True,
     )
+    _tr = resolve_start_ranges(args)
+    _te = resolve_start_ranges(args, test=True)
+    if _te != _tr:
+        print(f"[generalization] TEST starts: x in [{_te[0]:.2f}, {_te[1]:.2f}], |y| <= {_te[2]:.2f} "
+              f"(training: x in [{_tr[0]:.2f}, {_tr[1]:.2f}], |y| <= {_tr[2]:.2f}).")
 
     specs = variant_specs(args)
     controllers: dict[str, PBController | None] = {}
@@ -4118,6 +4205,63 @@ def main() -> None:
     )
 
 
+def plot_start_generalization(
+    *,
+    args,
+    run_dir: Path,
+    variant_order: list[tuple[str, str]],
+    test_batch: ScenarioBatch,
+    test_metrics: dict,
+    show_plots: bool,
+) -> None:
+    """Per-variant map of TEST-episode outcomes at their start positions.
+
+    Green = success, red x = wall hit, hollow orange = reached the wall but
+    missed the goal. The dotted box marks the TRAINING start region, so
+    out-of-distribution starts (via --test_start_*) are immediately visible.
+    """
+    if any("success" not in test_metrics[m]["rollout"] for m, _ in variant_order):
+        print("[plots] start_generalization skipped (per-episode outcomes missing; "
+              "re-run evaluation with this code version).")
+        return
+    from matplotlib.patches import Rectangle
+
+    plt = get_plt(show_plots)
+    setup_plot_style(plt)
+    n = len(variant_order)
+    fig, axes = plt.subplots(1, n, figsize=(3.6 * n + 0.8, 4.2),
+                             sharex=True, sharey=True, squeeze=False)
+    starts = test_batch.start.numpy()
+    tr_x_min, tr_x_max, tr_y_max = resolve_start_ranges(args)
+    for ax, (mode, label) in zip(axes[0], variant_order):
+        roll = test_metrics[mode]["rollout"]
+        succ = roll["success"].numpy().astype(bool)
+        coll = roll["collided"].numpy().astype(bool)
+        miss = (~succ) & (~coll)
+        ax.scatter(starts[succ, 0], starts[succ, 1], s=14, color="#16a34a",
+                   alpha=0.75, label="success", zorder=3)
+        ax.scatter(starts[coll, 0], starts[coll, 1], s=20, color="#dc2626",
+                   marker="x", alpha=0.85, label="wall hit", zorder=3)
+        ax.scatter(starts[miss, 0], starts[miss, 1], s=18, facecolors="none",
+                   edgecolors="#f59e0b", alpha=0.85, label="missed goal", zorder=3)
+        ax.axvline(float(args.wall_x), color="#475569", lw=1.2, ls="--")
+        ax.scatter([0.0], [0.0], marker="*", s=90, color="#2563eb", zorder=4)
+        ax.add_patch(Rectangle((tr_x_min, -tr_y_max), tr_x_max - tr_x_min,
+                               2.0 * tr_y_max, fill=False, ls=":", lw=1.3,
+                               ec="#64748b", zorder=2))
+        ax.set_title(f"{label}\nsuccess {100.0 * float(succ.mean()):.1f}%", fontsize=10)
+        ax.set_xlabel("start x")
+    axes[0][0].set_ylabel("start y")
+    axes[0][0].legend(loc="best", fontsize=8, framealpha=0.9)
+    fig.suptitle("Generalization over initial positions (dotted box = training starts)",
+                 y=1.04)
+    fig.savefig(run_dir / "start_generalization.png", bbox_inches="tight")
+    print(f"Saved start-generalization map -> {run_dir / 'start_generalization.png'}")
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+
 def _run_all_plots(
     *,
     args,
@@ -4156,6 +4300,14 @@ def _run_all_plots(
         show_plots=show_plots,
     )
     plot_trajectory_samples(
+        args=args,
+        run_dir=run_dir,
+        variant_order=specs,
+        test_batch=test_batch,
+        test_metrics=test_metrics,
+        show_plots=show_plots,
+    )
+    plot_start_generalization(
         args=args,
         run_dir=run_dir,
         variant_order=specs,

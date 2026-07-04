@@ -80,11 +80,12 @@ GROUPS = [
         "use_w0_clip", "w0_clip", "use_w_augment", "w_augment_decay"}, False),
     ("Context features & lifting", lambda d: d == "context_mode" or d.startswith("mp_context")
         or d in {"context_ema_alpha", "gate_obs_delay", "context_dropout_p"}, False),
-    ("Geometry & dynamics", lambda d: d.startswith("start_") or d in {
+    ("Geometry & dynamics", lambda d: d.startswith("start_") or d.startswith("test_start") or d in {
         "horizon", "plot_horizon", "use_plot_horizon", "dt", "pre_kp", "pre_kd", "drag_coeff",
         "wall_x", "gate_half_width", "gate_amplitude", "goal_tol", "corridor_limit",
         "wall_focus_sigma", "gate_settle_steps"}, False),
-    ("Gate schedule / motion", lambda d: d.startswith("gate_dwell") or d in {"gate_corr_time", "gate_range", "gate_center_range"}, False),
+    ("Gate schedule / motion", lambda d: d.startswith("gate_dwell") or d in {
+        "gate_corr_time", "gate_range", "gate_center_range", "freeze_per_episode"}, False),
     ("Disturbance process", lambda d: d.startswith("noise_") or d.startswith("gust_"), False),
     ("Loss weights & normalization", lambda d: d.endswith("_weight") or d.endswith("_sharpness")
         or d.startswith("alpha_") or d == "loss_normalize"
@@ -196,7 +197,7 @@ EXPERIMENTS = {
     "Continuous gate · OU (new)": "continuous",
 }
 # Params that apply to only one gate-motion regime (hidden for the other).
-SWITCH_ONLY_DESTS = {"gate_dwell_min", "gate_dwell_max", "gate_settle_steps"}
+SWITCH_ONLY_DESTS = {"gate_dwell_min", "gate_dwell_max", "gate_settle_steps", "freeze_per_episode"}
 CONTINUOUS_ONLY_DESTS = {"gate_corr_time", "gate_range", "gate_center_range", "gate_margin_train"}
 
 
@@ -270,6 +271,9 @@ def render_widget(dest, bools, values, override=_NO_OVERRIDE):
         val = int(override) if has_ovr else int(default)
         return st.number_input(dest, value=val, step=1, help=helptext, key=f"w_{dest}")
     if tname == "float":
+        if default is None:
+            val = str(override) if (has_ovr and override not in (None, "", "None")) else ""
+            return st.text_input(f"{dest} (blank = auto)", value=val, help=helptext, key=f"w_{dest}")
         # text input preserves scientific notation / exact small values
         val = str(override) if has_ovr else str(default)
         return st.text_input(dest, value=val, help=helptext, key=f"w_{dest}")
@@ -315,13 +319,15 @@ def build_argv(order, bools, values, widget_vals, run_id):
                 argv += [opt, str(int(v))]
         elif tname == "float":
             txt = str(v).strip()
-            if txt == "":
+            if txt == "" or txt.lower() == "none":
                 continue
             try:
-                if float(txt) != float(default):
-                    argv += [opt, txt]
+                parsed = float(txt)
             except ValueError:
                 warnings.append(f"{dest}: '{txt}' is not a float — skipped.")
+                continue
+            if default is None or parsed != float(default):
+                argv += [opt, txt]
         else:  # str
             dflt = "" if default is None else str(default)
             if str(v).strip() != dflt:
