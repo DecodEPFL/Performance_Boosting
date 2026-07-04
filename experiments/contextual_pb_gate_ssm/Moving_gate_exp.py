@@ -692,11 +692,13 @@ def variant_specs(args=None) -> list[tuple[str, str]]:
 
 
 # Canonical context-feature layout. This ORDER defines the context-vector layout
-# and must stay fixed (operator input weights depend on it); it matches the
-# original 11-feature 'full' context exactly.
+# and must stay fixed (operator input weights depend on it). New features are
+# appended at the END so any previously used subset emits the exact same vector
+# (and old checkpoints stay loadable); the first 11 match the original 'full' set.
 CONTEXT_FEATURE_ORDER = [
     "gate_obs", "gate_vel", "gate_ema", "gate_slow_ema", "gate_error",
     "rel_wall_x", "goal_dx", "goal_dy", "approach", "switch_age", "time_to_wall",
+    "vel_x", "vel_y",
 ]
 # key -> (group, human label, experiments-it-applies-to). 'fair' = observation +
 # own state + known geometry; 'privileged' = gate dynamics / schedule ("cheating").
@@ -712,6 +714,8 @@ CONTEXT_FEATURE_META = {
     "approach":      ("fair",       "Approach weight (near wall)",           ("switch", "continuous")),
     "switch_age":    ("privileged", "Steps since last gate switch",          ("switch",)),
     "time_to_wall":  ("privileged", "Normalized time-to-wall (schedule)",    ("switch", "continuous")),
+    "vel_x":         ("fair",       "Own velocity vx",                       ("switch", "continuous")),
+    "vel_y":         ("fair",       "Own velocity vy",                       ("switch", "continuous")),
 }
 # Default fair set for the continuous experiment: observation, causal gate-motion
 # history, own state, and known geometry.
@@ -719,7 +723,13 @@ FAIR_CONTEXT_DEFAULT = [
     "gate_obs", "gate_vel", "gate_ema", "gate_error",
     "rel_wall_x", "goal_dx", "goal_dy", "approach",
 ]
-_FULL_FEATURES = list(CONTEXT_FEATURE_ORDER)
+# Legacy --context_mode 'full' stays the ORIGINAL 11 features (frozen so old
+# runs/checkpoints keep their context_dim); opt into velocity via
+# --context_features / the launcher checkboxes instead.
+_FULL_FEATURES = [
+    "gate_obs", "gate_vel", "gate_ema", "gate_slow_ema", "gate_error",
+    "rel_wall_x", "goal_dx", "goal_dy", "approach", "switch_age", "time_to_wall",
+]
 _MINIMAL_FEATURES = ["gate_error", "approach", "switch_age"]  # legacy --context_mode minimal
 
 FULL_CONTEXT_DIM = len(_FULL_FEATURES)
@@ -1134,6 +1144,8 @@ def build_context(
     pos = state[..., :2]
     x_pos = pos[..., 0]
     y_pos = pos[..., 1]
+    vel_x = state[..., 2]
+    vel_y = state[..., 3]
 
     # Apply observation delay: controller sees gate from `delay` steps ago
     delay = int(args.gate_obs_delay)
@@ -1167,6 +1179,10 @@ def build_context(
         "approach": approach,
         "switch_age": switch_age_t / age_scale,
         "time_to_wall": time_to_wall,
+        # Own velocity (fair, endogenous). The PD-pre-stabilized plant keeps
+        # |v| at O(1) over the sampled start ranges, so no extra normalization.
+        "vel_x": vel_x,
+        "vel_y": vel_y,
     }
     feats = resolve_context_features(args)
     z_t = float(args.z_scale) * torch.cat([feat_map[k] for k in feats], dim=-1)
