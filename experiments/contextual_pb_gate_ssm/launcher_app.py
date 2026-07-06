@@ -74,7 +74,7 @@ GROUPS = [
     ("Training", lambda d: d in {
         "train_batch", "val_batch", "test_batch", "epochs", "disturbance_only_epochs",
         "eval_every", "lr", "lr_min", "grad_clip", "warm_start", "cuda_amp",
-        "prefetch_batches"}, True),
+        "prefetch_batches", "torch_compile"}, True),
     ("Plots & storyboards", lambda d: d in {"use_storyboard", "use_storyboard_compact"}, False),
     ("Contextual SSM (new variant)", lambda d: d.startswith("ctx_") or d in {"contextual_comparison", "match_to_contextual"}, True),
     ("SSM core", lambda d: d.startswith("ssm_") or d.startswith("mp_only_ssm"), False),

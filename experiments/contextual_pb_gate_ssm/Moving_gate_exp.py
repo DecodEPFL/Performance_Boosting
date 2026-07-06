@@ -110,6 +110,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Generate the next training batch concurrently with training.")
     parser.add_argument("--no_prefetch_batches", dest="prefetch_batches", action="store_false")
     parser.set_defaults(prefetch_batches=True)
+    parser.add_argument("--torch_compile", action="store_true",
+                        help="EXPERIMENTAL: wrap the PB operator's per-step forward in "
+                             "torch.compile(dynamic=True) during training to fuse the many "
+                             "tiny kernels of the sequential rollout. Falls back to eager "
+                             "on any compilation error. Expect several slow warm-up "
+                             "epochs; benefit depends heavily on the torch version "
+                             "(cluster image ships 2.1) — A/B the epoch times before "
+                             "trusting it.")
     parser.add_argument("--require_cuda", action="store_true",
                         help="Fail fast when --device cuda is requested but CUDA is "
                              "unavailable, instead of silently training on CPU "
@@ -520,6 +528,37 @@ def tensor_scalars_to_floats(values: dict[str, torch.Tensor]) -> dict[str, float
     names = list(values)
     packed = torch.stack([values[name].detach().float().reshape(()) for name in names])
     return dict(zip(names, packed.cpu().tolist()))
+
+
+def maybe_compile_operator(controller: PBController, args: argparse.Namespace) -> None:
+    """Opt-in torch.compile of the operator's per-step forward (--torch_compile).
+
+    The closed-loop rollout calls ``controller.operator(w_t, z_t)`` once per
+    timestep with tiny tensors, so the run is kernel-launch bound; compiling
+    the operator fuses those launches. The forward METHOD is wrapped (not the
+    module), so ``state_dict`` keys stay unprefixed and checkpoints remain
+    compatible with resume / plot_only / custom rollouts. ``dynamic=True``
+    keeps the changing step index / recurrent state from recompiling per step.
+    Best-effort: any failure keeps eager mode.
+    """
+    if not bool(getattr(args, "torch_compile", False)):
+        return
+    op = controller.operator
+    # PB_TORCH_COMPILE_BACKEND overrides the backend (e.g. aot_eager for
+    # correctness checks on machines where inductor's C++ build is unusable).
+    backend = os.environ.get("PB_TORCH_COMPILE_BACKEND", "inductor")
+    try:
+        # Step counters live as int attributes (e.g. MpContextualSSM._t fed to
+        # the core as time_offset). By default dynamo bakes such ints into
+        # guards -> one recompile per timestep until the cache limit, then
+        # silent eager fallback. Treat them as dynamic instead.
+        if hasattr(torch._dynamo.config, "allow_unspec_int_on_nn_module"):
+            torch._dynamo.config.allow_unspec_int_on_nn_module = True
+        op.forward = torch.compile(op.forward, dynamic=True, backend=backend)
+        print(f"[compile] torch.compile enabled on the PB operator (backend={backend}; "
+              "first epochs include compilation warm-up).")
+    except Exception as exc:  # pragma: no cover - depends on torch build
+        print(f"[compile] torch.compile unavailable ({exc}); continuing in eager mode.")
 
 
 def cuda_autocast(args: argparse.Namespace, device: torch.device):
@@ -1893,6 +1932,8 @@ def train_controller(
         missing, unexpected = controller.load_state_dict(warm_start_state, strict=False)
         print(f"[{mode}] warm-started from provided checkpoint "
               f"(missing={len(missing)}, unexpected={len(unexpected)}).")
+
+    maybe_compile_operator(controller, args)
 
     # AdamW with separate LRs for the recurrent SSM core (full lr) and the
     # surrounding bounded heads / MLP operator (half lr).

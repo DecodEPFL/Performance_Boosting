@@ -81,21 +81,28 @@ class LpContextLifter(nn.Module):
                 nn.Linear(int(hidden_dim), self.out_dim, bias=False),
             )
 
+        # Streaming step counter kept as tensor ARITHMETIC end to end: reading
+        # it via `.item()` would cost a GPU->CPU sync at every closed-loop
+        # timestep (160 pipeline stalls per rollout) and break torch.compile
+        # graphs, while a Python int would bake the step value into dynamo
+        # guards (one recompile per timestep). Non-persistent: never saved.
         self.register_buffer("_step", torch.zeros((), dtype=torch.long), persistent=False)
 
     def reset(self) -> None:
-        self._step.zero_()
+        with torch.no_grad():
+            self._step.zero_()
 
     def _decay(self, t_steps: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        start = int(self._step.item())
-        idx = torch.arange(start, start + int(t_steps), device=device, dtype=dtype).view(1, t_steps, 1)
+        offsets = torch.arange(int(t_steps), device=device, dtype=dtype)
+        idx = (self._step.to(device=device, dtype=dtype) + offsets).view(1, t_steps, 1)
         if self.decay_law == "exp":
             d = torch.exp(-self.decay_rate * idx)
         elif self.decay_law == "poly":
             d = (1.0 + idx) ** (-self.decay_power)
         else:
             d = (idx < float(self.decay_horizon)).to(dtype)
-        self._step += int(t_steps)
+        with torch.no_grad():
+            self._step += int(t_steps)
         return d
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
