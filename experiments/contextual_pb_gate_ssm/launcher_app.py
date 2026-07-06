@@ -29,11 +29,13 @@ from rcp_backend import (
     RCPConfig,
     build_delete_command,
     build_describe_command,
+    build_list_command,
     build_logs_command,
     build_scp_command,
     build_submit_command,
     infer_job_state,
     is_terminal_success,
+    parse_workload_states,
     remote_run_dir,
     ssh_master_command,
 )
@@ -552,6 +554,41 @@ def main():
                              "and skips the combined figures. When ALL jobs are done, "
                              "Sync once and use Re-plot in Browse runs to build the "
                              "comparison figures. Cuts wall-clock by ~#variants.")
+                    if st.button("🗑 Delete all COMPLETED workloads in the project",
+                                 key="rcp_sweep_completed",
+                                 help="Removes finished Run:AI workload records (frees their "
+                                      "job names for resubmission). Results on the PVC are "
+                                      "not touched. Running/pending jobs are left alone."):
+                        try:
+                            listing = run_rcp_cli(build_list_command(rcp_config("sweep")),
+                                                  "Workload list")
+                            if listing.returncode:
+                                st.error(cli_error("Workload list", listing))
+                            else:
+                                done = [name for name, state in
+                                        parse_workload_states(listing.stdout or "")
+                                        if is_terminal_success(state)]
+                                if not done:
+                                    st.info("No completed workloads to delete.")
+                                failed: list[str] = []
+                                for name in done:
+                                    result = run_rcp_cli(
+                                        build_delete_command(rcp_config(name)),
+                                        f"Delete {name}")
+                                    if result.returncode:
+                                        failed.append(name)
+                                    else:
+                                        for job in st.session_state.get("rcp_jobs", []):
+                                            if job["job_name"] == name:
+                                                job["state"] = "Deleted"
+                                if done and not failed:
+                                    st.success(f"Deleted {len(done)} completed workload(s): "
+                                               + ", ".join(f"`{n}`" for n in done))
+                                elif failed:
+                                    st.warning(f"Deleted {len(done) - len(failed)}; failed on: "
+                                               + ", ".join(failed))
+                        except RuntimeError as exc:
+                            st.error(str(exc))
 
             # Experiment selector lives OUTSIDE the form so changing it re-renders
             # the form (different gate params + context options) immediately.

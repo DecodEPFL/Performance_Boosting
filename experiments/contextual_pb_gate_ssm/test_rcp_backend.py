@@ -2,7 +2,8 @@ from pathlib import Path
 import unittest
 
 from rcp_backend import (
-    RCPConfig, build_scp_command, build_submit_command, gpu_request_args, remote_run_dir,
+    RCPConfig, build_scp_command, build_submit_command, gpu_request_args,
+    parse_workload_states, remote_run_dir,
 )
 
 
@@ -24,6 +25,18 @@ class RCPBackendTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--cpu-core-request") + 1], "4")
         self.assertEqual(cmd[cmd.index("--cpu-memory-request") + 1], "16G")
         self.assertEqual(cmd[-4:-1], ["--", "bash", "-lc"])
+
+    def test_parse_workload_states_from_cli_table(self):
+        table = (
+            " Workload               Type        Framework   Status      Project              \n"
+            "──────────────────────────────────────────────────────────────────────────────────\n"
+            " arch-contextual-ssm    Training    Runai       Completed   sci-sti-gft-lmassai  \n"
+            " arch-mad-context       Training    Runai       Running     sci-sti-gft-lmassai  \n"
+            "\n"
+        )
+        self.assertEqual(parse_workload_states(table),
+                         [("arch-contextual-ssm", "Completed"),
+                          ("arch-mad-context", "Running")])
 
     def test_result_paths_and_scp_destination(self):
         cfg = RCPConfig(job_name="gate-demo")

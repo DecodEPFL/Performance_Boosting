@@ -110,6 +110,26 @@ def build_delete_command(config: RCPConfig) -> list[str]:
             config.job_name, "-p", config.runai_project]
 
 
+def build_list_command(config: RCPConfig) -> list[str]:
+    return [str(Path(config.runai_bin).expanduser()), "training", "standard", "list",
+            "-p", config.runai_project]
+
+
+def parse_workload_states(list_output: str) -> list[tuple[str, str]]:
+    """(workload, status) pairs from the human-readable `runai ... list` table.
+
+    Table shape: `Workload  Type  Framework  Status  Project ...` with a
+    separator line of box-drawing dashes under the header.
+    """
+    rows: list[tuple[str, str]] = []
+    for line in list_output.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or fields[0] == "Workload" or set(line.strip()) <= {"─", "-"}:
+            continue
+        rows.append((fields[0], fields[3]))
+    return rows
+
+
 # The launcher runs scp without a TTY, so it can never answer a password
 # prompt: fail fast (BatchMode) and reuse a shared master session when the
 # user has opened one with the matching ControlPath (see ssh_master_command).
