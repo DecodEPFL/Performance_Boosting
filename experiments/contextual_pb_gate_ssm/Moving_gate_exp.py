@@ -548,15 +548,28 @@ def maybe_compile_operator(controller: PBController, args: argparse.Namespace) -
     # correctness checks on machines where inductor's C++ build is unusable).
     backend = os.environ.get("PB_TORCH_COMPILE_BACKEND", "inductor")
     try:
+        # Compilation actually happens at the FIRST CALL, far from this
+        # try/except — suppress_errors is what turns any trace/codegen failure
+        # into a per-frame eager fallback instead of killing the job. Old
+        # dynamo builds need it: torch 2.1 (cluster image) crashes with
+        # "SymNodeVariable() is not a constant" on symbolic-shape guards
+        # inside the SSM cells' state checks.
+        torch._dynamo.config.suppress_errors = True
         # Step counters live as int attributes (e.g. MpContextualSSM._t fed to
         # the core as time_offset). By default dynamo bakes such ints into
         # guards -> one recompile per timestep until the cache limit, then
         # silent eager fallback. Treat them as dynamic instead.
         if hasattr(torch._dynamo.config, "allow_unspec_int_on_nn_module"):
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
-        op.forward = torch.compile(op.forward, dynamic=True, backend=backend)
+        # dynamic=None = static shapes first, promote on recompile. Batch size
+        # and T=1 are constant here, so the factorized variants compile fully
+        # static — the only path old torch also handles well; anything that
+        # ends up symbolic and trips dynamo falls back to eager via
+        # suppress_errors.
+        op.forward = torch.compile(op.forward, dynamic=None, backend=backend)
         print(f"[compile] torch.compile enabled on the PB operator (backend={backend}; "
-              "first epochs include compilation warm-up).")
+              "first epochs include compilation warm-up; frames that fail to "
+              "compile fall back to eager).")
     except Exception as exc:  # pragma: no cover - depends on torch build
         print(f"[compile] torch.compile unavailable ({exc}); continuing in eager mode.")
 
