@@ -137,6 +137,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plot_only", type=str, default="",
                         help="Path to an existing run directory. Loads saved controller weights "
                              "and config, skips training, and re-runs evaluation + all plots.")
+    # Custom-rollout playground: replay a trained run from an arbitrary start.
+    parser.add_argument("--custom_rollout", type=str, default="",
+                        help="Path/ID of a trained run directory: load its config + saved "
+                             "controllers, roll them out from (--custom_start_x, "
+                             "--custom_start_y) on a fresh scenario (--custom_seed), and "
+                             "save a trajectory GIF under <run>/custom/. Skips training.")
+    parser.add_argument("--custom_start_x", type=float, default=None,
+                        help="custom_rollout: start x position.")
+    parser.add_argument("--custom_start_y", type=float, default=None,
+                        help="custom_rollout: start y position.")
+    parser.add_argument("--custom_seed", type=int, default=123,
+                        help="custom_rollout: scenario seed (gate motion + gusts).")
+    parser.add_argument("--custom_variants", type=str, default="",
+                        help="custom_rollout: comma-separated variants to overlay "
+                             "(default: every *_controller.pt in the run, plus nominal).")
     parser.add_argument("--no_show_plots", action="store_true")
     parser.add_argument("--warm_start", dest="warm_start", action="store_true",
                         help="Warm-start the context variant from the disturbance_only checkpoint.")
@@ -3948,6 +3963,203 @@ def run_layers_ablation(args: argparse.Namespace, device: torch.device) -> None:
     )
 
 
+def run_custom_rollout(args: argparse.Namespace, device: torch.device) -> None:
+    """Roll out a trained run's controllers from a user-chosen start position.
+
+    Loads config + checkpoints from ``--custom_rollout <run>``, pins every
+    sampled episode to (--custom_start_x, --custom_start_y), simulates one
+    fresh scenario (--custom_seed: gate motion + gusts), prints per-variant
+    outcomes, and renders the trajectory GIF under ``<run>/custom/``.
+    No training happens."""
+    run_dir = Path(str(args.custom_rollout)).expanduser()
+    if not run_dir.is_absolute():
+        run_dir = Path(__file__).resolve().parent / "runs" / str(args.custom_rollout)
+    run_dir = run_dir.resolve()
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"--custom_rollout run directory not found: {run_dir}")
+    if args.custom_start_x is None or args.custom_start_y is None:
+        raise ValueError("--custom_rollout requires --custom_start_x and --custom_start_y.")
+
+    config_path = run_dir / "config.json"
+    if config_path.exists():
+        saved_cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        cli_overrides = set(sys.argv[1:])
+        for k, v in saved_cfg.items():
+            if f"--{k}" not in cli_overrides and hasattr(args, k):
+                setattr(args, k, v)
+        print(f"[custom] Loaded run config from {config_path}")
+    else:
+        print(f"[custom] Warning: no config.json in {run_dir}; using current CLI args.")
+
+    sx = float(args.custom_start_x)
+    sy = float(args.custom_start_y)
+    # Pin the start distribution to the requested point; scenario randomness
+    # (gate motion + gusts) comes only from --custom_seed.
+    args.start_x_min = args.start_x_max = sx
+    args.start_y_min = sy
+    args.start_y_max = sy
+    args.test_start_x_min = args.test_start_x_max = None
+    args.test_start_y_min = args.test_start_y_max = None
+    try:
+        expected_cross_index = estimate_expected_cross_index(args)
+    except ValueError:
+        expected_cross_index = max(1, int(args.horizon) // 2)
+        print(f"[custom] No in-horizon nominal crossing from x={sx:+.2f}; "
+              f"anchoring schedule/context at t={expected_cross_index}.")
+
+    batch = sample_batch(
+        args=args, batch_size=2, seed=int(args.custom_seed), paired=True,
+        shuffle=False, expected_cross_index=expected_cross_index,
+    )
+
+    available = sorted(
+        p.name[: -len("_controller.pt")]
+        for p in run_dir.glob("*_controller.pt")
+        if p.name[: -len("_controller.pt")] in ALL_VARIANTS
+    )
+    requested = [m.strip() for m in str(args.custom_variants or "").split(",") if m.strip()]
+    modes = requested or (available + ["nominal"])
+    unknown = [m for m in modes if m != "nominal" and m not in ALL_VARIANTS]
+    if unknown:
+        raise ValueError(f"Unknown variant(s) {unknown}. Choose from {list(ALL_VARIANTS)} or 'nominal'.")
+
+    # Reproduce the architecture sizing used during training. In particular,
+    # mp_only_context may have an automatically matched d_model, and
+    # --match_to_contextual changes the d_model of every comparison variant.
+    mp_only_d_model = int(args.ssm_d_model)
+    mp_only_layers = int(args.mp_only_ssm_layers or args.ssm_layers)
+    if "mp_only_context" in modes:
+        if args.mp_only_ssm_d_model is not None:
+            mp_only_d_model = int(args.mp_only_ssm_d_model)
+        else:
+            probe, _ = build_controller(torch.device("cpu"), args)
+            target = count_params(probe)
+            del probe
+            base_w_dim = 8 if getattr(args, "use_w_augment", False) else 4
+            mp_in_dim = base_w_dim + (
+                int(args.mp_context_lift_dim) if bool(args.mp_context_lift) else 0
+            )
+            mp_only_d_model = find_matched_ssm_d_model(
+                args=args, target_params=target, mp_in_dim=mp_in_dim,
+            )
+
+    matched_d_model: dict[str, int] = {}
+    trained_modes = {mode for mode, _ in variant_specs(args)}
+    if getattr(args, "match_to_contextual", False) and "contextual_ssm" in trained_modes:
+        probe, _ = build_controller(torch.device("cpu"), args, contextual=True)
+        target = count_params(probe)
+        del probe
+        shape_cache: dict[tuple[bool, bool], int] = {}
+        for mode in modes:
+            if mode in ("nominal", "contextual_ssm"):
+                continue
+            shape = (mode == "mp_only_context", mode == "mad_context")
+            if shape not in shape_cache:
+                shape_cache[shape] = find_matched_d_model(
+                    args=args, target_params=target,
+                    mp_only=shape[0], use_mad=shape[1],
+                )
+            matched_d_model[mode] = shape_cache[shape]
+
+    specs: list[tuple[str, str]] = []
+    test_metrics: dict[str, dict] = {}
+    for mode in modes:
+        label = contextual_label(args) if mode == "contextual_ssm" else ALL_VARIANTS[mode]
+        if mode == "nominal":
+            controller = plant_true = None
+        else:
+            pt_path = run_dir / f"{mode}_controller.pt"
+            if not pt_path.exists():
+                print(f"[custom] Skipping {mode}: {pt_path.name} not found in this run.")
+                continue
+            try:
+                use_mp_only = mode == "mp_only_context"
+                controller, plant_true = build_controller(
+                    device, args,
+                    mp_only=use_mp_only,
+                    force_no_lift=(mode == "context_no_lift"),
+                    factor_rank_override=1 if mode == "mad_context" else None,
+                    ssm_d_model_override=matched_d_model.get(
+                        mode, mp_only_d_model if use_mp_only else None),
+                    ssm_layers_override=(
+                        mp_only_layers if use_mp_only and mode not in matched_d_model else None),
+                    contextual=(mode == "contextual_ssm"),
+                )
+                controller.load_state_dict(torch.load(pt_path, map_location=device))
+                controller.eval()
+            except Exception as exc:
+                print(f"[custom] Skipping {mode}: could not rebuild/load ({exc}).")
+                continue
+        test_metrics[mode] = evaluate_variant(
+            args=args, batch=batch, device=device, mode=mode,
+            controller=controller, plant_true=plant_true,
+            expected_cross_index=expected_cross_index,
+        )
+        specs.append((mode, label))
+    if not specs:
+        raise RuntimeError("No variant could be rolled out (no loadable checkpoints in this run).")
+
+    out_dir = run_dir / "custom"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"x{sx:.2f}_y{sy:.2f}_s{int(args.custom_seed)}"
+
+    print("\n" + "=" * 72)
+    print(f"CUSTOM ROLLOUT  start=({sx:+.2f}, {sy:+.2f})  seed={int(args.custom_seed)}  "
+          f"gate={'continuous' if is_continuous_gate(args) else 'switch'}")
+    print("=" * 72)
+    summary: dict[str, dict] = {}
+    for mode, label in specs:
+        m = test_metrics[mode]
+        roll = m["rollout"]
+        outcome = ("SUCCESS" if bool(roll["success"][0])
+                   else ("WALL HIT" if bool(roll["collided"][0]) else "MISSED GOAL"))
+        print(f"{label:40s} {outcome:12s} cross_err={m['avg_abs_cross_error']:.3f} "
+              f"terminal={m['avg_terminal_dist']:.3f}")
+        summary[mode] = {"outcome": outcome,
+                         **{k: v for k, v in strip_rollout(m).items()
+                            if isinstance(v, (int, float))}}
+    print("=" * 72)
+    merge_json(out_dir / "custom_results.json", {tag: summary})
+
+    # Also save a static trajectory overview for quick inspection in the UI.
+    plt = get_plt(False)
+    setup_plot_style(plt)
+    fig, ax = plt.subplots(figsize=(8.4, 5.4))
+    colors = variant_colors()
+    start = batch.start[0].numpy()
+    gate = batch.gate_y[0].numpy()
+    ax.axvline(float(args.wall_x), color="#64748b", lw=2.0, label="wall")
+    gate_at_cross = float(gate[min(expected_cross_index, len(gate) - 1)])
+    ax.plot([float(args.wall_x)] * 2,
+            [gate_at_cross - float(args.gate_half_width),
+             gate_at_cross + float(args.gate_half_width)],
+            color="#4ade80", lw=6.0, solid_capstyle="butt", label="gate opening",
+            zorder=3)
+    ax.scatter([0.0], [0.0], marker="*", s=150, color="#f59e0b", label="goal", zorder=5)
+    ax.scatter([start[0]], [start[1]], s=55, color="#334155", label="start", zorder=5)
+    for mode, label in specs:
+        xy = test_metrics[mode]["rollout"]["x_seq"][0, :, :2].numpy()
+        xy = np.vstack([start, xy])
+        ax.plot(xy[:, 0], xy[:, 1], color=colors[mode], lw=2.0,
+                label=f"{label} — {summary[mode]['outcome'].lower()}")
+    ax.set_xlabel("x position")
+    ax.set_ylabel("y position")
+    ax.set_title(f"Custom rollout from ({sx:+.2f}, {sy:+.2f}), seed {int(args.custom_seed)}")
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    trajectory_path = out_dir / f"trajectory_custom_{tag}.png"
+    fig.savefig(trajectory_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[custom] Trajectory saved -> {trajectory_path}")
+
+    _animate_one_sample(
+        plt=plt, args=args, run_dir=out_dir, variant_order=specs,
+        test_batch=batch, test_metrics=test_metrics, sample_idx=0,
+        file_tag=f"custom_{tag}", show_plots=False,
+    )
+    print(f"[custom] Done -> {out_dir / f'rollout_animation_custom_{tag}.gif'}")
+
+
 def main() -> None:
     args = parse_args()
     set_seeds(int(args.seed))
@@ -3987,6 +4199,11 @@ def main() -> None:
                 print("[cuda] BF16 is not supported by this GPU; using FP32.")
         if bool(getattr(args, "prefetch_batches", True)):
             print("[cuda] Pinned-memory training-batch prefetch enabled.")
+
+    # Custom inference must run before the training/ablation dispatch below.
+    if args.custom_rollout:
+        run_custom_rollout(args, device)
+        return
 
     # ── Context-ablation mode ─────────────────────────────────────────────────
     if getattr(args, "ablate_context", False):

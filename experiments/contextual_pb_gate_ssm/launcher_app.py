@@ -62,6 +62,9 @@ SKIP_DESTS = {
     "gate_motion", "context_features", "context_mode",
     # Managed by the launcher itself (RCP submissions / per-variant fan-out).
     "require_cuda", "skip_plots",
+    # Driven by the Custom trajectory tab, never by the Launch form.
+    "custom_rollout", "custom_start_x", "custom_start_y",
+    "custom_seed", "custom_variants",
 }
 DEVICE_CHOICES = ["cpu", "cuda", "mps"]
 
@@ -469,7 +472,8 @@ def main():
         order, bools, values = [], {}, {}
         specs_error = exc
 
-    tab_launch, tab_browse = st.tabs(["🚀 Launch run", "📊 Browse runs"])
+    tab_launch, tab_custom, tab_browse = st.tabs(
+        ["🚀 Launch run", "🎯 Custom trajectory", "📊 Browse runs"])
 
     # ── Launch tab ──────────────────────────────────────────────
     with tab_launch:
@@ -1071,6 +1075,113 @@ def main():
                 if any_submitting:
                     time.sleep(1)
                     _rerun()
+
+    # ── Custom trajectory tab ───────────────────────────────────
+    with tab_custom:
+        trained_runs = sorted(
+            [p for p in RUNS_DIR.iterdir()
+             if p.is_dir() and any(p.glob("*_controller.pt"))],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not trained_runs:
+            st.info("No synchronized run with a trained controller is available yet.")
+        else:
+            selected_name = st.selectbox(
+                "Trained run", [p.name for p in trained_runs], key="custom_run")
+            selected_run = RUNS_DIR / selected_name
+            config_data: dict = {}
+            try:
+                config_data = json.loads((selected_run / "config.json").read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+
+            checkpoint_modes = [
+                p.name[:-len("_controller.pt")]
+                for p in sorted(selected_run.glob("*_controller.pt"))
+                if p.name[:-len("_controller.pt")] in VARIANT_HELP
+            ]
+            option_modes = checkpoint_modes + ["nominal"]
+            labels = dict(get_variant_options())
+            labels["nominal"] = "Nominal baseline"
+
+            x_default = 0.5 * (
+                float(config_data.get("start_x_min", 1.7))
+                + float(config_data.get("start_x_max", 2.1)))
+            y_min = config_data.get("start_y_min")
+            y_max = float(config_data.get("start_y_max", 0.4))
+            y_default = 0.5 * ((-y_max if y_min is None else float(y_min)) + y_max)
+
+            with st.form("custom_trajectory_form", border=False):
+                c1, c2, c3 = st.columns(3)
+                start_x = c1.number_input("Start x", value=float(x_default), format="%.3f")
+                start_y = c2.number_input("Start y", value=float(y_default), format="%.3f")
+                scenario_seed = c3.number_input(
+                    "Scenario seed", min_value=0, value=123, step=1)
+                chosen_modes = st.multiselect(
+                    "Controllers", option_modes, default=checkpoint_modes,
+                    format_func=lambda mode: labels.get(mode, mode),
+                )
+                generate_custom = st.form_submit_button(
+                    "Generate trajectory and GIF", type="primary", width="stretch")
+
+            if generate_custom:
+                if not chosen_modes:
+                    st.error("Select at least one trained controller or the nominal baseline.")
+                else:
+                    custom_argv = [
+                        "--device", "cpu", "--no_show_plots",
+                        "--custom_rollout", str(selected_run),
+                        "--custom_start_x", str(float(start_x)),
+                        "--custom_start_y", str(float(start_y)),
+                        "--custom_seed", str(int(scenario_seed)),
+                        "--custom_variants", ",".join(chosen_modes),
+                    ]
+                    launch(custom_argv, f"custom_{selected_name}")
+                    st.success("Generating the custom trajectory locally from the saved checkpoint.")
+
+            custom_proc = st.session_state.get("proc")
+            custom_active = (custom_proc is not None
+                             and str(st.session_state.get("proc_run_id", "")).startswith("custom_"))
+            custom_ret = custom_proc.poll() if custom_active else None
+            if custom_active:
+                if custom_ret is None:
+                    st.status("Generating trajectory and GIF...", state="running")
+                elif custom_ret != 0:
+                    st.error(f"Custom rollout failed with exit code {custom_ret}.")
+                else:
+                    st.success("Custom trajectory complete.")
+                with st.expander("Generation log", expanded=custom_ret not in (None, 0)):
+                    st.code(tail(st.session_state.get("proc_log", "")), language="text")
+
+            custom_dir = selected_run / "custom"
+            custom_gifs = sorted(custom_dir.glob("*.gif"),
+                                 key=lambda p: p.stat().st_mtime, reverse=True)
+            custom_pngs = sorted(custom_dir.glob("*.png"),
+                                 key=lambda p: p.stat().st_mtime, reverse=True)
+            if custom_gifs:
+                st.subheader("Generated animation")
+                st.image(str(custom_gifs[0]), caption=custom_gifs[0].name)
+            if custom_pngs:
+                st.subheader("Trajectory")
+                st.image(str(custom_pngs[0]), caption=custom_pngs[0].name, width="stretch")
+            results_path = custom_dir / "custom_results.json"
+            if results_path.exists():
+                try:
+                    results = json.loads(results_path.read_text())
+                    latest_key = next(reversed(results))
+                    rows = [{"variant": mode, **values}
+                            for mode, values in results[latest_key].items()]
+                    st.subheader("Outcome")
+                    st.dataframe(rows, hide_index=True, width="stretch")
+                except (json.JSONDecodeError, StopIteration):
+                    pass
+
+            # Poll last so the log, previous GIFs, and outcomes stay visible
+            # while the generation subprocess runs.
+            if custom_active and custom_ret is None:
+                time.sleep(1)
+                _rerun()
 
     # ── Browse tab ──────────────────────────────────────────────
     with tab_browse:
