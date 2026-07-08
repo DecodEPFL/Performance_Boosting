@@ -417,6 +417,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "(label optional). Empty = leave-one-out over the fair default "
                              "set. Example: 'full:gate_obs,gate_error,approach;"
                              "-gate_obs:gate_error,approach'.")
+    parser.add_argument("--ablation_only_label", type=str, default="",
+                        help="Cluster fan-out helper: from the parsed ablation sweep, train "
+                             "only the item with this label while preserving the full sweep "
+                             "metadata for a later --plot_only combine step.")
     parser.add_argument("--ablate_layers", action="store_true",
                         help="Run an SSM-depth comparison: train --ablation_variant with the "
                              "SAME context at each --ablation_layers depth (same data/seeds).")
@@ -3852,6 +3856,13 @@ def _run_ablation_sweep(args: argparse.Namespace, device: torch.device, *,
     config's change (e.g. set context_features, or set ssm_layers). Produces the
     comparison bar chart, the full trajectory/GIF suite, and a ranked summary.
     """
+    only_label = str(getattr(args, "ablation_only_label", "") or "").strip()
+    if only_label:
+        items = [item for item in items if item[0] == only_label]
+        if not items:
+            raise ValueError(f"--ablation_only_label={only_label!r} is not in this sweep.")
+        print(f"[{run_prefix}] fan-out worker: training only {only_label!r}.")
+
     arch = str(args.ablation_variant)
     expected_cross_index = estimate_expected_cross_index(args)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3899,8 +3910,16 @@ def _run_ablation_sweep(args: argparse.Namespace, device: torch.device, *,
                 print(f"[resume] Loaded {pt_path.name} — skipping training for "
                       f"'{label}' (pass --fresh to retrain).")
             except Exception as exc:
+                if getattr(args, "plot_only", ""):
+                    raise RuntimeError(
+                        f"[plot_only] Could not load {pt_path.name}; refusing to retrain "
+                        f"during fan-out combine. Original error: {exc}") from exc
                 controller = plant_true = None
                 print(f"[resume] Could not reuse {pt_path.name} ({exc}); retraining from scratch.")
+        elif getattr(args, "plot_only", ""):
+            raise FileNotFoundError(
+                f"[plot_only] Missing {pt_path.name}; cannot combine ablation plots "
+                "until every fan-out job has saved its checkpoint.")
         if resumed:
             history = load_saved_history(run_dir, label)
             best_val = evaluate_variant(
@@ -3932,17 +3951,25 @@ def _run_ablation_sweep(args: argparse.Namespace, device: torch.device, *,
 
     config_payload = dict(vars(args))
     config_payload["expected_cross_index"] = int(expected_cross_index)
+    config_payload["ablation_only_label"] = ""
     config_payload.update(extra_config)
     save_json(run_dir / "config.json", config_payload)
-    save_json(run_dir / "metrics.json", {lab: strip_rollout(test_metrics[lab]) for lab in labels})
-    save_json(run_dir / "val_metrics.json", {lab: strip_rollout(val_metrics[lab]) for lab in labels})
-    save_json(run_dir / "train_history.json", histories)
-    plot_ablation_comparison(run_dir=run_dir, title=title, labels=labels,
-                             test_metrics=test_metrics, show_plots=not args.no_show_plots,
-                             fname=f"{run_prefix}_comparison.png")
     if getattr(args, "skip_plots", False):
-        print(f"[skip_plots] Full plot suite skipped; kept {run_prefix}_comparison.png.")
+        merge_json(run_dir / "metrics.json",
+                   {lab: strip_rollout(test_metrics[lab]) for lab in labels})
+        merge_json(run_dir / "val_metrics.json",
+                   {lab: strip_rollout(val_metrics[lab]) for lab in labels})
+        merge_json(run_dir / "train_history.json", histories)
+        print(f"[skip_plots] Figure/GIF generation skipped; checkpoints and metrics "
+              f"were saved incrementally. Re-generate combined plots later with: "
+              f"--plot_only {run_dir.name}")
     else:
+        save_json(run_dir / "metrics.json", {lab: strip_rollout(test_metrics[lab]) for lab in labels})
+        save_json(run_dir / "val_metrics.json", {lab: strip_rollout(val_metrics[lab]) for lab in labels})
+        save_json(run_dir / "train_history.json", histories)
+        plot_ablation_comparison(run_dir=run_dir, title=title, labels=labels,
+                                 test_metrics=test_metrics, show_plots=not args.no_show_plots,
+                                 fname=f"{run_prefix}_comparison.png")
         # Full comparison suite (trajectory overlays, control curves, storyboards, GIFs),
         # each config treated as a "variant" (its stored rollout carries its own setup).
         _run_all_plots(
@@ -3983,7 +4010,19 @@ def parse_ablation_layers(args: argparse.Namespace) -> list[int]:
 
     Empty -> a small sweep around the current --ssm_layers (base//2, base, base*2).
     """
-    raw = str(getattr(args, "ablation_layers", "") or "").strip()
+    raw_value = getattr(args, "ablation_layers", "") or ""
+    if isinstance(raw_value, (list, tuple)):
+        out: list[int] = []
+        for value in raw_value:
+            n = int(value)
+            if n < 1:
+                raise ValueError(f"--ablation_layers entries must be >= 1 (got {n}).")
+            if n not in out:
+                out.append(n)
+        if not out:
+            raise ValueError("No valid layer counts parsed from --ablation_layers.")
+        return out
+    raw = str(raw_value).strip()
     if not raw:
         base = max(1, int(args.ssm_layers))
         return sorted({max(1, base // 2), base, base * 2})
@@ -4214,6 +4253,116 @@ def run_custom_rollout(args: argparse.Namespace, device: torch.device) -> None:
     print(f"[custom] Done -> {out_dir / f'rollout_animation_custom_{tag}.gif'}")
 
 
+def run_plot_only(args: argparse.Namespace, device: torch.device) -> None:
+    """Load an existing run directory and regenerate figures without training."""
+    plot_only_path = Path(args.plot_only).expanduser()
+    if not plot_only_path.is_absolute():
+        plot_only_path = Path(__file__).resolve().parent / "runs" / args.plot_only
+    run_dir = plot_only_path.resolve()
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"--plot_only path does not exist: {run_dir}")
+
+    cli_overrides = set(sys.argv[1:])
+    config_path = run_dir / "config.json"
+    if config_path.exists():
+        saved_cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        # Merge saved config into args (CLI overrides saved values where specified).
+        for k, v in saved_cfg.items():
+            if f"--{k}" not in cli_overrides and hasattr(args, k):
+                setattr(args, k, v)
+        if "--no_mad_comparison" in cli_overrides:
+            args.mad_comparison = False
+        if "mad_comparison" not in saved_cfg and "--mad_comparison" not in cli_overrides:
+            args.mad_comparison = False
+        print(f"[plot_only] Loaded config from {config_path}")
+    else:
+        print(f"[plot_only] Warning: no config.json found in {run_dir}, using current args.")
+    if "--run_id" not in cli_overrides:
+        args.run_id = run_dir.name
+
+    # Ablation replot is the fan-out combine step: load every saved checkpoint,
+    # evaluate on the shared validation/test batches, then draw the comparison
+    # figures. Explicitly disable retraining and per-worker filtering.
+    if getattr(args, "ablate_context", False) or getattr(args, "ablate_layers", False):
+        args.fresh = False
+        args.skip_plots = False
+        args.ablation_only_label = ""
+        print("[plot_only] Combining ablation fan-out results from saved checkpoints.")
+        if getattr(args, "ablate_context", False):
+            run_context_ablation(args, device)
+        else:
+            run_layers_ablation(args, device)
+        return
+
+    expected_cross_index = estimate_expected_cross_index(args)
+    specs = variant_specs(args)
+
+    test_batch = sample_batch(
+        args=args,
+        batch_size=int(args.test_batch),
+        seed=int(args.seed) + 60_000,
+        paired=True,
+        shuffle=False,
+        expected_cross_index=expected_cross_index,
+        use_test_starts=True,
+    )
+    val_batch = sample_batch(
+        args=args,
+        batch_size=int(args.val_batch),
+        seed=int(args.seed) + 50_000,
+        paired=True,
+        shuffle=False,
+        expected_cross_index=expected_cross_index,
+    )
+
+    controllers: dict[str, PBController | None] = {}
+    plants: dict[str, DoubleIntegratorTrue | None] = {}
+    val_metrics: dict[str, dict] = {}
+    test_metrics: dict[str, dict] = {}
+    histories: dict[str, list[dict]] = {}
+
+    for mode, label in specs:
+        pt_path = run_dir / f"{mode}_controller.pt"
+        use_mp_only = (mode == "mp_only_context")
+        use_mad = (mode == "mad_context")
+        use_contextual = (mode == "contextual_ssm")
+        controller, plant_true = build_controller(
+            device,
+            args,
+            mp_only=use_mp_only,
+            factor_rank_override=1 if use_mad else None,
+            contextual=use_contextual,
+        )
+        if pt_path.exists():
+            controller.load_state_dict(torch.load(pt_path, map_location=device))
+            print(f"[plot_only] Loaded {pt_path.name}")
+        else:
+            print(f"[plot_only] Warning: {pt_path.name} not found — using random weights for {mode}.")
+        controllers[mode] = controller
+        plants[mode] = plant_true
+        histories[mode] = []
+        val_metrics[mode] = evaluate_variant(
+            args=args, batch=val_batch, device=device, mode=mode,
+            controller=controller, plant_true=plant_true,
+            expected_cross_index=expected_cross_index,
+        )
+        test_metrics[mode] = evaluate_variant(
+            args=args, batch=test_batch, device=device, mode=mode,
+            controller=controller, plant_true=plant_true,
+            expected_cross_index=expected_cross_index,
+        )
+
+    show_plots = not args.no_show_plots
+    _run_all_plots(
+        args=args, run_dir=run_dir, specs=specs,
+        controllers=controllers, plants=plants,
+        val_batch=val_batch, test_batch=test_batch,
+        val_metrics=val_metrics, test_metrics=test_metrics,
+        histories=histories, show_plots=show_plots,
+        expected_cross_index=expected_cross_index,
+    )
+
+
 def main() -> None:
     args = parse_args()
     set_seeds(int(args.seed))
@@ -4259,6 +4408,11 @@ def main() -> None:
         run_custom_rollout(args, device)
         return
 
+    # ── Plot-only / fan-out combine mode ──────────────────────────────────────
+    if args.plot_only:
+        run_plot_only(args, device)
+        return
+
     # ── Context-ablation mode ─────────────────────────────────────────────────
     if getattr(args, "ablate_context", False):
         run_context_ablation(args, device)
@@ -4267,103 +4421,6 @@ def main() -> None:
     # ── SSM-depth comparison mode ─────────────────────────────────────────────
     if getattr(args, "ablate_layers", False):
         run_layers_ablation(args, device)
-        return
-
-    # ── Plot-only mode ────────────────────────────────────────────────────────
-    if args.plot_only:
-        _plot_only_path = Path(args.plot_only).expanduser()
-        if not _plot_only_path.is_absolute():
-            _plot_only_path = Path(__file__).resolve().parent / "runs" / args.plot_only
-        run_dir = _plot_only_path.resolve()
-        if not run_dir.is_dir():
-            raise FileNotFoundError(f"--plot_only path does not exist: {run_dir}")
-        config_path = run_dir / "config.json"
-        if config_path.exists():
-            import json as _json
-            saved_cfg = _json.loads(config_path.read_text(encoding="utf-8"))
-            # Merge saved config into args (CLI overrides saved values where specified)
-            cli_overrides = set(sys.argv[1:])
-            for k, v in saved_cfg.items():
-                if f"--{k}" not in cli_overrides and hasattr(args, k):
-                    setattr(args, k, v)
-            if "--no_mad_comparison" in cli_overrides:
-                args.mad_comparison = False
-            if "mad_comparison" not in saved_cfg and "--mad_comparison" not in cli_overrides:
-                args.mad_comparison = False
-            print(f"[plot_only] Loaded config from {config_path}")
-        else:
-            print(f"[plot_only] Warning: no config.json found in {run_dir}, using current args.")
-
-        expected_cross_index = estimate_expected_cross_index(args)
-        specs = variant_specs(args)
-
-        test_batch = sample_batch(
-            args=args,
-            batch_size=int(args.test_batch),
-            seed=int(args.seed) + 60_000,
-            paired=True,
-            shuffle=False,
-            expected_cross_index=expected_cross_index,
-            use_test_starts=True,
-        )
-        val_batch = sample_batch(
-            args=args,
-            batch_size=int(args.val_batch),
-            seed=int(args.seed) + 50_000,
-            paired=True,
-            shuffle=False,
-            expected_cross_index=expected_cross_index,
-        )
-
-        controllers: dict[str, PBController | None] = {}
-        plants: dict[str, DoubleIntegratorTrue | None] = {}
-        val_metrics: dict[str, dict] = {}
-        test_metrics: dict[str, dict] = {}
-        histories: dict[str, list[dict]] = {}
-
-        mp_only_d_model = int(args.ssm_d_model)
-        mp_only_layers = int(args.ssm_layers)
-
-        for mode, label in specs:
-            pt_path = run_dir / f"{mode}_controller.pt"
-            use_mp_only = (mode == "mp_only_context")
-            use_mad = (mode == "mad_context")
-            use_contextual = (mode == "contextual_ssm")
-            controller, plant_true = build_controller(
-                device,
-                args,
-                mp_only=use_mp_only,
-                factor_rank_override=1 if use_mad else None,
-                contextual=use_contextual,
-            )
-            if pt_path.exists():
-                controller.load_state_dict(torch.load(pt_path, map_location=device))
-                print(f"[plot_only] Loaded {pt_path.name}")
-            else:
-                print(f"[plot_only] Warning: {pt_path.name} not found — using random weights for {mode}.")
-            controllers[mode] = controller
-            plants[mode] = plant_true
-            histories[mode] = []
-            val_metrics[mode] = evaluate_variant(
-                args=args, batch=val_batch, device=device, mode=mode,
-                controller=controller, plant_true=plant_true,
-                expected_cross_index=expected_cross_index,
-            )
-            test_metrics[mode] = evaluate_variant(
-                args=args, batch=test_batch, device=device, mode=mode,
-                controller=controller, plant_true=plant_true,
-                expected_cross_index=expected_cross_index,
-            )
-
-        show_plots = not args.no_show_plots
-        _run_all_plots(
-            args=args, run_dir=run_dir, specs=specs,
-            controllers=controllers, plants=plants,
-            val_batch=val_batch, test_batch=test_batch,
-            val_metrics=val_metrics, test_metrics=test_metrics,
-            histories=histories, show_plots=show_plots,
-            expected_cross_index=expected_cross_index,
-        )
         return
 
     # ─────────────────────────────────────────────────────────────────────────

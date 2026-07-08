@@ -57,7 +57,7 @@ DEFAULTS_FILE = EXP_DIR / "ui_defaults.json"
 # The *_comparison toggles and the raw --variants string are superseded by the
 # explicit variant checkbox picker (see the "Variants to run" section below).
 SKIP_DESTS = {
-    "no_show_plots", "plot_only", "help",
+    "no_show_plots", "plot_only", "help", "ablation_only_label",
     "variants", "simple_comparison", "mad_comparison",
     "contextual_comparison", "lift_comparison",
     # Handled by the custom Experiment selector + Context-signal checkboxes.
@@ -546,14 +546,13 @@ def main():
                     st.text_input("Run:AI CLI path", value=rcp_overrides["runai_bin"],
                                   key="rcp_runai_bin")
                     st.checkbox(
-                        "⚡ One job per variant (parallel fan-out)", value=False,
+                        "⚡ Parallel fan-out on RCP", value=False,
                         key="rcp_fanout",
-                        help="Single-run mode with ≥2 ticked variants: submit each variant "
-                             "as its own Run:AI workload sharing one run ID/directory. "
-                             "Each job trains one variant, saves its checkpoint+metrics, "
-                             "and skips the combined figures. When ALL jobs are done, "
-                             "Sync once and use Re-plot in Browse runs to build the "
-                             "comparison figures. Cuts wall-clock by ~#variants.")
+                        help="Submit independent work as multiple Run:AI workloads sharing "
+                             "one run ID/directory: one job per selected variant, context "
+                             "ablation config, or layer count. Each job saves its checkpoint "
+                             "and metrics; when ALL jobs are done, Sync once and use Re-plot "
+                             "in Browse runs to build the combined figures.")
                     if st.button("🗑 Delete all COMPLETED workloads in the project",
                                  key="rcp_sweep_completed",
                                  help="Removes finished Run:AI workload records (frees their "
@@ -780,7 +779,8 @@ def main():
                     _rerun()
 
             def launch_selected(argv: list[str], run_id: str, summary: str,
-                                fanout_variants: list[str] | None = None) -> None:
+                                fanout_variants: list[str] | None = None,
+                                fanout_items: list[tuple[str, list[str]]] | None = None) -> None:
                 if execution_target == "Local":
                     launch(argv, run_id)
                     st.success(
@@ -808,17 +808,23 @@ def main():
                         # training on the pod's few CPU cores for hours.
                         argv.append("--require_cuda")
                     if fanout_variants:
-                        for variant in fanout_variants:
+                        fanout_items = [
+                            (variant, ["--variants", variant, "--skip_plots"])
+                            for variant in fanout_variants
+                        ]
+                    if fanout_items:
+                        for label, extra_args in fanout_items:
                             slug = re.sub(r"[^a-z0-9-]+", "-",
-                                          variant.lower().replace("_", "-")).strip("-")
+                                          label.lower().replace("_", "-")).strip("-")
+                            if not slug:
+                                slug = "item"
                             v_job = f"{job_name[: max(1, 62 - len(slug))]}-{slug}".strip("-")[:63]
-                            v_argv = argv + ["--variants", variant, "--skip_plots"]
-                            start_rcp_submission(v_argv, run_id, rcp_config(v_job))
+                            start_rcp_submission(argv + extra_args, run_id, rcp_config(v_job))
                         st.success(
-                            f"Submitting **{len(fanout_variants)}** Run:AI jobs (one per "
-                            f"variant) for run **{run_id}** — {summary}. When ALL jobs have "
-                            "completed, Sync once below, then use 🔁 Re-plot in Browse runs "
-                            "to build the combined comparison figures.")
+                            f"Submitting **{len(fanout_items)}** Run:AI jobs for run "
+                            f"**{run_id}** — {summary}. When ALL jobs have completed, "
+                            "Sync once below, then use 🔁 Re-plot in Browse runs to build "
+                            "the combined comparison figures.")
                         return
                     start_rcp_submission(argv, run_id, config)
                 except (TypeError, ValueError, OSError) as exc:
@@ -836,9 +842,9 @@ def main():
                     _arch_label = st.session_state.get("abl_arch_label")
                     arch = next((k for k, lab in abl_arch_opts if lab == _arch_label), "context")
                     err = None
+                    cfgs = []
                     configs_str = ""
                     if abl_type == "Custom sets":
-                        cfgs = []
                         for s in range(abl_n_sets):
                             fs = [f for f in ctx_order if f in ctx_feats
                                   and st.session_state.get(f"abl_set_{s}_{f}")]
@@ -870,18 +876,48 @@ def main():
                                  "--ablation_variant", arch, "--ablation_configs", configs_str]
                         for w in warns:
                             st.warning(w)
+                        fanout = (execution_target == "EPFL RCP"
+                                  and bool(st.session_state.get("rcp_fanout"))
+                                  and len(cfgs) >= 2)
+                        fanout_items = [
+                            (lab, [f"--ablation_only_label={lab}", "--skip_plots"])
+                            for lab, _ in cfgs
+                        ] if fanout else None
                         launch_selected(
                             argv, run_id,
-                            f"{exp_label}; arch=`{arch}`; {abl_type} ablation")
+                            f"{exp_label}; arch=`{arch}`; {abl_type} ablation",
+                            fanout_items=fanout_items)
                 elif is_layers:
                     _arch_label = st.session_state.get("abl_arch_label")
                     arch = next((k for k, lab in abl_arch_opts if lab == _arch_label), "context")
                     ctx_selected = [k for k in ctx_feats if st.session_state.get(f"ctx_{k}")]
                     layers_str = (st.session_state.get("layers_list") or "").strip()
-                    nlayers = [t.strip() for t in layers_str.split(",") if t.strip()]
+                    layer_values: list[int] = []
+                    layer_err = None
+                    if layers_str:
+                        try:
+                            for token in layers_str.split(","):
+                                token = token.strip()
+                                if not token:
+                                    continue
+                                n = int(token)
+                                if n < 1:
+                                    raise ValueError
+                                if n not in layer_values:
+                                    layer_values.append(n)
+                        except ValueError:
+                            layer_err = "Layer counts must be positive integers, e.g. 3,6,9,12."
+                    else:
+                        try:
+                            base_layers = int(widget_vals.get("ssm_layers") or values["ssm_layers"]["default"])
+                        except Exception:
+                            base_layers = int(values["ssm_layers"]["default"])
+                        layer_values = sorted({max(1, base_layers // 2), base_layers, base_layers * 2})
                     if not ctx_selected:
                         st.error("Select at least one context feature under ② above.")
-                    elif layers_str and len(nlayers) < 2:
+                    elif layer_err:
+                        st.error(layer_err)
+                    elif len(layer_values) < 2:
                         st.error("Give at least 2 layer counts to compare (or leave blank for an auto sweep).")
                     else:
                         argv, warns = build_argv(active_order, bools, values, widget_vals, run_id)
@@ -892,9 +928,17 @@ def main():
                             argv += ["--ablation_layers", layers_str]
                         for w in warns:
                             st.warning(w)
+                        fanout = (execution_target == "EPFL RCP"
+                                  and bool(st.session_state.get("rcp_fanout"))
+                                  and len(layer_values) >= 2)
+                        fanout_items = [
+                            (f"L{n}", [f"--ablation_only_label=L{n}", "--skip_plots"])
+                            for n in layer_values
+                        ] if fanout else None
                         launch_selected(
                             argv, run_id,
-                            f"{exp_label}; arch=`{arch}`; layers=[{layers_str or 'auto'}]")
+                            f"{exp_label}; arch=`{arch}`; layers=[{layers_str or 'auto'}]",
+                            fanout_items=fanout_items)
                 else:
                     selected = [k for k, _ in get_variant_options() if st.session_state.get(f"var_{k}")]
                     ctx_selected = [k for k in ctx_feats if st.session_state.get(f"ctx_{k}")]
@@ -1222,6 +1266,45 @@ def main():
 
     # ── Browse tab ──────────────────────────────────────────────
     with tab_browse:
+        saved_rcp_defaults = {
+            **RCP_DEFAULTS,
+            **((load_ui_defaults().get("rcp", {}) or {}) if DEFAULTS_FILE.exists() else {}),
+        }
+        with st.expander("☁️ Sync RCP run by ID", expanded=False):
+            st.caption(
+                "Use this when the UI forgot the tracked Run:AI job. It copies the remote "
+                "run directory directly, so the job card does not need to be visible.")
+            manual_run_id = st.text_input(
+                "Remote run ID", value="", placeholder="ui_20260708_103222",
+                key="manual_sync_run_id")
+            ms1, ms2 = st.columns(2)
+            ms1.text_input(
+                "Jumphost", value=saved_rcp_defaults["jumphost"],
+                key="manual_sync_jumphost")
+            ms2.text_input(
+                "Remote code directory", value=saved_rcp_defaults["code_dir"],
+                key="manual_sync_code_dir")
+            st.caption(
+                "If sync asks for a password or fails in batch mode, open this once in "
+                "Terminal first: "
+                f"`{ssh_master_command(RCPConfig(**saved_rcp_defaults))}`")
+            if st.button("⇣ Sync this run", type="primary", width="stretch"):
+                rid = manual_run_id.strip()
+                if not rid:
+                    st.error("Enter the remote run ID first.")
+                else:
+                    values = dict(saved_rcp_defaults)
+                    values["jumphost"] = st.session_state.get(
+                        "manual_sync_jumphost", values["jumphost"]).strip()
+                    values["code_dir"] = st.session_state.get(
+                        "manual_sync_code_dir", values["code_dir"]).strip()
+                    try:
+                        with st.spinner("Copying remote artifacts over SSH..."):
+                            destination = sync_rcp_results(RCPConfig(**values), rid)
+                        st.success(f"Synced into `{destination.relative_to(ROOT)}`.")
+                    except RuntimeError as exc:
+                        st.error(str(exc))
+
         runs = sorted([p for p in RUNS_DIR.iterdir() if p.is_dir()],
                       key=lambda p: p.stat().st_mtime, reverse=True)
         if not runs:
