@@ -182,6 +182,7 @@ VARIANT_HELP = {
     "disturbance_only": "PB+SSM that sees the disturbance but no gate context.",
     "context": "Hand-rolled factorized operator M_b(w,z) × M_p(w).",
     "mad_context": "Magnitude-and-direction special case (factorization rank s=1).",
+    "rpb_context": "rPB special case: diagonal context mixer using the selected context vector.",
     "mp_only_context": "M_p-only + context lift, sized to match the factorized params.",
     "context_no_lift": "Factorized operator with the M_p context lift disabled.",
     "contextual_ssm": "NEW — single ContextualDeepSSM operator (ports set below).",
@@ -627,7 +628,7 @@ def main():
             is_ablation = (run_mode == "Context ablation")
             is_layers = (run_mode == "Layer comparison")
             abl_arch_opts = [(k, lab) for k, lab in get_variant_options()
-                             if k in ("context", "mad_context", "mp_only_context", "contextual_ssm")]
+                             if k in ("context", "mad_context", "rpb_context", "mp_only_context", "contextual_ssm")]
             abl_type = None
             abl_n_sets = 3
             if is_ablation:

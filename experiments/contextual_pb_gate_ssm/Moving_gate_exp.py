@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".mplconfig"))
 
-from bounded_mlp_operator import BoundedMLPOperator
+from bounded_mlp_operator import BoundedMLPOperator, DiagonalBoundedMLPOperator
 from context_lifting import LpContextLifter
 from nav_plants import DoubleIntegratorNominal, DoubleIntegratorTrue
 from pb_core import PBController, as_bt, rollout_pb, validate_component_compatibility, WIntegralAugmenter
@@ -385,9 +385,9 @@ def build_parser() -> argparse.ArgumentParser:
     # Example: --variants contextual_ssm   (run only the new ContextualDeepSSM variant)
     parser.add_argument("--variants", type=str, default="",
                         help="Comma-separated subset of variants to run, e.g. "
-                             "'contextual_ssm' or 'context,contextual_ssm'. Choices: "
+                             "'contextual_ssm' or 'context,rpb_context'. Choices: "
                              "nominal, disturbance_only, context, mad_context, "
-                             "mp_only_context, context_no_lift, contextual_ssm. "
+                             "rpb_context, mp_only_context, context_no_lift, contextual_ssm. "
                              "Empty = use the *_comparison flags.")
 
     # Context mode (v3): full (11-D) or minimal (3-D: gate error, approach, switch age).
@@ -417,7 +417,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Run a context-feature ablation: train --ablation_variant once "
                              "per config in --ablation_configs (same data/seeds) and compare.")
     parser.add_argument("--ablation_variant", type=str, default="context",
-                        choices=["context", "mad_context", "mp_only_context", "contextual_ssm"],
+                        choices=["context", "mad_context", "rpb_context", "mp_only_context", "contextual_ssm"],
                         help="Single architecture held fixed across the ablation.")
     parser.add_argument("--ablation_configs", type=str, default="",
                         help="Semicolon-separated context configs, each 'label:feat1,feat2' "
@@ -670,12 +670,13 @@ def find_matched_d_model(
     target_params: int,
     mp_only: bool,
     use_mad: bool,
+    diagonal_mixer: bool = False,
     d_min: int = 4,
     d_max: int = 1024,
     step: int = 2,
 ) -> int:
     """SSM d_model whose FULL-controller param count is closest to target_params
-    for the given variant shape (factorized / MAD / M_p-only).
+    for the given variant shape (factorized / MAD / rPB / M_p-only).
 
     Param count is monotone in d_model, so we sweep and keep the value minimizing
     |count - target|. The whole controller is built each step, so M_b / lifter
@@ -690,6 +691,7 @@ def find_matched_d_model(
             ctrl, _ = build_controller(
                 probe_device, args, mp_only=mp_only,
                 factor_rank_override=1 if use_mad else None,
+                diagonal_mixer=diagonal_mixer,
                 ssm_d_model_override=d,
             )
         except Exception:
@@ -719,6 +721,7 @@ ALL_VARIANTS: dict[str, str] = {
     "disturbance_only": "PB+SSM: no context",
     "context": "PB+SSM: factorized M_b x M_p",
     "mad_context": "PB+SSM: MAD s=1",
+    "rpb_context": "rPB: diagonal context mixer",
     "mp_only_context": "PB+SSM: M_p-only + lift (matched params)",
     "context_no_lift": "PB+SSM: factorized M_b x M_p (no lift)",
     "contextual_ssm": "PB+SSM: ContextualDeepSSM",
@@ -761,6 +764,7 @@ def variant_specs(args=None) -> list[tuple[str, str]]:
     ]
     if mad_cmp:
         specs.append(("mad_context", "PB+SSM: MAD s=1"))
+    specs.append(("rpb_context", "rPB: diagonal context mixer"))
     specs.append(("mp_only_context", "PB+SSM: M_p-only + lift (matched params)"))
     if args is not None and getattr(args, "lift_comparison", False):
         specs.append(("context_no_lift", "PB+SSM: factorized M_b x M_p (no lift)"))
@@ -1425,6 +1429,7 @@ def build_controller(
     factor_rank_override: int | None = None,
     ssm_d_model_override: int | None = None,
     ssm_layers_override: int | None = None,
+    diagonal_mixer: bool = False,
     contextual: bool = False,
 ) -> tuple[PBController, DoubleIntegratorTrue]:
     """Build a PBController + true plant.
@@ -1434,6 +1439,8 @@ def build_controller(
                  M_p output dim is set to nu.  Compatible with mp_context_lift.
         factor_rank_override: Override the factorization width s. Setting this to
                               1 recovers the MAD magnitude-and-direction policy.
+        diagonal_mixer: rPB special case. M_p outputs R^nu and M_b is constrained
+                        to diag(g(w,z)), so u_i = g_i(w,z) * M_p_i(w).
         ssm_d_model_override: Override --ssm_d_model for M_p (used by mp_only_context
                               to match the factorized parameter budget).
         ssm_layers_override: Override --ssm_layers for M_p (same purpose).
@@ -1490,8 +1497,9 @@ def build_controller(
 
     ssm_d_model = int(ssm_d_model_override if ssm_d_model_override is not None else args.ssm_d_model)
     ssm_n_layers = int(ssm_layers_override if ssm_layers_override is not None else args.ssm_layers)
-    # When mp_only, M_p outputs u directly (dim=nu); feat_dim is only used for factorized mode.
-    mp_out_dim = nu if mp_only else feat_dim
+    # When mp_only or rPB, M_p outputs u-sized features directly. In rPB the
+    # diagonal mixer gates those two channels elementwise.
+    mp_out_dim = nu if (mp_only or diagonal_mixer) else feat_dim
     mp = MpDeepSSM(
         mp_in_dim,
         mp_out_dim,
@@ -1505,6 +1513,18 @@ def build_controller(
     ).to(device)
     if mp_only:
         mb = None
+    elif diagonal_mixer:
+        mb = DiagonalBoundedMLPOperator(
+            w_dim=w_dim,
+            z_dim=z_dim,
+            dim=nu,
+            hidden_dim=int(args.mb_hidden),
+            num_layers=int(args.mb_layers),
+            use_z_residual=True,
+            z_residual_gain=float(args.z_residual_gain),
+            bound_mode="softsign",
+            clamp_value=float(args.mb_bound),
+        ).to(device)
     else:
         mb = BoundedMLPOperator(
             w_dim=w_dim,
@@ -1634,7 +1654,7 @@ def rollout_variant(
             expected_cross_index=expected_cross_index,
             training=training,
         )
-    if mode in ("context", "mad_context", "mp_only_context", "context_no_lift", "contextual_ssm"):
+    if mode in ("context", "mad_context", "rpb_context", "mp_only_context", "context_no_lift", "contextual_ssm"):
         return rollout_pb_variant(
             args=args,
             batch=batch,
@@ -1960,6 +1980,7 @@ def train_controller(
     factor_rank_override: int | None = None,
     ssm_d_model_override: int | None = None,
     ssm_layers_override: int | None = None,
+    diagonal_mixer: bool = False,
     contextual: bool = False,
     run_dir: Path | None = None,
     save_tag: str | None = None,
@@ -1993,6 +2014,7 @@ def train_controller(
         factor_rank_override=factor_rank_override,
         ssm_d_model_override=ssm_d_model_override,
         ssm_layers_override=ssm_layers_override,
+        diagonal_mixer=diagonal_mixer,
         contextual=contextual,
     )
     print(f"[{mode}] trainable params: {count_params(controller):,}")
@@ -2182,6 +2204,7 @@ def variant_colors() -> dict[str, str]:
         "disturbance_only": "#d97706",
         "context": "#0f766e",
         "mad_context": "#2563eb",
+        "rpb_context": "#0891b2",
         "mp_only_context": "#7c3aed",
         "context_no_lift": "#db2777",
         "contextual_ssm": "#16a34a",
@@ -2195,7 +2218,7 @@ def reference_rollout_metrics(test_metrics: dict[str, dict]) -> dict:
     Prefers 'context' for backward-compatible plots, then any other variant that
     was actually run — so plots still work when 'context' is not among --variants.
     """
-    for pref in ("context", "contextual_ssm", "mad_context", "mp_only_context",
+    for pref in ("context", "rpb_context", "contextual_ssm", "mad_context", "mp_only_context",
                  "context_no_lift", "disturbance_only", "nominal"):
         m = test_metrics.get(pref)
         if isinstance(m, dict) and "rollout" in m:
@@ -2256,7 +2279,7 @@ def plot_wall_style_summary(
     for mode, label in variant_order:
         traj = test_metrics[mode]["rollout"]["x_seq"][sample_idx, :, :2].numpy()
         traj_full = np.vstack([start, traj])
-        lw = 2.6 if mode in ("context", "mad_context", "mp_only_context", "contextual_ssm") else 2.0
+        lw = 2.6 if mode in ("context", "mad_context", "rpb_context", "mp_only_context", "contextual_ssm") else 2.0
         ax1.plot(traj_full[:, 0], traj_full[:, 1], color=colors[mode], lw=lw, label=label)
 
     ax1.scatter([start_x], [start_y], color="#6b7280", s=36, zorder=4, label="Start")
@@ -2747,7 +2770,7 @@ def _animate_one_sample(
     trail_lines: dict[str, object] = {}
     dots: dict[str, object] = {}
     for mode, lbl in variant_order:
-        lw = 2.8 if mode in ("context", "mad_context", "mp_only_context", "contextual_ssm") else 1.8
+        lw = 2.8 if mode in ("context", "mad_context", "rpb_context", "mp_only_context", "contextual_ssm") else 1.8
         outcome = _outcome(mode)
         ln, = ax_arena.plot([], [], color=colors[mode], lw=lw, zorder=4,
                             label=f"{lbl}  {outcome}",
@@ -2793,7 +2816,7 @@ def _animate_one_sample(
     y_lines: dict[str, tuple] = {}
     for mode, lbl in variant_order:
         y_seq = trajs[mode][1:, 1]
-        lw = 2.4 if mode in ("context", "mad_context", "mp_only_context", "contextual_ssm") else 1.6
+        lw = 2.4 if mode in ("context", "mad_context", "rpb_context", "mp_only_context", "contextual_ssm") else 1.6
         ln, = ax_time.plot([], [], color=colors[mode], lw=lw, label=lbl)
         y_lines[mode] = (ln, y_seq)
 
@@ -2915,7 +2938,7 @@ def animate_adversarial_sample(
     # Pick the adversarial sample with the best (lowest) final position error
     # for the first available context variant, so the GIF shows informative behaviour.
     primary_mode = next(
-        (m for m, _ in variant_order if m in ("context", "mad_context", "mp_only_context", "contextual_ssm", "disturbance_only")),
+        (m for m, _ in variant_order if m in ("context", "mad_context", "rpb_context", "mp_only_context", "contextual_ssm", "disturbance_only")),
         variant_order[0][0],
     )
     x_seq = test_metrics[primary_mode]["rollout"]["x_seq"]  # (B, T, 4)
@@ -3063,7 +3086,7 @@ def plot_adversarial_switching(
                 xy = test_metrics[mode]["rollout"]["x_seq"][idx, :, :2].numpy()
                 start = test_batch.start[idx].numpy()
                 traj = np.vstack([start, xy])
-                lw = 2.2 if mode in ("context", "mad_context", "mp_only_context", "contextual_ssm") else 1.4
+                lw = 2.2 if mode in ("context", "mad_context", "rpb_context", "mp_only_context", "contextual_ssm") else 1.4
                 ax_traj.plot(traj[:, 0], traj[:, 1], color=colors[mode], lw=lw,
                              alpha=0.8, label=label if idx == int(adv_indices[0]) else "")
         corr_adv = float(args.corridor_limit)
@@ -3269,7 +3292,7 @@ def _storyboard_ref_mode(test_metrics: dict, variant_order: list[tuple[str, str]
     """Reference variant for the storyboards: prefer a context-bearing controller
     (its crossing time anchors the snapshots and it should be the showcased,
     non-colliding trajectory), falling back to the first plotted variant."""
-    for mode in ("context", "contextual_ssm", "mad_context", "mp_only_context", "context_no_lift"):
+    for mode in ("context", "rpb_context", "contextual_ssm", "mad_context", "mp_only_context", "context_no_lift"):
         if mode in test_metrics:
             return mode
     return variant_order[0][0]
@@ -3833,6 +3856,8 @@ def build_interpretation(test_metrics: dict[str, dict]) -> str:
         lines.append(f"Factorized M_b x M_p: success rate {test_metrics['context']['success_rate']:.3f}")
     if "mad_context" in test_metrics:
         lines.append(f"MAD s=1: {test_metrics['mad_context']['success_rate']:.3f}")
+    if "rpb_context" in test_metrics:
+        lines.append(f"rPB diagonal mixer: {test_metrics['rpb_context']['success_rate']:.3f}")
     if "mp_only_context" in test_metrics:
         lines.append(f"M_p-only (matched params): {test_metrics['mp_only_context']['success_rate']:.3f}")
     if "contextual_ssm" in test_metrics:
@@ -3931,6 +3956,7 @@ def _run_ablation_sweep(args: argparse.Namespace, device: torch.device, *,
 
     use_mp_only = (arch == "mp_only_context")
     use_mad = (arch == "mad_context")
+    use_rpb = (arch == "rpb_context")
     use_contextual = (arch == "contextual_ssm")
 
     print(f"[{run_prefix}] architecture={arch}; {len(items)} configs; run -> {run_dir}")
@@ -3955,6 +3981,7 @@ def _run_ablation_sweep(args: argparse.Namespace, device: torch.device, *,
                 controller, plant_true = build_controller(
                     device, args, mp_only=use_mp_only,
                     factor_rank_override=1 if use_mad else None,
+                    diagonal_mixer=use_rpb,
                     contextual=use_contextual,
                 )
                 controller.load_state_dict(torch.load(pt_path, map_location=device))
@@ -3984,6 +4011,7 @@ def _run_ablation_sweep(args: argparse.Namespace, device: torch.device, *,
                 args=args, device=device, mode=arch, val_batch=val_batch,
                 expected_cross_index=expected_cross_index,
                 mp_only=use_mp_only, factor_rank_override=1 if use_mad else None,
+                diagonal_mixer=use_rpb,
                 contextual=use_contextual,
                 run_dir=run_dir, save_tag=label,
             )
@@ -4193,15 +4221,15 @@ def run_custom_rollout(args: argparse.Namespace, device: torch.device) -> None:
         probe, _ = build_controller(torch.device("cpu"), args, contextual=True)
         target = count_params(probe)
         del probe
-        shape_cache: dict[tuple[bool, bool], int] = {}
+        shape_cache: dict[tuple[bool, bool, bool], int] = {}
         for mode in modes:
             if mode in ("nominal", "contextual_ssm"):
                 continue
-            shape = (mode == "mp_only_context", mode == "mad_context")
+            shape = (mode == "mp_only_context", mode == "mad_context", mode == "rpb_context")
             if shape not in shape_cache:
                 shape_cache[shape] = find_matched_d_model(
                     args=args, target_params=target,
-                    mp_only=shape[0], use_mad=shape[1],
+                    mp_only=shape[0], use_mad=shape[1], diagonal_mixer=shape[2],
                 )
             matched_d_model[mode] = shape_cache[shape]
 
@@ -4218,11 +4246,13 @@ def run_custom_rollout(args: argparse.Namespace, device: torch.device) -> None:
                 continue
             try:
                 use_mp_only = mode == "mp_only_context"
+                use_rpb = mode == "rpb_context"
                 controller, plant_true = build_controller(
                     device, args,
                     mp_only=use_mp_only,
                     force_no_lift=(mode == "context_no_lift"),
                     factor_rank_override=1 if mode == "mad_context" else None,
+                    diagonal_mixer=use_rpb,
                     ssm_d_model_override=matched_d_model.get(
                         mode, mp_only_d_model if use_mp_only else None),
                     ssm_layers_override=(
@@ -4374,12 +4404,14 @@ def run_plot_only(args: argparse.Namespace, device: torch.device) -> None:
         pt_path = run_dir / f"{mode}_controller.pt"
         use_mp_only = (mode == "mp_only_context")
         use_mad = (mode == "mad_context")
+        use_rpb = (mode == "rpb_context")
         use_contextual = (mode == "contextual_ssm")
         controller, plant_true = build_controller(
             device,
             args,
             mp_only=use_mp_only,
             factor_rank_override=1 if use_mad else None,
+            diagonal_mixer=use_rpb,
             contextual=use_contextual,
         )
         if pt_path.exists():
@@ -4560,15 +4592,16 @@ def main() -> None:
         for _mode, _ in specs:
             if _mode in ("nominal", "contextual_ssm"):
                 continue
-            shape = (_mode == "mp_only_context", _mode == "mad_context")  # (mp_only, use_mad)
+            shape = (_mode == "mp_only_context", _mode == "mad_context", _mode == "rpb_context")
             if shape not in _shape_cache:
                 _shape_cache[shape] = find_matched_d_model(
                     args=args, target_params=_target,
-                    mp_only=shape[0], use_mad=shape[1])
+                    mp_only=shape[0], use_mad=shape[1], diagonal_mixer=shape[2])
             matched_d_model[_mode] = _shape_cache[shape]
             _c, _ = build_controller(
                 _probe_device, args, mp_only=shape[0],
                 factor_rank_override=1 if shape[1] else None,
+                diagonal_mixer=shape[2],
                 ssm_d_model_override=matched_d_model[_mode])
             print(f"[match] {_mode}: ssm_d_model={matched_d_model[_mode]} -> "
                   f"{count_params(_c):,} params (target {_target:,})")
@@ -4585,11 +4618,13 @@ def main() -> None:
         use_mp_only = (mode == "mp_only_context")
         use_no_lift = (mode == "context_no_lift")
         use_mad = (mode == "mad_context")
+        use_rpb = (mode == "rpb_context")
         use_contextual = (mode == "contextual_ssm")
         mode_overrides = dict(
             mp_only=use_mp_only,
             force_no_lift=use_no_lift,
             factor_rank_override=1 if use_mad else None,
+            diagonal_mixer=use_rpb,
             ssm_d_model_override=matched_d_model.get(mode, mp_only_d_model if use_mp_only else None),
             ssm_layers_override=(mp_only_layers if (use_mp_only and mode not in matched_d_model) else None),
             contextual=use_contextual,
