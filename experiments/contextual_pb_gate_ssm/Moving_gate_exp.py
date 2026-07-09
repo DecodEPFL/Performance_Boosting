@@ -372,6 +372,13 @@ def build_parser() -> argparse.ArgumentParser:
                              "Requires --ssm_param tv or tvc; gain-safe (no L2 projection). "
                              "Adds 'select' to --ctx_modes if not already present.")
     parser.set_defaults(ctx_select=False)
+    parser.add_argument("--ctx_z_scale", type=float, default=1.0,
+                        help="Target per-feature scale of the context fed to ContextualDeepSSM. "
+                             "The shared context builder multiplies its physically-normalized "
+                             "features by --z_scale (tuned for the bounded-MLP M_b); the "
+                             "contextual operator rescales them by ctx_z_scale/z_scale before "
+                             "ALL ports (input/gate/mixer/select). 1.0 (default) = unit-range "
+                             "context; set equal to --z_scale to reproduce the old raw feed.")
 
     # Explicit variant selection. When non-empty, runs EXACTLY these variants
     # (comma-separated, in order) and overrides the *_comparison toggles below.
@@ -1271,6 +1278,44 @@ def build_context(
     return z_t.unsqueeze(1)
 
 
+class ContextRescale(torch.nn.Module):
+    """Stateless scalar rescale of the context (streaming-safe, no parameters).
+
+    Applied as ContextualDeepSSM's context_encoder, i.e. before every context
+    port (input/gate/mixer/select), so normalization is uniform across ports.
+    """
+
+    def __init__(self, factor: float):
+        super().__init__()
+        self.factor = float(factor)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return z * self.factor
+
+
+def cli_has_override(cli_overrides: set[str], dest: str) -> bool:
+    flag = f"--{dest}"
+    return flag in cli_overrides or any(tok.startswith(f"{flag}=") for tok in cli_overrides)
+
+
+def apply_saved_config(args: argparse.Namespace, saved_cfg: dict, cli_overrides: set[str], *,
+                       log_prefix: str) -> None:
+    for k, v in saved_cfg.items():
+        if not cli_has_override(cli_overrides, k) and hasattr(args, k):
+            setattr(args, k, v)
+    if (
+        "ctx_z_scale" not in saved_cfg
+        and not cli_has_override(cli_overrides, "ctx_z_scale")
+        and hasattr(args, "ctx_z_scale")
+        and hasattr(args, "z_scale")
+    ):
+        # Older ContextualDeepSSM checkpoints saw the shared build_context()
+        # output directly. Preserve that behavior when replaying old configs.
+        args.ctx_z_scale = float(args.z_scale)
+        print(f"[{log_prefix}] Legacy config has no ctx_z_scale; using "
+              f"ctx_z_scale=z_scale ({float(args.ctx_z_scale):g}).")
+
+
 def build_contextual_controller(
     device: torch.device,
     args: argparse.Namespace,
@@ -1308,6 +1353,13 @@ def build_contextual_controller(
     if getattr(args, "use_w_augment", False):
         w_augmenter = WIntegralAugmenter(decay=float(args.w_augment_decay)).to(device)
 
+    # Undo the shared builder's z_scale amplification (tuned for the bounded-MLP
+    # M_b) and feed the contextual operator ~unit-range context instead.
+    context_encoder = None
+    rescale = float(args.ctx_z_scale) / max(float(args.z_scale), 1e-12)
+    if abs(rescale - 1.0) > 1e-9:
+        context_encoder = ContextRescale(rescale)
+
     nominal_plant = DoubleIntegratorNominal(
         dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd),
         drag_coeff=float(args.drag_coeff),
@@ -1324,6 +1376,7 @@ def build_contextual_controller(
         context_modes=modes,
         detach_state=False,
         w_augmenter=w_augmenter,
+        context_encoder=context_encoder,
         # context ports
         context_filter=args.ctx_filter,
         horizon=int(args.horizon),
@@ -4077,9 +4130,7 @@ def run_custom_rollout(args: argparse.Namespace, device: torch.device) -> None:
     if config_path.exists():
         saved_cfg = json.loads(config_path.read_text(encoding="utf-8"))
         cli_overrides = set(sys.argv[1:])
-        for k, v in saved_cfg.items():
-            if f"--{k}" not in cli_overrides and hasattr(args, k):
-                setattr(args, k, v)
+        apply_saved_config(args, saved_cfg, cli_overrides, log_prefix="custom")
         print(f"[custom] Loaded run config from {config_path}")
     else:
         print(f"[custom] Warning: no config.json in {run_dir}; using current CLI args.")
@@ -4267,9 +4318,7 @@ def run_plot_only(args: argparse.Namespace, device: torch.device) -> None:
     if config_path.exists():
         saved_cfg = json.loads(config_path.read_text(encoding="utf-8"))
         # Merge saved config into args (CLI overrides saved values where specified).
-        for k, v in saved_cfg.items():
-            if f"--{k}" not in cli_overrides and hasattr(args, k):
-                setattr(args, k, v)
+        apply_saved_config(args, saved_cfg, cli_overrides, log_prefix="plot_only")
         if "--no_mad_comparison" in cli_overrides:
             args.mad_comparison = False
         if "mad_comparison" not in saved_cfg and "--mad_comparison" not in cli_overrides:

@@ -25,6 +25,12 @@ from pathlib import Path
 
 import streamlit as st
 
+# Make the app's own directory importable regardless of how it is executed
+# (streamlit run, bare python, or streamlit.testing AppTest).
+_EXP_DIR = Path(__file__).resolve().parent
+if str(_EXP_DIR) not in sys.path:
+    sys.path.insert(0, str(_EXP_DIR))
+
 from rcp_backend import (
     RCPConfig,
     build_delete_command,
