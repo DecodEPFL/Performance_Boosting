@@ -215,3 +215,45 @@ experiments/contextual_pb_obstacles_ssm/runs/<run_id>/
 
 Key obstacle outputs include static summaries plus `rollout_animation_*.gif`
 files showing the moving obstacles and the robot trajectories over time.
+
+---
+
+## Payload-Regime Variant
+
+This experiment studies abrupt pickup/drop events: mass, actuator effectiveness,
+drag, and a lateral centre-of-mass bias can switch during a rollout. The
+contextual controller receives only causal onboard payload telemetry (the
+measured mass/change, actuator effectiveness, lateral load bias, and its own
+state). The disturbance-only controller receives the identical dynamics and
+noise but no payload telemetry.
+
+Run it from the repository root:
+
+```bash
+python experiments/contextual_pb_payload_ssm/Moving_payload_exp.py --no_show_plots
+```
+
+The dedicated launcher exposes every experiment parameter, controller variant,
+and causal context feature, and browses the saved figures, GIFs, PDF storyboard,
+and telemetry-intervention results:
+
+```bash
+.venv/bin/streamlit run experiments/contextual_pb_payload_ssm/launcher_app.py
+```
+
+Each held-out run includes an in-distribution comparison, an OOD
+mass-and-switch-time stress case, and delayed/wrong/missing-telemetry
+interventions. Results are under:
+
+```text
+experiments/contextual_pb_payload_ssm/runs/<run_id>/
+```
+
+Submit it through Run:AI with the existing helper by selecting the payload
+script:
+
+```bash
+GASPAR=<gaspar> PROJECT=<harbor-project> IMAGE=performance-boosting TAG=v1.1 \
+  EXPERIMENT=payload JOB_NAME=pb-payload-full RUN_ID=rcp_payload_full GPU=1 \
+  scripts/rcp_runai_submit.sh --epochs 300
+```

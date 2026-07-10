@@ -96,3 +96,87 @@ class DoubleIntegratorTrue:
         return integrate_double_integrator(
             x, u, dt=self.dt, pre_kp=self.pre_kp, pre_kd=self.pre_kd, drag_coeff=self.drag_coeff,
         )
+
+
+class PayloadSwitchingDoubleIntegratorTrue:
+    """Batch-bound double integrator whose control authority changes with payload.
+
+    The nominal model remains the unit-mass ``DoubleIntegratorNominal``.  Before
+    each rollout, call :meth:`set_payload_schedule` with one causal schedule per
+    batch element.  At step ``t`` the true plant uses
+
+    ``acc = -kp * pos - kd * vel + actuator_gain[t] / mass[t] * u
+           - drag[t] * ||vel|| * vel + lateral_bias[t] * e_y``.
+
+    Keeping the pre-stabiliser fixed mirrors a controller whose baseline gains
+    are calibrated for a reference payload; mass, actuator effectiveness and
+    centre-of-mass bias are therefore genuine, time-varying model mismatch.
+    """
+
+    def __init__(
+        self,
+        dt: float = 0.05,
+        pre_kp: float = 1.0,
+        pre_kd: float = 1.5,
+    ) -> None:
+        self.dt = float(dt)
+        self.pre_kp = float(pre_kp)
+        self.pre_kd = float(pre_kd)
+        self._mass: Optional[torch.Tensor] = None
+        self._actuator_gain: Optional[torch.Tensor] = None
+        self._drag: Optional[torch.Tensor] = None
+        self._lateral_bias: Optional[torch.Tensor] = None
+
+    def set_payload_schedule(
+        self,
+        *,
+        mass: torch.Tensor,
+        actuator_gain: torch.Tensor,
+        drag: torch.Tensor,
+        lateral_bias: torch.Tensor,
+    ) -> None:
+        """Bind ``(B, horizon)`` regime tensors for the next rollout."""
+        schedules = (mass, actuator_gain, drag, lateral_bias)
+        if any(value.ndim != 2 for value in schedules):
+            raise ValueError("Payload schedules must all have shape (batch, horizon).")
+        shape = mass.shape
+        if any(value.shape != shape for value in schedules[1:]):
+            raise ValueError("Payload schedules must share one (batch, horizon) shape.")
+        if torch.any(mass <= 0.0):
+            raise ValueError("Payload mass must stay strictly positive.")
+        if torch.any(actuator_gain <= 0.0):
+            raise ValueError("Payload actuator gain must stay strictly positive.")
+        self._mass = mass
+        self._actuator_gain = actuator_gain
+        self._drag = drag
+        self._lateral_bias = lateral_bias
+
+    def forward(self, x: torch.Tensor, u: torch.Tensor, t: Optional[int] = None) -> torch.Tensor:
+        if self._mass is None or self._actuator_gain is None or self._drag is None or self._lateral_bias is None:
+            raise RuntimeError("Call set_payload_schedule before rolling out the payload plant.")
+        if t is None or t < 0 or t >= self._mass.shape[1]:
+            raise ValueError(f"Payload plant needs an in-range step index, got t={t}.")
+
+        x = as_bt(x)
+        u = as_bt(u)
+        if x.shape[0] != self._mass.shape[0]:
+            raise ValueError(
+                "Payload schedule batch size does not match rollout batch: "
+                f"{self._mass.shape[0]} vs {x.shape[0]}."
+            )
+
+        pos = x[..., :2]
+        vel = x[..., 2:]
+        mass_t = self._mass[:, t].view(-1, 1, 1)
+        gain_t = self._actuator_gain[:, t].view(-1, 1, 1)
+        drag_t = self._drag[:, t].view(-1, 1, 1)
+        bias_t = self._lateral_bias[:, t].view(-1, 1, 1)
+
+        pos_next = pos + self.dt * vel
+        acc = -self.pre_kp * pos - self.pre_kd * vel + (gain_t / mass_t) * u
+        speed = torch.sqrt((vel * vel).sum(dim=-1, keepdim=True) + 1e-12)
+        acc = acc - drag_t * speed * vel
+        acc_y = acc[..., 1:2] + bias_t
+        acc = torch.cat([acc[..., :1], acc_y], dim=-1)
+        vel_next = vel + self.dt * acc
+        return torch.cat([pos_next, vel_next], dim=-1)

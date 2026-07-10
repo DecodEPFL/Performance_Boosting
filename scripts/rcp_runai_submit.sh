@@ -21,8 +21,11 @@ case "${EXPERIMENT}" in
   obstacles)
     EXPERIMENT_SCRIPT="experiments/contextual_pb_obstacles_ssm/Moving_obstacles_exp.py"
     ;;
+  payload)
+    EXPERIMENT_SCRIPT="experiments/contextual_pb_payload_ssm/Moving_payload_exp.py"
+    ;;
   *)
-    echo "Unknown EXPERIMENT='${EXPERIMENT}'. Use EXPERIMENT=gate or EXPERIMENT=obstacles." >&2
+    echo "Unknown EXPERIMENT='${EXPERIMENT}'. Use EXPERIMENT=gate, EXPERIMENT=obstacles, or EXPERIMENT=payload." >&2
     exit 2
     ;;
 esac
