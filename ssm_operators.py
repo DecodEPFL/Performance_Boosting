@@ -61,6 +61,21 @@ class MpDeepSSM(nn.Module):
         return out
 
 
+class ContextRescale(nn.Module):
+    """Stateless scalar rescale of the context (streaming-safe, no parameters).
+
+    Pass as ContextualDeepSSM's ``context_encoder`` so the rescale applies
+    before every context port (input/gate/mixer/select) uniformly.
+    """
+
+    def __init__(self, factor: float):
+        super().__init__()
+        self.factor = float(factor)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return z * self.factor
+
+
 class MpContextualSSM(OperatorBase):
     """PB operator built on ``neural_ssm.ContextualDeepSSM``.
 
