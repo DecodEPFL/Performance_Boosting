@@ -3508,15 +3508,15 @@ def plot_trajectory_storyboard(
         # Ghost: full trajectory (very faded)
         for mode, _ in variant_order:
             ax.plot(trajs[mode][:, 0], trajs[mode][:, 1],
-                    color=colors.get(mode, "#888"), lw=1.0, alpha=0.10, zorder=2)
+                    color=colors[mode], lw=1.0, alpha=0.10, zorder=2)
 
         # Partial trail + current position dot
         for mode, _ in variant_order:
             trail = trajs[mode][:t_snap + 2]
             ax.plot(trail[:, 0], trail[:, 1],
-                    color=colors.get(mode, "#888"), lw=2.0, alpha=0.90, zorder=4)
+                    color=colors[mode], lw=2.0, alpha=0.90, zorder=4)
             ax.scatter(trail[-1, 0], trail[-1, 1],
-                       color=colors.get(mode, "#888"), s=45, zorder=6,
+                       color=colors[mode], s=45, zorder=6,
                        edgecolors="white", linewidths=0.8)
 
         # Start marker (first panel only)
@@ -3575,7 +3575,7 @@ def plot_trajectory_storyboard(
 
     # ── Shared legend ──────────────────────────────────────────────────────────
     legend_handles = [
-        Line2D([0], [0], color=colors.get(m, "#888"), lw=2, label=labels[m])
+        Line2D([0], [0], color=colors[m], lw=2, label=labels[m])
         for m, _ in variant_order if m in test_metrics
     ]
     legend_handles += [
@@ -3718,13 +3718,13 @@ def plot_trajectory_storyboard_compact(
         # Ghost + partial trail + dot
         for mode, _ in variant_order:
             ax.plot(trajs[mode][:, 0], trajs[mode][:, 1],
-                    color=colors.get(mode, "#888"), lw=0.7, alpha=0.10, zorder=2)
+                    color=colors[mode], lw=0.7, alpha=0.10, zorder=2)
         for mode, _ in variant_order:
             trail = trajs[mode][:t_snap + 2]
             ax.plot(trail[:, 0], trail[:, 1],
-                    color=colors.get(mode, "#888"), lw=1.5, alpha=0.90, zorder=4)
+                    color=colors[mode], lw=1.5, alpha=0.90, zorder=4)
             ax.scatter(trail[-1, 0], trail[-1, 1],
-                       color=colors.get(mode, "#888"), s=18, zorder=6,
+                       color=colors[mode], s=18, zorder=6,
                        edgecolors="white", linewidths=0.5)
 
         # Start (first panel) + goal
@@ -3775,7 +3775,7 @@ def plot_trajectory_storyboard_compact(
 
     # ── Legend (single row, very compact) ─────────────────────────────────────
     legend_handles = [
-        Line2D([0], [0], color=colors.get(m, "#888"), lw=1.5, label=labels[m])
+        Line2D([0], [0], color=colors[m], lw=1.5, label=labels[m])
         for m, _ in variant_order if m in test_metrics
     ]
     legend_handles += [
