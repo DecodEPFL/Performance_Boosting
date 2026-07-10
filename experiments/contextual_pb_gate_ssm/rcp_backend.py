@@ -1,4 +1,9 @@
-"""Pure helpers for submitting and synchronizing gate runs on EPFL RCP."""
+"""Pure helpers for submitting and synchronizing experiment runs on EPFL RCP.
+
+Experiment-agnostic: ``RCPConfig.script`` names the repo-relative experiment
+entry point (defaults to the gate experiment); the remote runs directory is
+derived from it (``<script dir>/runs/<run_id>``).
+"""
 from __future__ import annotations
 
 import re
@@ -23,6 +28,8 @@ class RCPConfig:
     job_name: str = ""
     jumphost: str = "lmassai@jumphost.rcp.epfl.ch"
     runai_bin: str = "~/.local/bin/runai"
+    # Repo-relative experiment entry point run inside the container.
+    script: str = "experiments/contextual_pb_gate_ssm/Moving_gate_exp.py"
 
     @property
     def image_uri(self) -> str:
@@ -50,7 +57,7 @@ def gpu_request_args(gpu: str | float | int) -> list[str]:
 
 
 def remote_run_dir(config: RCPConfig, run_id: str) -> PurePosixPath:
-    return PurePosixPath(config.code_dir) / "experiments/contextual_pb_gate_ssm/runs" / run_id
+    return PurePosixPath(config.code_dir) / PurePosixPath(config.script).parent / "runs" / run_id
 
 
 def cpu_thread_env_prefix(config: RCPConfig) -> str:
@@ -69,8 +76,7 @@ def cpu_thread_env_prefix(config: RCPConfig) -> str:
 
 def build_remote_command(config: RCPConfig, argv: list[str]) -> str:
     """Build the container shell command, preserving launcher argv exactly."""
-    script = "experiments/contextual_pb_gate_ssm/Moving_gate_exp.py"
-    python_cmd = shlex.join(["python3", script, *argv])
+    python_cmd = shlex.join(["python3", config.script, *argv])
     return f"{cpu_thread_env_prefix(config)}cd {shlex.quote(config.code_dir)} && {python_cmd}"
 
 

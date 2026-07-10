@@ -46,6 +46,19 @@ class RCPBackendTests(unittest.TestCase):
         self.assertEqual(cmd[-1], "/tmp/stage")
         self.assertIn(expected, cmd[-2])
 
+    def test_script_parameterization_targets_other_experiments(self):
+        payload = "experiments/contextual_pb_payload_ssm/Moving_payload_exp.py"
+        cfg = RCPConfig(job_name="payload-demo", script=payload)
+        self.assertEqual(
+            str(remote_run_dir(cfg, "r7")),
+            "/home/lmassai/Performance_Boosting/experiments/contextual_pb_payload_ssm/runs/r7")
+        remote = build_submit_command(cfg, ["--run_id", "r7"])[-1]
+        self.assertIn(payload, remote)
+        self.assertNotIn("Moving_gate_exp.py", remote)
+        # default stays on the gate experiment (backward compatibility)
+        legacy = build_submit_command(RCPConfig(job_name="gate-demo"), [])[-1]
+        self.assertIn("experiments/contextual_pb_gate_ssm/Moving_gate_exp.py", legacy)
+
 
 if __name__ == "__main__":
     unittest.main()

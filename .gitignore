@@ -1,0 +1,35 @@
+# IDE
+.idea/
+.vscode/
+
+# Claude Code
+.claude/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Streamlit launcher logs
+experiments/contextual_pb_gate_ssm/.launch_logs/
+
+# Cluster/runtime artifacts
+.cache/
+logs/*.err
+logs/*.out
+
+# Experiment outputs (sync/copy runs explicitly when needed)
+experiments/*/runs/
+experiments/*/.launch_logs/
+experiments/*/.mplconfig/
