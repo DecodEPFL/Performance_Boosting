@@ -18,7 +18,9 @@ import streamlit as st
 EXP_DIR = Path(__file__).resolve().parent
 ROOT, SCRIPT, RUNS, LOGS = EXP_DIR.parents[1], EXP_DIR / "Moving_payload_exp.py", EXP_DIR / "runs", EXP_DIR / ".launch_logs"
 for path in (RUNS, LOGS): path.mkdir(parents=True, exist_ok=True)
-if str(EXP_DIR) not in sys.path: sys.path.insert(0, str(EXP_DIR))
+for path in (ROOT, EXP_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 # The experiment-agnostic RCP backend is maintained in the gate experiment.
 _GATE_DIR = ROOT / "experiments" / "contextual_pb_gate_ssm"
 if str(_GATE_DIR) not in sys.path: sys.path.insert(0, str(_GATE_DIR))
@@ -31,16 +33,19 @@ from rcp_backend import (RCPConfig, build_delete_command, build_describe_command
 
 SKIP = {"help", "plot_only", "no_show_plots", "run_id", "variants", "context_features"}
 GROUPS = [
-    ("Run & training", lambda d: d in {"seed", "device", "train_batch", "val_batch", "test_batch", "epochs", "disturbance_only_epochs", "eval_every", "lr", "lr_min", "grad_clip"}),
-    ("Payload regime & causal telemetry", lambda d: d.startswith("payload_") or d.startswith("test_payload") or d in {"regime_protocol", "test_switch_min", "test_switch_max", "intervention_delay_steps", "intervention_eval"}),
-    ("Docking geometry & dynamics", lambda d: d in {"horizon", "dt", "start_x_min", "start_x_max", "start_y_max", "pre_kp", "pre_kd", "corridor_limit", "goal_tol", "terminal_speed_tol", "control_limit"}),
+    ("Run & training", lambda d: d in {"task", "seed", "device", "train_batch", "val_batch", "test_batch", "epochs", "disturbance_only_epochs", "eval_every", "lr", "lr_min", "grad_clip"}),
+    ("Slalom course & gates", lambda d: d.startswith("slalom_gate_") or d in {"horizon", "dt", "start_x_min", "start_x_max", "start_y_max", "corridor_limit", "goal_tol", "terminal_speed_tol", "control_limit"}),
+    ("Hidden cargo & tether physics", lambda d: d.startswith("slalom_payload_") or d.startswith("slalom_tether_") or d.startswith("slalom_sway_") or d in {"slalom_physics_substeps", "slalom_test_mass_min", "slalom_test_mass_max", "slalom_test_tether_length_min", "slalom_test_tether_length_max", "slalom_tension_softness", "slalom_tension_scale", "slalom_max_tension", "slalom_max_extension"}),
+    ("Collision, settling & curriculum", lambda d: d.startswith("slalom_") or d in {"pre_kp", "pre_kd"}),
+    ("Causal payload sensing", lambda d: d in {"payload_context_delay", "payload_obs_noise_sigma", "payload_context_dropout_p", "intervention_delay_steps", "intervention_eval"}),
+    ("Legacy docking regime", lambda d: d.startswith("payload_") or d.startswith("test_payload") or d in {"regime_protocol", "test_switch_min", "test_switch_max"}),
     ("Disturbance process", lambda d: d.startswith("noise_") or d.startswith("gust_")),
     ("PB architecture", lambda d: d in {"feat_dim", "mb_hidden", "mb_layers", "mb_bound", "z_scale", "z_residual_gain", "use_w_augment", "w_augment_decay", "use_w0_clip", "w0_clip"}),
     ("Contextual SSM (ContextualDeepSSM)", lambda d: d.startswith("ctx_")),
     ("SSM & context lift", lambda d: d.startswith("ssm_") or d.startswith("mp_context")),
     ("Loss & output", lambda d: d.endswith("_weight") or d in {"post_switch_window", "recovery_radius", "sample_traj_count", "skip_plots"}),
 ]
-VARIANTS = {"nominal": "Nominal pre-stabiliser", "disturbance_only": "PB+SSM: no payload telemetry", "context": "PB+SSM: payload-aware factorization", "mad_context": "PB+SSM: payload-aware MAD (s=1)", "contextual_ssm": "🆕 PB+SSM: ContextualDeepSSM"}
+VARIANTS = {"nominal": "Nominal pre-stabiliser", "disturbance_only": "PB+SSM: no context", "route_context": "PB+SSM: route context only", "context": "PB+SSM: route + payload context", "mad_context": "PB+SSM: route + payload MAD (s=1)", "contextual_ssm": "🆕 PB+SSM: ContextualDeepSSM"}
 
 
 def specs():
@@ -58,13 +63,21 @@ def specs():
 
 
 def widget(dest, bools, values):
+    key = f"p_{dest}"
     if dest in bools:
-        e = bools[dest]; return st.checkbox(dest, value=bool(e["default"]), help=e["help"], key=f"p_{dest}")
+        e = bools[dest]; kwargs = {"help": e["help"], "key": key}
+        if key not in st.session_state: kwargs["value"] = bool(e["default"])
+        return st.checkbox(dest, **kwargs)
     e, default = values[dest], values[dest]["default"]
-    if e["choices"]: return st.selectbox(dest, e["choices"], index=e["choices"].index(default), help=e["help"], key=f"p_{dest}")
-    if e["type"] is int: return st.number_input(dest, value=int(default or 0), step=1, help=e["help"], key=f"p_{dest}")
-    if e["type"] is float or isinstance(default, float): return st.text_input(dest, value="" if default is None else str(default), help=e["help"], key=f"p_{dest}")
-    return st.text_input(dest, value="" if default is None else str(default), help=e["help"], key=f"p_{dest}")
+    kwargs = {"help": e["help"], "key": key}
+    if e["choices"]:
+        if key not in st.session_state: kwargs["index"] = e["choices"].index(default)
+        return st.selectbox(dest, e["choices"], **kwargs)
+    if e["type"] is int:
+        if key not in st.session_state: kwargs["value"] = int(default or 0)
+        return st.number_input(dest, step=1, **kwargs)
+    if key not in st.session_state: kwargs["value"] = "" if default is None else str(default)
+    return st.text_input(dest, **kwargs)
 
 
 def argv_from_widgets(order, bools, values, run_id: str) -> tuple[list[str], list[str]]:
@@ -345,8 +358,8 @@ def render_rcp_jobs() -> None:
 
 
 def render_launch() -> None:
-    order, bools, values = specs(); st.subheader("Payload-regime experiment")
-    st.caption("A load pickup/drop changes mass, control authority, drag, and lateral bias. Payload telemetry is causal; wrong or delayed telemetry is evaluated as a sensor-integrity intervention.")
+    order, bools, values = specs(); st.subheader("Tethered Cargo Slalom")
+    st.caption("A carrier tows a hidden swinging cargo body through three alternating precision gates. Joint success means carrier, cargo, and every sampled tether segment clear every gate, then the carrier docks and the cargo settles in tow.")
 
     target = st.radio("Execution target", ["Local", "EPFL RCP"], horizontal=True, key="prcp_target")
     # A fresh RCP selection should use its requested GPU; restore the CPU default
@@ -368,26 +381,26 @@ def render_launch() -> None:
         cols = st.columns(2)
         for i, (key, label) in enumerate(VARIANTS.items()): cols[i % 2].checkbox(label, value=True, key=f"variant_{key}")
         st.markdown("#### Causal context signal")
-        st.caption("All of these are present/past onboard signals—no future switch time or true future dynamics is exposed.")
+        st.caption("Route-only and full-context controllers have the same context width; payload slots are zeroed for route-only. No future state or gate outcome is exposed.")
         cols = st.columns(3)
         for i, key in enumerate(CONTEXT_FEATURE_ORDER): cols[i % 3].checkbox(CONTEXT_FEATURE_META[key][1], value=key in FAIR_CONTEXT_DEFAULT, key=f"context_{key}")
         used = set()
         for title, predicate in GROUPS:
             members = [d for d in order if d not in used and predicate(d)]; used.update(members)
             if members:
-                with st.expander(title, expanded=title in {"Run & training", "Payload regime & causal telemetry"}):
+                with st.expander(title, expanded=title in {"Run & training", "Slalom course & gates", "Hidden cargo & tether physics"}):
                     for dest in members: widget(dest, bools, values)
         remaining = [d for d in order if d not in used]
         if remaining:
             with st.expander("Other parameters"):
                 for dest in remaining: widget(dest, bools, values)
-        submitted = st.form_submit_button("🚀 Launch payload experiment", type="primary", width="stretch")
+        submitted = st.form_submit_button("🚀 Launch cargo slalom", type="primary", width="stretch")
     if submitted:
         variants = [key for key in VARIANTS if st.session_state.get(f"variant_{key}")]; context = [key for key in CONTEXT_FEATURE_ORDER if st.session_state.get(f"context_{key}")]
         if not variants: st.error("Choose at least one controller.")
         elif not context: st.error("Choose at least one causal context feature.")
         else:
-            run_id = f"payload_ui_{datetime.now():%Y%m%d_%H%M%S}"; argv, warnings = argv_from_widgets(order, bools, values, run_id); argv += ["--variants", ",".join(variants), "--context_features", ",".join(context)]
+            run_id = f"tethered_ui_{datetime.now():%Y%m%d_%H%M%S}"; argv, warnings = argv_from_widgets(order, bools, values, run_id); argv += ["--variants", ",".join(variants), "--context_features", ",".join(context)]
             for warning in warnings: st.warning(warning)
             if st.session_state.get("prcp_target") == "EPFL RCP":
                 submit_to_rcp(argv, run_id)
@@ -436,7 +449,9 @@ def render_browse() -> None:
                 st.text(path.read_text() if path.suffix == ".txt" else json.dumps(json.loads(path.read_text()), indent=2))
     gifs, pngs, pdfs = sorted(run.glob("*.gif")), sorted(run.glob("*.png")), sorted(run.glob("*.pdf"))
     if gifs:
-        st.subheader("Animations"); [st.image(str(path), caption=path.name) for path in gifs]
+        st.subheader("Animations")
+        for path in gifs:
+            st.image(str(path), caption=path.name)
     if pngs:
         st.subheader("Figures"); columns = st.columns(2)
         for i, path in enumerate(pngs): columns[i % 2].image(str(path), caption=path.name, width="stretch")
@@ -446,7 +461,7 @@ def render_browse() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Payload PB launcher", layout="wide"); st.title("📦 Contextual PB + SSM — payload regimes")
+    st.set_page_config(page_title="Tethered Cargo Slalom", layout="wide"); st.title("📦 Contextual PB + SSM — Tethered Cargo Slalom")
     st.caption(f"`{SCRIPT.relative_to(ROOT)}`")
     launch_tab, browse_tab = st.tabs(["🚀 Launch run", "📊 Browse artifacts"])
     with launch_tab: render_launch()

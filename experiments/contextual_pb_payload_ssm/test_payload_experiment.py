@@ -20,7 +20,7 @@ from payload_core import build_context, rollout_variant, sample_batch
 
 class PayloadExperimentTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.args = parse_args(["--horizon", "96", "--train_batch", "4", "--val_batch", "4", "--test_batch", "4"])
+        self.args = parse_args(["--task", "docking", "--horizon", "96", "--train_batch", "4", "--val_batch", "4", "--test_batch", "4"])
 
     def test_paired_payload_switches_are_mirrored(self) -> None:
         batch = sample_batch(self.args, batch_size=4, seed=12, paired=True, shuffle=False)
@@ -66,20 +66,20 @@ class PayloadExperimentTest(unittest.TestCase):
                 self.assertTrue(torch.all(batch.lateral_bias_true[i, step + settle:] == 0.0))
         # taper noise window: last step ~0, early steps untouched
         self.assertLess(float(batch.process_noise[:, -1].abs().max()), 1e-6)
-        legacy = parse_args(["--horizon", "96", "--noise_decay", "none", "--payload_bias_settle_steps", "0"])
+        legacy = parse_args(["--task", "docking", "--horizon", "96", "--noise_decay", "none", "--payload_bias_settle_steps", "0"])
         legacy_batch = sample_batch(legacy, batch_size=4, seed=33, paired=True, shuffle=False)
         self.assertTrue(torch.allclose(batch.process_noise[:, :20], legacy_batch.process_noise[:, :20]))
 
     def test_contextual_controller_builds_and_rolls_out(self) -> None:
         from payload_core import build_controller
-        args = parse_args(["--horizon", "96", "--ssm_layers", "2", "--ssm_d_model", "16", "--ssm_d_state", "16", "--ctx_d_features", "8"])
+        args = parse_args(["--task", "docking", "--horizon", "96", "--ssm_layers", "2", "--ssm_d_model", "16", "--ssm_d_state", "16", "--ctx_d_features", "8"])
         controller, plant = build_controller(torch.device("cpu"), args, mad=False, contextual=True)
         batch = sample_batch(args, batch_size=4, seed=44, paired=True, shuffle=False)
         with torch.no_grad():
             result = rollout_variant(args, batch, torch.device("cpu"), mode="contextual_ssm", controller=controller, plant=plant)
         self.assertEqual(tuple(result.u_seq.shape), (4, args.horizon, 2))
         with self.assertRaises(ValueError):  # select port needs a selective core
-            bad = parse_args(["--ssm_param", "lru", "--ctx_select"])
+            bad = parse_args(["--task", "docking", "--ssm_param", "lru", "--ctx_select"])
             build_controller(torch.device("cpu"), bad, mad=False, contextual=True)
 
 

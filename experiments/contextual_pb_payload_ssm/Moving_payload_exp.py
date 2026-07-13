@@ -1,9 +1,8 @@
-"""Contextual PB experiment: causal payload telemetry under abrupt regime changes."""
+"""Contextual PB experiments for hidden payload dynamics."""
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import sys
 from datetime import datetime
@@ -18,12 +17,14 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
 
 from payload_artifacts import render_all
-from payload_core import (CONTEXT_FEATURE_META, CONTEXT_FEATURE_ORDER, FAIR_CONTEXT_DEFAULT, PayloadBatch,
-                          build_controller, context_dim, rollout_variant, sample_batch, variant_specs)
+from payload_core import (PayloadBatch, build_controller, context_dim,
+                          rollout_variant, sample_batch, variant_specs)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser("Contextual PB payload-regime switching experiment")
+    p = argparse.ArgumentParser("Contextual PB hidden-payload experiments")
+    p.add_argument("--task", choices=["tethered_slalom", "docking"], default="tethered_slalom",
+                   help="Tethered Cargo Slalom is the presentation benchmark; docking keeps the legacy task.")
     p.add_argument("--seed", type=int, default=41); p.add_argument("--device", default="cpu")
     p.add_argument("--require_cuda", action="store_true",
                    help="Abort if CUDA is unavailable instead of silently falling back to CPU "
@@ -33,11 +34,54 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--train_batch", type=int, default=512); p.add_argument("--val_batch", type=int, default=512); p.add_argument("--test_batch", type=int, default=1024)
     p.add_argument("--epochs", type=int, default=300); p.add_argument("--disturbance_only_epochs", type=int, default=300); p.add_argument("--eval_every", type=int, default=10)
     p.add_argument("--lr", type=float, default=2e-3); p.add_argument("--lr_min", type=float, default=2e-4); p.add_argument("--grad_clip", type=float, default=1.0)
-    p.add_argument("--variants", default="nominal,disturbance_only,context,mad_context,contextual_ssm")
-    p.add_argument("--horizon", type=int, default=150); p.add_argument("--dt", type=float, default=.05)
-    p.add_argument("--start_x_min", type=float, default=1.85); p.add_argument("--start_x_max", type=float, default=2.15); p.add_argument("--start_y_max", type=float, default=.16)
-    p.add_argument("--pre_kp", type=float, default=.32); p.add_argument("--pre_kd", type=float, default=.80); p.add_argument("--corridor_limit", type=float, default=.78)
-    p.add_argument("--goal_tol", type=float, default=.13); p.add_argument("--terminal_speed_tol", type=float, default=.14); p.add_argument("--control_limit", type=float, default=1.45)
+    p.add_argument("--variants", default="nominal,disturbance_only,route_context,context,mad_context,contextual_ssm")
+    p.add_argument("--horizon", type=int, default=210); p.add_argument("--dt", type=float, default=.04)
+    p.add_argument("--start_x_min", type=float, default=2.35); p.add_argument("--start_x_max", type=float, default=2.55); p.add_argument("--start_y_max", type=float, default=.05)
+    p.add_argument("--pre_kp", type=float, default=.36); p.add_argument("--pre_kd", type=float, default=.90); p.add_argument("--corridor_limit", type=float, default=.86)
+    p.add_argument("--goal_tol", type=float, default=.14); p.add_argument("--terminal_speed_tol", type=float, default=.18); p.add_argument("--control_limit", type=float, default=2.2)
+    # Tethered Cargo Slalom: the PB state remains the carrier's four states. The
+    # cargo below is private state owned by the true plant and never reconstructed.
+    p.add_argument("--slalom_gate_xs", default="1.85,1.31,0.78")
+    p.add_argument("--slalom_gate_centers", default="0.29,-0.31,0.28")
+    p.add_argument("--slalom_gate_center_jitter", type=float, default=.025)
+    p.add_argument("--slalom_gate_half_width", type=float, default=.48)
+    p.add_argument("--slalom_gate_focus_sigma", type=float, default=.10)
+    p.add_argument("--slalom_carrier_radius", type=float, default=.055)
+    p.add_argument("--slalom_payload_radius", type=float, default=.085)
+    p.add_argument("--slalom_tether_radius", type=float, default=.018)
+    p.add_argument("--slalom_collision_margin", type=float, default=.012)
+    p.add_argument("--slalom_tether_samples", type=int, default=5)
+    p.add_argument("--slalom_physics_substeps", type=int, default=2)
+    p.add_argument("--slalom_payload_mass_min", type=float, default=.65)
+    p.add_argument("--slalom_payload_mass_max", type=float, default=1.40)
+    p.add_argument("--slalom_test_mass_min", type=float, default=.50)
+    p.add_argument("--slalom_test_mass_max", type=float, default=1.65)
+    p.add_argument("--slalom_tether_length_min", type=float, default=.38)
+    p.add_argument("--slalom_tether_length_max", type=float, default=.52)
+    p.add_argument("--slalom_test_tether_length_min", type=float, default=.32)
+    p.add_argument("--slalom_test_tether_length_max", type=float, default=.60)
+    p.add_argument("--slalom_tether_stiffness_min", type=float, default=7.0)
+    p.add_argument("--slalom_tether_stiffness_max", type=float, default=12.0)
+    p.add_argument("--slalom_tether_damping_min", type=float, default=.30)
+    p.add_argument("--slalom_tether_damping_max", type=float, default=.80)
+    p.add_argument("--slalom_sway_speed_min", type=float, default=.28)
+    p.add_argument("--slalom_sway_speed_max", type=float, default=.58)
+    p.add_argument("--slalom_payload_air_drag", type=float, default=.12)
+    p.add_argument("--slalom_tether_reaction", type=float, default=.35)
+    p.add_argument("--slalom_tension_softness", type=float, default=8.0)
+    p.add_argument("--slalom_tension_scale", type=float, default=4.0)
+    p.add_argument("--slalom_max_tension", type=float, default=4.0)
+    p.add_argument("--slalom_max_extension", type=float, default=.18)
+    p.add_argument("--slalom_payload_speed_tol", type=float, default=.22)
+    p.add_argument("--slalom_settle_swing_tol", type=float, default=.16)
+    p.add_argument("--slalom_settle_extension_tol", type=float, default=.10)
+    p.add_argument("--slalom_gate_weight", type=float, default=420.0)
+    p.add_argument("--slalom_payload_settle_weight", type=float, default=20.0)
+    p.add_argument("--slalom_tension_weight", type=float, default=1.0)
+    p.add_argument("--slalom_stretch_weight", type=float, default=25.0)
+    p.add_argument("--slalom_collision_sharpness", type=float, default=22.0)
+    p.add_argument("--slalom_curriculum_extra_width", type=float, default=.14)
+    p.add_argument("--slalom_curriculum_fraction", type=float, default=.35)
     p.add_argument("--regime_protocol", choices=["fixed", "single_switch"], default="single_switch")
     p.add_argument("--payload_light_mass", type=float, default=.72); p.add_argument("--payload_loaded_mass", type=float, default=1.55); p.add_argument("--payload_mass_ref", type=float, default=1.0)
     p.add_argument("--payload_light_actuator_gain", type=float, default=1.12); p.add_argument("--payload_loaded_actuator_gain", type=float, default=.76)
@@ -55,7 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--test_payload_light_mass", type=float, default=None); p.add_argument("--test_payload_loaded_mass", type=float, default=1.78)
     p.add_argument("--test_switch_min", type=int, default=22); p.add_argument("--test_switch_max", type=int, default=40)
     p.add_argument("--payload_context_delay", type=int, default=0); p.add_argument("--payload_obs_noise_sigma", type=float, default=.012); p.add_argument("--payload_context_dropout_p", type=float, default=.04)
-    p.add_argument("--context_features", default=",".join(FAIR_CONTEXT_DEFAULT))
+    p.add_argument("--context_features", default="",
+                   help="Comma-separated causal signals; blank selects the complete task-specific set.")
     p.add_argument("--intervention_delay_steps", type=int, default=6); p.add_argument("--no_intervention_eval", dest="intervention_eval", action="store_false"); p.set_defaults(intervention_eval=True)
     p.add_argument("--noise_vel_sigma", type=float, default=1.2e-3); p.add_argument("--noise_pos_multiplier", type=float, default=.25)
     p.add_argument("--gust_count_min", type=int, default=1); p.add_argument("--gust_count_max", type=int, default=3); p.add_argument("--gust_duration", type=int, default=7); p.add_argument("--gust_velocity", type=float, default=.014)
@@ -89,6 +134,30 @@ def parse_args(argv: list[str] | None = None):
     if min(args.train_batch, args.val_batch, args.test_batch) < 2 or any(x % 2 for x in (args.train_batch, args.val_batch, args.test_batch)): raise ValueError("All paired batch sizes must be even and >= 2.")
     if min(args.epochs, args.disturbance_only_epochs, args.eval_every) < 1: raise ValueError("epochs, disturbance_only_epochs, and eval_every must be positive.")
     if args.horizon < 12 or args.post_switch_window < 1 or args.control_limit <= 0: raise ValueError("horizon, post_switch_window, and control_limit must be positive (horizon >= 12).")
+    if args.task == "tethered_slalom":
+        from tethered_payload import gate_geometry
+        gate_geometry(args)
+        positive = (args.slalom_payload_mass_min, args.slalom_payload_mass_max,
+                    args.slalom_test_mass_min, args.slalom_test_mass_max,
+                    args.slalom_tether_length_min, args.slalom_tether_length_max,
+                    args.slalom_test_tether_length_min, args.slalom_test_tether_length_max,
+                    args.slalom_tether_stiffness_min, args.slalom_tether_stiffness_max,
+                    args.slalom_physics_substeps, args.slalom_tether_samples)
+        if min(positive) <= 0:
+            raise ValueError("Slalom mass, tether, physics-substep, and sample parameters must be positive.")
+        ranges = (
+            (args.slalom_payload_mass_min, args.slalom_payload_mass_max),
+            (args.slalom_test_mass_min, args.slalom_test_mass_max),
+            (args.slalom_tether_length_min, args.slalom_tether_length_max),
+            (args.slalom_test_tether_length_min, args.slalom_test_tether_length_max),
+            (args.slalom_tether_stiffness_min, args.slalom_tether_stiffness_max),
+            (args.slalom_tether_damping_min, args.slalom_tether_damping_max),
+            (args.slalom_sway_speed_min, args.slalom_sway_speed_max),
+        )
+        if any(lo < 0 or hi < lo for lo, hi in ranges):
+            raise ValueError("Every slalom parameter range must be non-negative and ordered min <= max.")
+        if not (0 < args.slalom_curriculum_fraction <= 1):
+            raise ValueError("slalom_curriculum_fraction must be in (0, 1].")
     return args
 
 
@@ -180,6 +249,16 @@ def main() -> None:
     args = parse_args(); _seed(int(args.seed))
     if args.require_cuda and not torch.cuda.is_available():
         raise SystemExit("--require_cuda was set but CUDA is not available on this node/image.")
+    if args.plot_only:
+        config_path = Path(__file__).resolve().parent / "runs" / args.plot_only / "config.json"
+        if config_path.exists():
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            args.task = saved.get(
+                "task", "tethered_slalom" if int(saved.get("experiment_schema_version", 0)) == 2 else "docking")
+    if args.task == "tethered_slalom":
+        from tethered_experiment import run
+        run(args)
+        return
     device = torch.device(args.device if not args.device.startswith("cuda") or torch.cuda.is_available() else "cpu")
     if args.plot_only:
         _plot_only(args, device, Path(__file__).resolve().parent / "runs" / args.plot_only); return

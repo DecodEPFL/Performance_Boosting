@@ -16,20 +16,39 @@ from pb_core.rollout import RolloutResult
 from ssm_operators import ContextRescale, MpContextualSSM, MpDeepSSM
 
 
-CONTEXT_FEATURE_ORDER = [
+DOCKING_CONTEXT_FEATURE_ORDER = [
     "payload_mass", "payload_mass_delta", "actuator_gain", "lateral_bias",
     "switch_age", "goal_dx", "goal_dy", "vel_x", "vel_y",
 ]
+CONTEXT_FEATURE_ORDER = [
+    "next_gate_dx", "next_gate_center", "carrier_gate_error", "gate_approach",
+    "goal_dx", "goal_dy", "vel_x", "vel_y",
+    "payload_mass", "payload_gate_error",
+    "payload_rel_x", "payload_rel_y", "payload_rel_vx", "payload_rel_vy",
+    "tether_extension", "tether_tension",
+]
+ROUTE_CONTEXT_FEATURES = {
+    "next_gate_dx", "next_gate_center", "carrier_gate_error", "gate_approach",
+    "goal_dx", "goal_dy", "vel_x", "vel_y",
+}
+PAYLOAD_CONTEXT_FEATURES = set(CONTEXT_FEATURE_ORDER).difference(ROUTE_CONTEXT_FEATURES)
 CONTEXT_FEATURE_META = {
-    "payload_mass": ("fair", "Measured payload mass", ("payload",)),
-    "payload_mass_delta": ("fair", "Causal payload-mass change", ("payload",)),
-    "actuator_gain": ("fair", "Measured actuator effectiveness", ("payload",)),
-    "lateral_bias": ("fair", "Measured lateral load bias", ("payload",)),
-    "switch_age": ("fair", "Age of the causal load-change event", ("payload",)),
+    "next_gate_dx": ("fair", "Distance to the next known gate", ("payload",)),
+    "next_gate_center": ("fair", "Next gate centre", ("payload",)),
+    "carrier_gate_error": ("fair", "Carrier error to next opening", ("payload",)),
+    "gate_approach": ("fair", "Causal gate-proximity weight", ("payload",)),
     "goal_dx": ("fair", "Goal offset x", ("payload",)),
     "goal_dy": ("fair", "Goal offset y", ("payload",)),
     "vel_x": ("fair", "Own velocity vx", ("payload",)),
     "vel_y": ("fair", "Own velocity vy", ("payload",)),
+    "payload_mass": ("fair", "Measured payload mass", ("payload",)),
+    "payload_gate_error": ("fair", "Payload error to next opening", ("payload",)),
+    "payload_rel_x": ("fair", "Payload displacement behind carrier x", ("payload",)),
+    "payload_rel_y": ("fair", "Payload displacement behind carrier y", ("payload",)),
+    "payload_rel_vx": ("fair", "Payload relative velocity x", ("payload",)),
+    "payload_rel_vy": ("fair", "Payload relative velocity y", ("payload",)),
+    "tether_extension": ("fair", "Measured tether extension", ("payload",)),
+    "tether_tension": ("fair", "Measured tether tension", ("payload",)),
 }
 FAIR_CONTEXT_DEFAULT = list(CONTEXT_FEATURE_ORDER)
 
@@ -57,12 +76,15 @@ class PayloadBatch:
 
 
 def resolve_context_features(args) -> list[str]:
+    order = (DOCKING_CONTEXT_FEATURE_ORDER
+             if str(getattr(args, "task", "docking")) == "docking"
+             else CONTEXT_FEATURE_ORDER)
     raw = str(getattr(args, "context_features", "") or "").strip()
-    selected = set(CONTEXT_FEATURE_ORDER if not raw else (x.strip() for x in raw.split(",") if x.strip()))
-    unknown = selected.difference(CONTEXT_FEATURE_ORDER)
+    selected = set(order if not raw else (x.strip() for x in raw.split(",") if x.strip()))
+    unknown = selected.difference(order)
     if unknown:
         raise ValueError(f"Unknown payload context features: {sorted(unknown)}")
-    features = [key for key in CONTEXT_FEATURE_ORDER if key in selected]
+    features = [key for key in order if key in selected]
     if not features:
         raise ValueError("Select at least one payload context feature.")
     return features
@@ -94,9 +116,10 @@ def contextual_modes_string(args) -> str:
 def variant_specs(args) -> list[tuple[str, str]]:
     labels = {
         "nominal": "Nominal pre-stabiliser",
-        "disturbance_only": "PB+SSM: no payload telemetry",
-        "context": "PB+SSM: payload-aware factorization",
-        "mad_context": "PB+SSM: payload-aware MAD (s=1)",
+        "disturbance_only": "PB+SSM: no context",
+        "route_context": "PB+SSM: route context only",
+        "context": "PB+SSM: route + payload context",
+        "mad_context": "PB+SSM: route + payload MAD (s=1)",
         "contextual_ssm": f"PB+SSM: ContextualDeepSSM ({contextual_modes_string(args)})",
     }
     requested = [x.strip() for x in str(args.variants).split(",") if x.strip()]

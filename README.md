@@ -218,14 +218,20 @@ files showing the moving obstacles and the robot trajectories over time.
 
 ---
 
-## Payload-Regime Variant
+## Tethered Cargo Slalom
 
-This experiment studies abrupt pickup/drop events: mass, actuator effectiveness,
-drag, and a lateral centre-of-mass bias can switch during a rollout. The
-contextual controller receives only causal onboard payload telemetry (the
-measured mass/change, actuator effectiveness, lateral load bias, and its own
-state). The disturbance-only controller receives the identical dynamics and
-noise but no payload telemetry.
+This experiment makes payload context structurally necessary. A four-state
+carrier must tow a private, dynamically swinging cargo body through three
+alternating precision gates. Alias-paired trials have the same observed carrier
+state, route, mass, and process noise, but opposite hidden cargo velocity. A
+route-only controller therefore sees identical inputs for two situations that
+require different first moves; the full-context controller additionally gets
+causal payload position, velocity, extension, tension, and mass telemetry.
+
+Success is deliberately strict: the carrier, cargo, and sampled points along
+the tether must all clear every gate, then the carrier must dock while the
+cargo settles into the trailing formation.
+The legacy pickup/drop docking task remains available with `--task docking`.
 
 Run it from the repository root:
 
@@ -241,9 +247,10 @@ and telemetry-intervention results:
 .venv/bin/streamlit run experiments/contextual_pb_payload_ssm/launcher_app.py
 ```
 
-Each held-out run includes an in-distribution comparison, an OOD
-mass-and-switch-time stress case, and delayed/wrong/missing-telemetry
-interventions. Results are under:
+Each held-out run saves its exact test batch and includes route-only versus full
+context, an OOD mass-and-tether stress case, delayed/wrong/missing-telemetry
+interventions, a split-screen GIF, gate-clearance plots, an alias-pair figure,
+and an event storyboard. Results are under:
 
 ```text
 experiments/contextual_pb_payload_ssm/runs/<run_id>/
