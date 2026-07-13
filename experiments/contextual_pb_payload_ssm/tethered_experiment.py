@@ -185,6 +185,11 @@ def evaluate(args, batch: SlalomBatch, device: torch.device, mode: str,
             "avg_max_tension": _float(rollout.tension_seq.amax(1).mean()),
             "avg_abs_reconstructed_w": _float(rollout.w_seq.abs().mean()),
         }
+        if controller is not None:
+            expected_w = torch.zeros_like(rollout.w_seq)
+            expected_w[:, 1:] = batch.process_noise[:, :-1].to(device)
+            out["max_w_noise_identity_error"] = _float(
+                (rollout.w_seq - expected_w).abs().amax())
         out.update(parts)
         out["rollout"] = {
             "x_seq": rollout.x_seq.cpu(), "u_seq": rollout.u_seq.cpu(),
@@ -258,8 +263,8 @@ def _evaluate_interventions(args, batch, ood, device, controllers, plants, metri
 
 def _load_args_for_replay(args, run_dir: Path):
     saved = json.loads((run_dir / "config.json").read_text())
-    if int(saved.get("experiment_schema_version", 0)) != 2:
-        raise RuntimeError("This renderer only accepts Tethered Cargo Slalom schema version 2 runs.")
+    if int(saved.get("experiment_schema_version", 0)) != 3:
+        raise RuntimeError("This renderer only accepts nonlinear Tethered Cargo Slalom schema version 3 runs.")
     cli_flags = {token.split("=")[0] for token in sys.argv[1:] if token.startswith("--")}
     merged = vars(args).copy()
     merged.update({key: value for key, value in saved.items() if f"--{key}" not in cli_flags})
@@ -272,7 +277,7 @@ def replay(args, device: torch.device, run_dir: Path) -> None:
     batch_path = run_dir / "test_batch.pt"
     if not batch_path.exists():
         raise FileNotFoundError(
-            "Cannot replay this schema-v2 run: test_batch.pt is missing, so an exact "
+            "Cannot replay this schema-v3 run: test_batch.pt is missing, so an exact "
             "artifact reproduction would be impossible.")
     batch = load_batch(batch_path)
     ood = sample_slalom_batch(args, batch_size=int(args.test_batch),
@@ -313,7 +318,8 @@ def run(args) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     config = dict(vars(args)); config.update(
         context_dim=context_dim(args), experiment_type="tethered_payload_slalom",
-        experiment_schema_version=2)
+        experiment_schema_version=3,
+        disturbance_identity="w[0]=0; w[t]=process_noise[t-1] for t>=1")
     _save_json(run_dir / "config.json", config)
     validation = sample_slalom_batch(args, batch_size=int(args.val_batch),
                                       seed=int(args.seed) + 50000,
@@ -352,5 +358,8 @@ def run(args) -> None:
     (run_dir / "interpretation.txt").write_text(
         summary + "\nJoint success requires carrier, cargo, and tether to clear every gate, "
         "then dock and settle. Route-only has identical context capacity but all payload "
-        "telemetry slots are zero.\n", encoding="utf-8")
+        "telemetry slots are zero. Nominal and true observed dynamics share the same "
+        "nonlinear pre-stabilised carrier, so reconstructed w is exactly the tapered "
+        "process noise; the hidden nonlinear cargo affects the task constraints, not w.\n",
+        encoding="utf-8")
     print("RESULTS  " + summary)

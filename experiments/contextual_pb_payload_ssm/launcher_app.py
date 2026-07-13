@@ -35,8 +35,9 @@ SKIP = {"help", "plot_only", "no_show_plots", "run_id", "variants", "context_fea
 GROUPS = [
     ("Run & training", lambda d: d in {"task", "seed", "device", "train_batch", "val_batch", "test_batch", "epochs", "disturbance_only_epochs", "eval_every", "lr", "lr_min", "grad_clip"}),
     ("Slalom course & gates", lambda d: d.startswith("slalom_gate_") or d in {"horizon", "dt", "start_x_min", "start_x_max", "start_y_max", "corridor_limit", "goal_tol", "terminal_speed_tol", "control_limit"}),
+    ("Nonlinear matched carrier", lambda d: d in {"pre_kp", "pre_kd", "slalom_carrier_cubic_stiffness", "slalom_carrier_quadratic_drag", "slalom_carrier_gyro_gain", "slalom_carrier_gyro_position_scale", "slalom_carrier_actuator_scale", "slalom_carrier_speed_loss"}),
     ("Hidden cargo & tether physics", lambda d: d.startswith("slalom_payload_") or d.startswith("slalom_tether_") or d.startswith("slalom_sway_") or d in {"slalom_physics_substeps", "slalom_test_mass_min", "slalom_test_mass_max", "slalom_test_tether_length_min", "slalom_test_tether_length_max", "slalom_tension_softness", "slalom_tension_scale", "slalom_max_tension", "slalom_max_extension"}),
-    ("Collision, settling & curriculum", lambda d: d.startswith("slalom_") or d in {"pre_kp", "pre_kd"}),
+    ("Collision, settling & curriculum", lambda d: d.startswith("slalom_")),
     ("Causal payload sensing", lambda d: d in {"payload_context_delay", "payload_obs_noise_sigma", "payload_context_dropout_p", "intervention_delay_steps", "intervention_eval"}),
     ("Legacy docking regime", lambda d: d.startswith("payload_") or d.startswith("test_payload") or d in {"regime_protocol", "test_switch_min", "test_switch_max"}),
     ("Disturbance process", lambda d: d.startswith("noise_") or d.startswith("gust_")),
@@ -359,7 +360,7 @@ def render_rcp_jobs() -> None:
 
 def render_launch() -> None:
     order, bools, values = specs(); st.subheader("Tethered Cargo Slalom")
-    st.caption("A carrier tows a hidden swinging cargo body through three alternating precision gates. Joint success means carrier, cargo, and every sampled tether segment clear every gate, then the carrier docks and the cargo settles in tow.")
+    st.caption("A strongly nonlinear, origin-stable carrier tows a hidden nonlinear cargo body through three alternating precision gates. Nominal and true carrier transitions are matched, so PB reconstructs only tapered process noise; payload context matters because carrier, cargo, and every tether segment must clear the gates and settle.")
 
     target = st.radio("Execution target", ["Local", "EPFL RCP"], horizontal=True, key="prcp_target")
     # A fresh RCP selection should use its requested GPU; restore the CPU default

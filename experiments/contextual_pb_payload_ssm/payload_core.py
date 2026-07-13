@@ -215,7 +215,12 @@ def noise_decay_window(args) -> np.ndarray:
         flat_until = T - ramp
         window = np.ones(T, dtype=np.float32)
         idx = np.arange(flat_until, T, dtype=np.float32)
-        window[flat_until:] = 0.5 * (1.0 + np.cos(np.pi * (idx - flat_until) / ramp))
+        if ramp == 1:
+            window[-1] = 0.0
+        else:
+            window[flat_until:] = 0.5 * (
+                1.0 + np.cos(np.pi * (idx - flat_until) / (ramp - 1))
+            )
         return window
     raise ValueError(f"Unknown --noise_decay mode {mode!r}.")
 

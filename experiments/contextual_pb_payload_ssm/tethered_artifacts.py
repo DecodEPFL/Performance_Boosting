@@ -231,6 +231,56 @@ def render_training(run_dir: Path, specs, histories: dict) -> None:
     fig.savefig(run_dir / "tethered_training.png", dpi=175, bbox_inches="tight"); plt.close(fig)
 
 
+def render_disturbance_identity(args, run_dir: Path, batch, specs, metrics) -> None:
+    """Show that PB sees the same tapered transition noise in every context mode."""
+    candidates = [
+        mode for mode in ("route_context", "context", "contextual_ssm", "mad_context")
+        if mode in metrics
+    ]
+    if not candidates:
+        return
+    selected = candidates[:1]
+    if any(mode in metrics for mode in ("context", "contextual_ssm", "mad_context")):
+        contextual = _best_context_mode(metrics)
+        if contextual not in selected:
+            selected.append(contextual)
+
+    expected = np.zeros_like(metrics[selected[0]]["rollout"]["w_seq"].numpy())
+    expected[:, 1:] = batch.process_noise[:, :-1].numpy()
+    target_rms = np.sqrt(np.mean(expected ** 2, axis=(0, 2)))
+    time = np.arange(expected.shape[1]) * float(args.dt)
+    fig, (signal, error_ax) = plt.subplots(
+        1, 2, figsize=(11.2, 4.0), gridspec_kw={"width_ratios": [2.6, 1.0]})
+    signal.plot(time, target_rms, color=INK, lw=3.5, alpha=.24,
+                label="injected tapered noise")
+    errors = []
+    for order, mode in enumerate(selected):
+        reconstructed = metrics[mode]["rollout"]["w_seq"].numpy()
+        rms = np.sqrt(np.mean(reconstructed ** 2, axis=(0, 2)))
+        signal.plot(time, rms, color=COLORS[mode], lw=1.8,
+                    ls="-" if order else (0, (4, 2)), label=_label(specs, mode))
+        errors.append(float(np.max(np.abs(reconstructed - expected))))
+    signal.set(title=r"$w_t$ overlays the injected $\eta_{t-1}$",
+               xlabel="time [s]", ylabel="RMS state increment per step")
+    signal.grid(True, alpha=.8); signal.legend(frameon=False, fontsize=8)
+
+    rows = np.arange(len(selected))
+    error_ax.barh(rows, errors, color=[COLORS[mode] for mode in selected], height=.46)
+    for row, value in zip(rows, errors):
+        error_ax.text(value, row, f"  {value:.1e}", va="center", color=INK, fontsize=9)
+    error_ax.set_yticks(rows, [_label(specs, mode) for mode in selected])
+    error_ax.invert_yaxis()
+    error_ax.set(title="max identity error", xlabel=r"$\max|w_t-\eta_{t-1}|$",
+                 xlim=(0, max(2e-7, max(errors) * 1.55)))
+    error_ax.grid(axis="x", alpha=.8); error_ax.spines["left"].set_visible(False)
+    fig.suptitle("Matched nonlinear dynamics leave only decaying noise",
+                 x=.055, y=.99, ha="left", fontsize=16, weight="bold")
+    fig.tight_layout(rect=(0, 0, 1, .91))
+    fig.savefig(run_dir / "tethered_disturbance_identity.png", dpi=180,
+                bbox_inches="tight")
+    plt.close(fig)
+
+
 def _event_steps(args, rollout: dict, index: int) -> list[int]:
     x = rollout["x_seq"][index, :, 0].numpy(); xs = gate_geometry(args)[0]
     steps = [0]
@@ -292,6 +342,7 @@ def render_all(args, run_dir: Path, batch, specs, metrics, histories, interventi
     render_ambiguity(args, run_dir, batch, specs, metrics, reference, contextual)
     render_interventions(run_dir, specs, interventions)
     render_training(run_dir, specs, histories)
+    render_disturbance_identity(args, run_dir, batch, specs, metrics)
     render_storyboard(args, run_dir, batch, specs, metrics, index, reference, contextual)
     render_gif(args, run_dir, batch, specs, metrics, index, reference, contextual)
     manifest = {

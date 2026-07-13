@@ -52,6 +52,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--slalom_collision_margin", type=float, default=.012)
     p.add_argument("--slalom_tether_samples", type=int, default=5)
     p.add_argument("--slalom_physics_substeps", type=int, default=2)
+    p.add_argument("--slalom_carrier_cubic_stiffness", type=float, default=.075,
+                   help="Radial Duffing stiffness k3 in -k3 ||q||^2 q.")
+    p.add_argument("--slalom_carrier_quadratic_drag", type=float, default=.22,
+                   help="Quadratic aerodynamic drag coefficient in -c2 ||v|| v.")
+    p.add_argument("--slalom_carrier_gyro_gain", type=float, default=.55,
+                   help="Peak energy-neutral gyroscopic cross-coupling gain.")
+    p.add_argument("--slalom_carrier_gyro_position_scale", type=float, default=1.6,
+                   help="Position scale inside tanh(s qx qy) for gyroscopic coupling.")
+    p.add_argument("--slalom_carrier_actuator_scale", type=float, default=1.6,
+                   help="Smooth actuator saturation level a in a tanh(u/a).")
+    p.add_argument("--slalom_carrier_speed_loss", type=float, default=.22,
+                   help="Speed-dependent loss of actuator authority, 1/(1+alpha ||v||^2).")
     p.add_argument("--slalom_payload_mass_min", type=float, default=.65)
     p.add_argument("--slalom_payload_mass_max", type=float, default=1.40)
     p.add_argument("--slalom_test_mass_min", type=float, default=.50)
@@ -66,8 +78,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--slalom_tether_damping_max", type=float, default=.80)
     p.add_argument("--slalom_sway_speed_min", type=float, default=.28)
     p.add_argument("--slalom_sway_speed_max", type=float, default=.58)
-    p.add_argument("--slalom_payload_air_drag", type=float, default=.12)
-    p.add_argument("--slalom_tether_reaction", type=float, default=.35)
+    p.add_argument("--slalom_payload_air_drag", type=float, default=.12,
+                   help="Quadratic payload drag coefficient in -cd ||vp|| vp.")
+    p.add_argument("--slalom_tether_reaction", type=float, default=0.0,
+                   help="Explicit model-mismatch ablation. Keep 0 for the matched heavy-carrier benchmark where reconstructed w is exactly process noise.")
     p.add_argument("--slalom_tension_softness", type=float, default=8.0)
     p.add_argument("--slalom_tension_scale", type=float, default=4.0)
     p.add_argument("--slalom_max_tension", type=float, default=4.0)
@@ -142,7 +156,9 @@ def parse_args(argv: list[str] | None = None):
                     args.slalom_tether_length_min, args.slalom_tether_length_max,
                     args.slalom_test_tether_length_min, args.slalom_test_tether_length_max,
                     args.slalom_tether_stiffness_min, args.slalom_tether_stiffness_max,
-                    args.slalom_physics_substeps, args.slalom_tether_samples)
+                    args.slalom_physics_substeps, args.slalom_tether_samples,
+                    args.slalom_carrier_actuator_scale, args.slalom_tension_softness,
+                    args.pre_kp, args.pre_kd)
         if min(positive) <= 0:
             raise ValueError("Slalom mass, tether, physics-substep, and sample parameters must be positive.")
         ranges = (
@@ -156,6 +172,17 @@ def parse_args(argv: list[str] | None = None):
         )
         if any(lo < 0 or hi < lo for lo, hi in ranges):
             raise ValueError("Every slalom parameter range must be non-negative and ordered min <= max.")
+        nonnegative = (
+            args.slalom_carrier_cubic_stiffness,
+            args.slalom_carrier_quadratic_drag,
+            args.slalom_carrier_gyro_gain,
+            args.slalom_carrier_gyro_position_scale,
+            args.slalom_carrier_speed_loss,
+            args.slalom_payload_air_drag,
+            args.slalom_tether_reaction,
+        )
+        if min(nonnegative) < 0:
+            raise ValueError("Nonlinear carrier, payload drag, and tether reaction parameters must be non-negative.")
         if not (0 < args.slalom_curriculum_fraction <= 1):
             raise ValueError("slalom_curriculum_fraction must be in (0, 1].")
     return args
@@ -254,7 +281,7 @@ def main() -> None:
         if config_path.exists():
             saved = json.loads(config_path.read_text(encoding="utf-8"))
             args.task = saved.get(
-                "task", "tethered_slalom" if int(saved.get("experiment_schema_version", 0)) == 2 else "docking")
+                "task", "tethered_slalom" if int(saved.get("experiment_schema_version", 0)) >= 2 else "docking")
     if args.task == "tethered_slalom":
         from tethered_experiment import run
         run(args)

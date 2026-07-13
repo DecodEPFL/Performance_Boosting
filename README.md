@@ -233,6 +233,43 @@ the tether must all clear every gate, then the carrier must dock while the
 cargo settles into the trailing formation.
 The legacy pickup/drop docking task remains available with `--task docking`.
 
+The nominal model and the observed carrier subsystem of the true plant now use
+the same strongly nonlinear, pre-stabilised dynamics. With carrier position
+\(q\in\mathbb R^2\), velocity \(v\), command \(u\), and
+\(J[v_x,v_y]^\top=[-v_y,v_x]^\top\), the continuous-time model is
+
+\[
+\dot q=v,\qquad
+\dot v=-k_pq-k_3\lVert q\rVert^2q-k_dv-c_2\lVert v\rVert v
++\omega\tanh(sq_xq_y)Jv
++\frac{a\tanh(u/a)}{1+\alpha\lVert v\rVert^2}.
+\]
+
+The saturation is elementwise. The gyroscopic term is nonlinear but
+energy-neutral. For zero input,
+
+\[
+V(q,v)=\tfrac12\lVert v\rVert^2+\tfrac{k_p}{2}\lVert q\rVert^2
++\tfrac{k_3}{4}\lVert q\rVert^4,\qquad
+\dot V=-k_d\lVert v\rVert^2-c_2\lVert v\rVert^3\le0,
+\]
+
+so the carrier is pre-stabilised at the origin. The true plant additionally
+integrates a private cargo position and velocity with nonlinear tether geometry,
+unilateral spring-damper tension, and quadratic drag. Under the default
+heavy-carrier assumption (`--slalom_tether_reaction 0`), this private state does
+not perturb the carrier transition. After the shared semi-implicit discretisation,
+
+\[
+x_{k+1}=f_{\mathrm{nl}}(x_k,u_k)+\eta_k,\qquad
+w_0=0,\quad w_k=\eta_{k-1}\ (k\ge1).
+\]
+
+Thus \(w\) is exactly the configured tapered process noise and decays to zero;
+it contains no hidden-payload shortcut. Context shines because safe gate
+crossing and final settling depend on the unobserved nonlinear cargo state even
+when the carrier state, route, and reconstructed disturbance are aliased.
+
 Run it from the repository root:
 
 ```bash
@@ -250,7 +287,7 @@ and telemetry-intervention results:
 Each held-out run saves its exact test batch and includes route-only versus full
 context, an OOD mass-and-tether stress case, delayed/wrong/missing-telemetry
 interventions, a split-screen GIF, gate-clearance plots, an alias-pair figure,
-and an event storyboard. Results are under:
+a reconstructed-noise identity plot, and an event storyboard. Results are under:
 
 ```text
 experiments/contextual_pb_payload_ssm/runs/<run_id>/

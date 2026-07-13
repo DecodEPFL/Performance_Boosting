@@ -39,6 +39,77 @@ class SlalomRollout:
     tension_seq: torch.Tensor
 
 
+def nonlinear_carrier_acceleration(
+    args, position: torch.Tensor, velocity: torch.Tensor, control: torch.Tensor,
+) -> torch.Tensor:
+    """Energy-shaped nonlinear carrier acceleration shared by both models.
+
+    The unforced carrier is a damped radial Duffing oscillator with quadratic
+    drag.  The gyroscopic term rotates velocity by 90 degrees and therefore
+    does no work.  Actuation is smoothly saturated and loses authority with
+    speed, as it would for a voltage/current-limited mobile base.
+    """
+    position_sq = position.square().sum(-1, keepdim=True)
+    velocity_sq = velocity.square().sum(-1, keepdim=True)
+    speed = torch.linalg.vector_norm(velocity, dim=-1, keepdim=True)
+    rotated_velocity = torch.stack((-velocity[..., 1], velocity[..., 0]), dim=-1)
+    gyro_coefficient = float(args.slalom_carrier_gyro_gain) * torch.tanh(
+        float(args.slalom_carrier_gyro_position_scale)
+        * position[..., 0:1] * position[..., 1:2]
+    )
+    actuator_scale = float(args.slalom_carrier_actuator_scale)
+    effective_control = (
+        actuator_scale * torch.tanh(control / actuator_scale)
+        / (1.0 + float(args.slalom_carrier_speed_loss) * velocity_sq)
+    )
+    return (
+        -float(args.pre_kp) * position
+        -float(args.slalom_carrier_cubic_stiffness) * position_sq * position
+        -float(args.pre_kd) * velocity
+        -float(args.slalom_carrier_quadratic_drag) * speed * velocity
+        +gyro_coefficient * rotated_velocity
+        +effective_control
+    )
+
+
+def nonlinear_carrier_step(args, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """Semi-implicit discretisation used identically by nominal and true plants."""
+    state, control = as_bt(x), as_bt(u)
+    position, velocity = state[..., :2], state[..., 2:]
+    substeps = max(1, int(args.slalom_physics_substeps))
+    step = float(args.dt) / substeps
+    for _ in range(substeps):
+        acceleration = nonlinear_carrier_acceleration(args, position, velocity, control)
+        velocity = velocity + step * acceleration
+        position = position + step * velocity
+    return torch.cat([position, velocity], dim=-1)
+
+
+def nonlinear_carrier_energy(args, x: torch.Tensor) -> torch.Tensor:
+    """Unforced Lyapunov energy of the observed carrier subsystem."""
+    state = as_bt(x)
+    position, velocity = state[..., :2], state[..., 2:]
+    position_sq = position.square().sum(-1)
+    return (
+        0.5 * velocity.square().sum(-1)
+        +0.5 * float(args.pre_kp) * position_sq
+        +0.25 * float(args.slalom_carrier_cubic_stiffness) * position_sq.square()
+    )
+
+
+class NonlinearCarrierNominal:
+    """Strongly nonlinear, pre-stabilised four-state nominal model."""
+
+    def __init__(self, args) -> None:
+        self.args = args
+
+    def nominal_dynamics(
+        self, x: torch.Tensor, u: torch.Tensor, t: int | None = None,
+    ) -> torch.Tensor:
+        del t
+        return nonlinear_carrier_step(self.args, x, u)
+
+
 def parse_float_list(raw: str, name: str) -> list[float]:
     try:
         values = [float(token.strip()) for token in str(raw).split(",") if token.strip()]
@@ -150,7 +221,13 @@ def sample_slalom_batch(
 
 
 class TetheredPayloadPlant:
-    """4D observed carrier with a private differentiable 4D cargo state."""
+    """Matched nonlinear carrier with a private nonlinear 4D cargo state.
+
+    By default the carrier is treated as a much heavier powered base, so tether
+    reaction is negligible.  This makes its observed transition exactly match
+    :class:`NonlinearCarrierNominal`; ``slalom_tether_reaction`` is retained as
+    an explicit model-mismatch ablation.
+    """
 
     def __init__(self, args) -> None:
         self.args = args
@@ -178,22 +255,37 @@ class TetheredPayloadPlant:
             raise RuntimeError("Bind the slalom batch before rollout.")
         carrier_pos, carrier_vel = as_bt(x)[..., :2], as_bt(x)[..., 2:]
         u = as_bt(u)
-        step = float(self.args.dt) / max(1, int(self.args.slalom_physics_substeps))
+        substeps = max(1, int(self.args.slalom_physics_substeps))
+        step = float(self.args.dt) / substeps
         tension = torch.zeros_like(self.mass)
-        for _ in range(max(1, int(self.args.slalom_physics_substeps))):
+        for _ in range(substeps):
             relative = self.payload_pos - carrier_pos
-            distance = torch.sqrt(relative.square().sum(-1, keepdim=True) + 1e-9)
-            direction = relative / distance
+            distance = torch.linalg.vector_norm(relative, dim=-1, keepdim=True)
+            direction = relative / distance.clamp_min(1e-9)
             relative_vel = self.payload_vel - carrier_vel
             radial_speed = (relative_vel * direction).sum(-1, keepdim=True)
             raw_tension = self.stiffness * (distance - self.length) + self.damping * radial_speed
             beta = float(self.args.slalom_tension_softness)
-            tension = F.softplus(beta * raw_tension) / beta
-            force_on_payload = -tension * direction - float(self.args.slalom_payload_air_drag) * self.payload_vel
+            # Shifted softplus followed by a unilateral projection: smooth for
+            # positive extension and exactly zero at/rest inside tether length.
+            tension = torch.clamp_min(
+                F.softplus(beta * raw_tension) / beta - float(np.log(2.0)) / beta,
+                0.0,
+            )
+            payload_speed = torch.linalg.vector_norm(
+                self.payload_vel, dim=-1, keepdim=True)
+            force_on_payload = (
+                -tension * direction
+                -float(self.args.slalom_payload_air_drag)
+                * payload_speed * self.payload_vel
+            )
             payload_acc = force_on_payload / self.mass
-            carrier_acc = (-float(self.args.pre_kp) * carrier_pos
-                           - float(self.args.pre_kd) * carrier_vel + u
-                           + float(self.args.slalom_tether_reaction) * tension * direction)
+            carrier_acc = nonlinear_carrier_acceleration(
+                self.args, carrier_pos, carrier_vel, u)
+            carrier_acc = (
+                carrier_acc
+                +float(self.args.slalom_tether_reaction) * tension * direction
+            )
             carrier_vel = carrier_vel + step * carrier_acc
             self.payload_vel = self.payload_vel + step * payload_acc
             carrier_pos = carrier_pos + step * carrier_vel
@@ -279,6 +371,7 @@ def build_slalom_controller(device: torch.device, args, mode: str):
         device, args, mad=(mode == "mad_context"),
         contextual=(mode == "contextual_ssm"),
     )
+    controller.plant = NonlinearCarrierNominal(args)
     return controller, TetheredPayloadPlant(args)
 
 
@@ -292,8 +385,9 @@ def rollout_slalom(
     x = torch.cat([batch.start.to(device), torch.zeros(batch.start.shape[0], 2, device=device)], -1).unsqueeze(1)
     x_log, u_log, w_log, payload_log, payload_vel_log, tension_log = [], [], [], [], [], []
     if controller is not None:
-        w0 = torch.clamp(x, -float(args.w0_clip), float(args.w0_clip)) if args.use_w0_clip else x
-        controller.reset(x, w0=w0)
+        # The slalom disturbance is transition noise, not an initial-condition
+        # encoding.  With the matched model, w_0=0 and w_t=eta_{t-1} exactly.
+        controller.reset(x, w0=torch.zeros_like(x))
     for t in range(int(args.horizon)):
         if controller is None:
             u = torch.zeros(x.shape[0], 1, 2, device=device)
