@@ -88,9 +88,27 @@ def _comparison_modes(metrics: dict) -> list[str]:
 
 def _best_context_mode(metrics: dict) -> str:
     candidates = [mode for mode in ("contextual_ssm", "context", "mad_context") if mode in metrics]
+    if not candidates:
+        candidates = _comparison_modes(metrics)
+    if not candidates:
+        raise ValueError("Cannot render an experiment with no evaluated controller variants.")
     return max(candidates, key=lambda mode: (metrics[mode]["success_rate"],
                                              metrics[mode]["gate_success_rate"],
                                              metrics[mode]["avg_min_clearance"]))
+
+
+def _comparison_pair(metrics: dict) -> tuple[str, str]:
+    """Choose a robust reference/context pair for any UI variant subset."""
+    contextual = _best_context_mode(metrics)
+    ordered_references = [
+        "route_context", "disturbance_only", "nominal", *_comparison_modes(metrics),
+    ]
+    reference = next(
+        (mode for mode in ordered_references
+         if mode in metrics and mode != contextual),
+        contextual,
+    )
+    return reference, contextual
 
 
 def _scenario(metrics: dict, reference: str, contextual: str) -> int:
@@ -107,8 +125,7 @@ def _scenario(metrics: dict, reference: str, contextual: str) -> int:
 
 
 def render_hero(args, run_dir: Path, batch, specs, metrics) -> tuple[int, str, str]:
-    contextual = _best_context_mode(metrics)
-    reference = "route_context" if "route_context" in metrics else "disturbance_only"
+    reference, contextual = _comparison_pair(metrics)
     index = _scenario(metrics, reference, contextual)
     modes = [mode for mode in ("disturbance_only", reference, contextual) if mode in metrics]
     modes = list(dict.fromkeys(modes))

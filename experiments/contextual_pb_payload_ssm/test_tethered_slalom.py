@@ -15,6 +15,7 @@ for path in (ROOT, EXP):
 
 from Moving_payload_exp import parse_args
 from payload_core import CONTEXT_FEATURE_ORDER, PAYLOAD_CONTEXT_FEATURES
+from tethered_artifacts import _comparison_pair
 from tethered_experiment import hard_gate_metrics
 from tethered_payload import (NonlinearCarrierNominal, SlalomRollout,
                               TetheredPayloadPlant,
@@ -76,6 +77,28 @@ class TetheredSlalomTest(unittest.TestCase):
                          sum(p.numel() for p in full.parameters()))
         self.assertEqual({key: tuple(value.shape) for key, value in route.state_dict().items()},
                          {key: tuple(value.shape) for key, value in full.state_dict().items()})
+
+    def test_artifact_comparison_accepts_any_variant_subset(self) -> None:
+        def result(score: float) -> dict:
+            return {
+                "success_rate": score,
+                "gate_success_rate": score,
+                "avg_min_clearance": score,
+            }
+
+        self.assertEqual(
+            _comparison_pair({"nominal": result(0.0), "context": result(1.0)}),
+            ("nominal", "context"),
+        )
+        self.assertEqual(
+            _comparison_pair({"mad_context": result(0.2),
+                              "contextual_ssm": result(0.8)}),
+            ("mad_context", "contextual_ssm"),
+        )
+        self.assertEqual(
+            _comparison_pair({"context": result(1.0)}),
+            ("context", "context"),
+        )
 
     def test_private_plant_rollout_is_deterministic_and_shape_safe(self) -> None:
         args = self.args(20); batch = sample_slalom_batch(
