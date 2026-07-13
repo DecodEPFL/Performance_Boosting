@@ -99,8 +99,10 @@ def _scenario(metrics: dict, reference: str, contextual: str) -> int:
     contrast = np.flatnonzero(ctx_success & ~ref_success)
     if len(contrast):
         return int(contrast[0])
-    ref_clear = ref["gate_clearance"].amin((1, 2)).numpy()
-    ctx_clear = ctx["gate_clearance"].amin((1, 2)).numpy()
+    ref_clearance = ref["gate_clearance"]
+    ctx_clearance = ctx["gate_clearance"]
+    ref_clear = ref_clearance.reshape(ref_clearance.shape[0], -1).amin(1).numpy()
+    ctx_clear = ctx_clearance.reshape(ctx_clearance.shape[0], -1).amin(1).numpy()
     return int(np.argmax(ctx_clear - ref_clear))
 
 

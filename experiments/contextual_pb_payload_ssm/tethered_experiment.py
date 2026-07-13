@@ -96,8 +96,10 @@ def hard_gate_metrics(args, batch: SlalomBatch, rollout: SlalomRollout) -> dict[
     safe = clearance >= 0.0
     carrier_safe = safe[..., 0].all(1)
     payload_safe = safe[..., -1].all(1)
-    tether_safe = safe[..., 1:-1].all((1, 2)) if sample_count > 2 else torch.ones_like(carrier_safe)
-    gate_safe = safe.all((1, 2))
+    # Older RCP PyTorch builds do not accept tuple dimensions in Tensor.all.
+    tether_safe = (safe[..., 1:-1].reshape(batch_size, -1).all(1)
+                   if sample_count > 2 else torch.ones_like(carrier_safe))
+    gate_safe = safe.reshape(batch_size, -1).all(1)
     return {
         "clearance": clearance, "safe": safe, "carrier_safe": carrier_safe,
         "payload_safe": payload_safe, "tether_safe": tether_safe,
@@ -177,7 +179,7 @@ def evaluate(args, batch: SlalomBatch, device: torch.device, mode: str,
             "goal_success_rate": _float(goal_ok.float().mean()),
             "settled_success_rate": _float(settled.float().mean()),
             "payload_collision_rate": _float((~hard["payload_safe"]).float().mean()),
-            "avg_min_clearance": _float(clearance.amin((1, 2)).mean()),
+            "avg_min_clearance": _float(clearance.reshape(clearance.shape[0], -1).amin(1).mean()),
             "avg_min_payload_clearance": _float(clearance[..., -1].amin(1).mean()),
             "avg_terminal_dist": _float(goal_dist.mean()),
             "avg_terminal_swing": _float(lateral_swing.mean()),
