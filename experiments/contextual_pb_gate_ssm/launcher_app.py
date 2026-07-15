@@ -99,7 +99,8 @@ GROUPS = [
         "horizon", "plot_horizon", "use_plot_horizon", "dt", "pre_kp", "pre_kd", "drag_coeff",
         "wall_x", "gate_half_width", "gate_amplitude", "goal_tol", "corridor_limit",
         "wall_focus_sigma", "gate_settle_steps"}, False),
-    ("Nonlinear robot dynamics", lambda d: d.startswith("nonlinear_"), False),
+    ("Nonlinear robot package (active only when toggle is ON)",
+     lambda d: d.startswith("nonlinear_"), False),
     ("Gate schedule / motion", lambda d: d.startswith("gate_dwell") or d in {
         "gate_corr_time", "gate_range", "gate_center_range", "freeze_per_episode"}, False),
     ("Disturbance process", lambda d: d.startswith("noise_") or d.startswith("gust_"), False),
@@ -250,15 +251,23 @@ CONTINUOUS_ONLY_DESTS = {
     "gate_corr_time", "gate_range", "gate_center_range", "gate_margin_train",
     "robot_model",
 }
+# These parameters belong exclusively to the untouched four-state legacy
+# plant.  The rigid-body model has its own explicitly prefixed gains.
+LEGACY_MODEL_DESTS = {"pre_kp", "pre_kd", "drag_coeff"}
 
 
 @st.cache_resource(show_spinner=False)
 def get_context_meta():
-    """(order, meta, fair_default) for context features, from the experiment module."""
+    """Context metadata and mode-specific defaults from the experiment module."""
     if str(EXP_DIR) not in sys.path:
         sys.path.insert(0, str(EXP_DIR))
     import Moving_gate_exp as M
-    return list(M.CONTEXT_FEATURE_ORDER), dict(M.CONTEXT_FEATURE_META), list(M.FAIR_CONTEXT_DEFAULT)
+    return (
+        list(M.CONTEXT_FEATURE_ORDER),
+        dict(M.CONTEXT_FEATURE_META),
+        list(M.FAIR_CONTEXT_DEFAULT),
+        list(getattr(M, "NONLINEAR_CONTEXT_DEFAULT", M.FAIR_CONTEXT_DEFAULT)),
+    )
 
 
 def param_applies(dest: str, exp_key: str) -> bool:
@@ -268,6 +277,15 @@ def param_applies(dest: str, exp_key: str) -> bool:
         return exp_key == "continuous"
     if dest.startswith("nonlinear_"):
         return exp_key == "continuous"
+    return True
+
+
+def model_param_applies(dest: str, nonlinear_enabled: bool) -> bool:
+    """Whether one parser option belongs to the selected robot-model package."""
+    if dest.startswith("nonlinear_"):
+        return nonlinear_enabled
+    if dest in LEGACY_MODEL_DESTS:
+        return not nonlinear_enabled
     return True
 
 
@@ -304,7 +322,47 @@ WIDGET_LABELS = {
     "use_comparison_storyboard": "Comparison storyboard (journal)",
     "use_unified_comparison": "Unified architecture comparison (journal)",
     "use_animations": "Rollout GIF animations",
-    "robot_model": "Use highly nonlinear robot model",
+    "robot_model": "Nonlinear robot package",
+    "nonlinear_mass": "Mass",
+    "nonlinear_pre_kp": "Translation restoring gain",
+    "nonlinear_pre_kd": "Translation pre-stabilizer damping",
+    "nonlinear_inertia": "Yaw moment of inertia",
+    "nonlinear_body_length": "Rigid-body length",
+    "nonlinear_body_width": "Rigid-body width",
+    "nonlinear_yaw_pre_kp": "Yaw restoring gain",
+    "nonlinear_yaw_pre_kd": "Yaw pre-stabilizer damping",
+    "nonlinear_cubic_stiffness": "Translation cubic stiffness",
+    "nonlinear_yaw_cubic_stiffness": "Yaw nonlinear stiffness",
+    "nonlinear_longitudinal_drag": "Longitudinal linear resistance",
+    "nonlinear_lateral_drag": "Lateral linear resistance",
+    "nonlinear_quadratic_drag": "Longitudinal quadratic drag",
+    "nonlinear_lateral_quadratic_drag": "Lateral quadratic resistance",
+    "nonlinear_coulomb_friction": "Rolling / Coulomb friction",
+    "nonlinear_friction_velocity": "Friction smoothing velocity",
+    "nonlinear_angular_drag": "Angular linear resistance",
+    "nonlinear_angular_quadratic_drag": "Angular quadratic resistance",
+    "nonlinear_angular_coulomb_friction": "Angular Coulomb friction",
+    "nonlinear_angular_friction_velocity": "Angular-friction smoothing rate",
+    "nonlinear_actuator_limit": "Longitudinal force limit",
+    "nonlinear_lateral_force_limit": "Lateral force limit",
+    "nonlinear_torque_limit": "Yaw torque limit",
+    "nonlinear_actuator_deadzone": "Force-command dead zone",
+    "nonlinear_torque_deadzone": "Torque-command dead zone",
+    "nonlinear_speed_loss": "High-speed authority loss",
+    "nonlinear_lateral_slip": "Combined-slip traction loss",
+    "nonlinear_traction_velocity": "Traction velocity scale",
+    "nonlinear_load_transfer": "Yaw/slip load-transfer coupling",
+    "nonlinear_tire_saturation": "Tire saturation strength",
+    "nonlinear_actuator_offset_x": "Lateral-force application offset",
+    "nonlinear_yaw_goal_weight": "Yaw goal-loss weight",
+    "nonlinear_goal_yaw_tol": "Yaw success tolerance (rad)",
+    "nonlinear_goal_speed_tol": "Terminal speed success tolerance",
+    "nonlinear_goal_yaw_rate_tol": "Terminal yaw-rate success tolerance",
+    "nonlinear_velocity_scale": "Velocity loss-normalization scale",
+    "nonlinear_yaw_rate_scale": "Yaw-rate loss-normalization scale",
+    "nonlinear_physics_substeps": "Physics substeps per control step",
+    "nonlinear_noise_yaw_sigma": "Yaw process-noise std",
+    "nonlinear_noise_yaw_rate_sigma": "Yaw-rate process-noise std",
 }
 
 
@@ -319,7 +377,10 @@ def render_widget(dest, bools, values, override=_NO_OVERRIDE):
     ``override`` (when not ``_NO_OVERRIDE``) replaces the parser default as the
     widget's initial value — used to apply user-saved launcher defaults.
     """
-    has_ovr = override is not _NO_OVERRIDE
+    # Older saved launcher defaults may contain ``None`` for fields that were
+    # hidden when they were saved. Treat those as absent instead of attempting
+    # ``int(None)`` or displaying a literal "None" when a mode is revealed.
+    has_ovr = override is not _NO_OVERRIDE and override is not None
     label = WIDGET_LABELS.get(dest, dest)
     if dest in bools:
         e = bools[dest]
@@ -329,15 +390,25 @@ def render_widget(dest, bools, values, override=_NO_OVERRIDE):
     default, tname, choices, helptext = e["default"], e["type"], e["choices"], e["help"]
     if dest == "robot_model":
         current = override if has_ovr else default
-        return st.checkbox(
+        enabled = st.toggle(
             label,
             value=robot_model_is_nonlinear(current),
             help=(
-                "Checked: strongly nonlinear pre-stabilized robot. "
-                "Unchecked: original legacy double integrator. " + helptext
+                "ON: six-state rigid-body dynamics, three-axis body wrench, "
+                "oriented-body losses/collisions/metrics, physical rendering, "
+                "and rigid-body context. OFF: the original four-state legacy "
+                "point-mass model, bit-for-bit. " + helptext
             ),
             key=f"w_{dest}",
         )
+        # Widgets inside a Streamlit form update client-side without rerunning
+        # the script, so this legend must be state-independent to never display
+        # a stale mode while the user flips the switch.
+        st.caption(
+            "OFF — original legacy model (bit-for-bit)  ·  "
+            "ON — complete nonlinear rigid-body package"
+        )
+        return enabled
     if dest == "device" and not choices:
         choices = DEVICE_CHOICES
     if choices:
@@ -347,28 +418,38 @@ def render_widget(dest, bools, values, override=_NO_OVERRIDE):
     if tname == "int":
         if default is None:
             val = str(override) if (has_ovr and override not in (None, "")) else ""
-            return st.text_input(f"{dest} (blank = auto)", value=val, help=helptext, key=f"w_{dest}")
+            return st.text_input(f"{label} (blank = auto)", value=val, help=helptext, key=f"w_{dest}")
         val = int(override) if has_ovr else int(default)
-        return st.number_input(dest, value=val, step=1, help=helptext, key=f"w_{dest}")
+        return st.number_input(label, value=val, step=1, help=helptext, key=f"w_{dest}")
     if tname == "float":
         if default is None:
             val = str(override) if (has_ovr and override not in (None, "", "None")) else ""
-            return st.text_input(f"{dest} (blank = auto)", value=val, help=helptext, key=f"w_{dest}")
+            return st.text_input(f"{label} (blank = auto)", value=val, help=helptext, key=f"w_{dest}")
         # text input preserves scientific notation / exact small values
         val = str(override) if has_ovr else str(default)
-        return st.text_input(dest, value=val, help=helptext, key=f"w_{dest}")
+        return st.text_input(label, value=val, help=helptext, key=f"w_{dest}")
     val = str(override) if has_ovr else ("" if default is None else str(default))
-    return st.text_input(dest, value=val, help=helptext, key=f"w_{dest}")
+    return st.text_input(label, value=val, help=helptext, key=f"w_{dest}")
 
 
 def build_argv(order, bools, values, widget_vals, run_id):
     """Turn widget values into a minimal argv (only non-default flags)."""
     argv: list[str] = ["--no_show_plots", "--run_id", run_id]
     warnings: list[str] = []
+    nonlinear_enabled = robot_model_is_nonlinear(
+        widget_vals.get("robot_model", values.get("robot_model", {}).get("default", "legacy"))
+    )
     for dest in order:
         if dest == "run_id":
             continue
-        v = widget_vals[dest]
+        if dest.startswith("nonlinear_") and not nonlinear_enabled:
+            # Keep legacy launch commands—and therefore legacy behavior—free
+            # from every parameter belonging to the opt-in nonlinear package.
+            continue
+        if nonlinear_enabled and dest in LEGACY_MODEL_DESTS:
+            # Avoid mixing the legacy point-mass gains into a rigid-body launch.
+            continue
+        v = widget_vals.get(dest)
         if dest == "robot_model":
             v = "nonlinear" if robot_model_is_nonlinear(v) else "legacy"
         if dest in bools:
@@ -678,12 +759,55 @@ def main():
                      "the controller must infer the motion from history.",
             )
             exp_key = EXPERIMENTS[exp_label]
-            ctx_order, ctx_meta, fair_default = get_context_meta()
+            if exp_key == "continuous":
+                saved_model = param_overrides.get(
+                    "robot_model", values["robot_model"]["default"],
+                )
+                nonlinear_ui = st.toggle(
+                    "Nonlinear robot package",
+                    value=robot_model_is_nonlinear(saved_model),
+                    key="w_robot_model",
+                    help=(
+                        "ON: six-state rigid-body dynamics, three-axis body wrench, "
+                        "oriented finite-body collisions/losses/metrics/rendering, and "
+                        "rigid-body context. OFF: original four-state legacy model."
+                    ),
+                )
+                st.caption(
+                    "OFF — original legacy model (bit-for-bit)  ·  "
+                    "ON — complete nonlinear rigid-body package"
+                )
+            else:
+                nonlinear_ui = False
+            # Context choices are model-scoped. Defaults saved before the
+            # rigid-body toggle existed implicitly belong to legacy; when the
+            # model changes, start from that model's complete built-in context
+            # instead of leaking stale velocity/yaw choices across ABIs.
+            saved_context_is_nonlinear = robot_model_is_nonlinear(
+                param_overrides.get("robot_model", "legacy")
+            )
+            active_ctx_overrides = (
+                ctx_overrides
+                if saved_context_is_nonlinear == nonlinear_ui
+                else {}
+            )
+            context_scope = f"{exp_key}_{'nonlinear' if nonlinear_ui else 'legacy'}"
+
+            def ctx_widget_key(feature: str) -> str:
+                return f"ctx_{context_scope}_{feature}"
+
+            ctx_order, ctx_meta, fair_default, nonlinear_context_default = get_context_meta()
             ctx_feats = [k for k in ctx_order if exp_key in ctx_meta[k][2]]
+            rigid_context = {"heading_sin", "heading_cos", "yaw_rate"}
+            if not nonlinear_ui:
+                ctx_feats = [k for k in ctx_feats if k not in rigid_context]
 
             def _ctx_default(feature: str) -> bool:
                 if exp_key == "continuous":
-                    return feature in fair_default
+                    defaults = (
+                        nonlinear_context_default if nonlinear_ui else fair_default
+                    )
+                    return feature in defaults
                 return feature in ("gate_error", "approach", "switch_age")  # legacy minimal
 
             # Run mode + ablation controls live OUTSIDE the form so toggling them
@@ -712,7 +836,7 @@ def main():
                 if abl_type == "Custom sets":
                     abl_n_sets = st.slider("How many sets to compare", 2, 6, 3, key="abl_n_sets")
 
-            assigned: set[str] = set()
+            assigned: set[str] = {"robot_model"} if exp_key == "continuous" else set()
             with st.form("launch_form", border=False):
                 if is_ablation:
                     st.markdown("#### ① Architecture to ablate")
@@ -783,15 +907,15 @@ def main():
                     for k in fair_keys:
                         xc1.checkbox(
                             ctx_meta[k][1],
-                            value=bool(ctx_overrides.get(k, _ctx_default(k))),
-                            key=f"ctx_{k}",
+                            value=bool(active_ctx_overrides.get(k, _ctx_default(k))),
+                            key=ctx_widget_key(k),
                         )
                     xc2.markdown("**Privileged** — schedule / noncausal ⚠️ cheating")
                     for k in priv_keys:
                         xc2.checkbox(
                             "⚠️ " + ctx_meta[k][1],
-                            value=bool(ctx_overrides.get(k, _ctx_default(k))),
-                            key=f"ctx_{k}",
+                            value=bool(active_ctx_overrides.get(k, _ctx_default(k))),
+                            key=ctx_widget_key(k),
                         )
                     st.divider()
 
@@ -801,8 +925,11 @@ def main():
                 for col, half in ((c1, halves[0]), (c2, halves[1])):
                     with col:
                         for title, pred, expanded in half:
+                            if title.startswith("Nonlinear robot package") and not nonlinear_ui:
+                                continue
                             members = [d for d in order if d not in assigned
-                                       and pred(d) and param_applies(d, exp_key)]
+                                       and pred(d) and param_applies(d, exp_key)
+                                       and model_param_applies(d, nonlinear_ui)]
                             if not members:
                                 continue
                             assigned.update(members)
@@ -811,7 +938,8 @@ def main():
                                     render_widget(d, bools, values,
                                                   param_overrides.get(d, _NO_OVERRIDE))
                 leftover = [d for d in order if d not in assigned
-                            and param_applies(d, exp_key)]
+                            and param_applies(d, exp_key)
+                            and model_param_applies(d, nonlinear_ui)]
                 if leftover:
                     with c2:
                         with st.expander("Other", expanded=False):
@@ -825,14 +953,21 @@ def main():
                 save_clicked = _bc2.form_submit_button(
                     "💾 Save current values as defaults", width="stretch")
 
-            active_order = [d for d in order if param_applies(d, exp_key)]
+            active_order = [
+                d for d in order
+                if param_applies(d, exp_key)
+                and model_param_applies(d, nonlinear_ui)
+            ]
 
             if save_clicked:
                 params = {d: st.session_state.get(f"w_{d}")
                           for d in active_order if d != "run_id"}
                 variants = {k: bool(st.session_state.get(f"var_{k}"))
                             for k, _ in get_variant_options()}
-                context = {k: bool(st.session_state.get(f"ctx_{k}")) for k in ctx_feats}
+                context = {
+                    k: bool(st.session_state.get(ctx_widget_key(k)))
+                    for k in ctx_feats
+                }
                 save_ui_defaults(params, variants, context=context, experiment=exp_label,
                                  rcp=rcp_values())
                 st.success(
@@ -851,6 +986,11 @@ def main():
                         st.session_state.pop(f"var_{_k}", None)
                     for _k in ctx_order:
                         st.session_state.pop(f"ctx_{_k}", None)
+                        for _scope in (
+                            "switch_legacy", "continuous_legacy",
+                            "continuous_nonlinear",
+                        ):
+                            st.session_state.pop(f"ctx_{_scope}_{_k}", None)
                     st.session_state.pop("experiment_radio", None)
                     st.toast("Reset to built-in defaults.")
                     _rerun()
@@ -934,7 +1074,11 @@ def main():
                         else:
                             configs_str = ";".join(f"{lab}:{','.join(fs)}" for lab, fs in cfgs)
                     else:
-                        base = [k for k in ctx_order if k in ctx_feats and st.session_state.get(f"ctx_{k}")]
+                        base = [
+                            k for k in ctx_order
+                            if k in ctx_feats
+                            and st.session_state.get(ctx_widget_key(k))
+                        ]
                         if not base:
                             err = "Tick ≥1 context feature in ② to define the base set."
                         elif abl_type == "Leave-one-out" and len(base) < 2:
@@ -967,7 +1111,10 @@ def main():
                 elif is_layers:
                     _arch_label = st.session_state.get("abl_arch_label")
                     arch = next((k for k, lab in abl_arch_opts if lab == _arch_label), "context")
-                    ctx_selected = [k for k in ctx_feats if st.session_state.get(f"ctx_{k}")]
+                    ctx_selected = [
+                        k for k in ctx_feats
+                        if st.session_state.get(ctx_widget_key(k))
+                    ]
                     layers_str = (st.session_state.get("layers_list") or "").strip()
                     layer_values: list[int] = []
                     layer_err = None
@@ -1018,7 +1165,10 @@ def main():
                             fanout_items=fanout_items)
                 else:
                     selected = [k for k, _ in get_variant_options() if st.session_state.get(f"var_{k}")]
-                    ctx_selected = [k for k in ctx_feats if st.session_state.get(f"ctx_{k}")]
+                    ctx_selected = [
+                        k for k in ctx_feats
+                        if st.session_state.get(ctx_widget_key(k))
+                    ]
                     fanout = (execution_target == "EPFL RCP"
                               and bool(st.session_state.get("rcp_fanout"))
                               and len(selected) >= 2)

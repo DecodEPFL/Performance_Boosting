@@ -13,13 +13,15 @@ recovers the original linear model exactly. Nominal and true dynamics share the
 same integrator, so when both use the same ``drag_coeff`` the PB disturbance
 reconstruction ``w = x⁺_true − f_nom(x, u)`` stays clean (process noise only).
 
-The module also provides a strongly nonlinear robot model with a radial
-Duffing restoring force, viscous/quadratic/Coulomb friction, gyroscopic
-cross-axis coupling, a smooth actuator dead-zone and saturation, speed-related
-authority loss, and lateral traction loss.  Its restoring and dissipative
-terms keep the unforced origin pre-stabilized by construction.  Nominal and
-true wrappers share one transition function so PB disturbance reconstruction
-continues to contain only externally injected process noise.
+The module also provides a six-state planar rigid-body robot.  Its state is
+``(p_x, p_y, yaw, v_x, v_y, yaw_rate)`` and its input is a body-frame wrench
+``(force_longitudinal, force_lateral, torque)``.  It includes translational and
+rotational inertia, an oriented anisotropic resistance model, combined-slip
+traction loss, coupled force/torque saturation, actuator dead-zones, and a
+force application offset.  Conservative restoring terms and strictly
+dissipative passive terms pre-stabilize the unforced origin.  Nominal and true
+wrappers share the exact same transition function so PB disturbance
+reconstruction continues to contain only externally injected process noise.
 """
 
 from __future__ import annotations
@@ -110,29 +112,53 @@ class DoubleIntegratorTrue:
 
 @dataclass(frozen=True)
 class NonlinearRobotConfig:
-    """Physical parameters for the strongly nonlinear navigation robot.
+    """Physical parameters for the nonlinear planar rigid body.
 
-    The state remains ``(p_x, p_y, v_x, v_y)`` and the command remains a 2D
-    force/acceleration request, so existing controllers and checkpoints keep
-    their dimensions.  The defaults deliberately make every nonlinear effect
-    visible without making the standard gate arena numerically stiff.
+    The state is ``(p_x, p_y, yaw, v_x, v_y, yaw_rate)``.  Translational
+    velocity is expressed in the inertial/world frame; the three control
+    channels are longitudinal force, lateral force, and yaw torque expressed
+    in the body frame.  Actuators are memoryless: no hidden lag or previous
+    command is required by the transition.
+
+    The physical footprint is the oriented rectangle defined by
+    ``body_length`` and ``body_width``.  The defaults expose the nonlinear
+    effects while remaining well behaved in the gate experiment's normal
+    operating envelope.
     """
 
     dt: float = 0.05
     pre_kp: float = 0.32
-    pre_kd: float = 0.80
+    pre_kd: float = 0.35
+    yaw_pre_kp: float = 0.22
+    yaw_pre_kd: float = 0.16
     mass: float = 1.0
+    inertia: float = 0.012
+    body_length: float = 0.16
+    body_width: float = 0.10
     cubic_stiffness: float = 0.10
-    quadratic_drag: float = 0.35
-    coulomb_friction: float = 0.06
+    yaw_cubic_stiffness: float = 0.06
+    longitudinal_drag: float = 0.15
+    lateral_drag: float = 0.85
+    quadratic_drag: float = 0.28
+    lateral_quadratic_drag: float = 0.55
+    coulomb_friction: float = 0.05
     friction_velocity: float = 0.12
-    gyro_gain: float = 0.18
-    gyro_position_scale: float = 1.0
+    angular_drag: float = 0.05
+    angular_quadratic_drag: float = 0.025
+    angular_coulomb_friction: float = 0.012
+    angular_friction_velocity: float = 0.18
     actuator_limit: float = 2.5
+    lateral_force_limit: float = 1.7
+    torque_limit: float = 0.18
     actuator_deadzone: float = 0.06
-    speed_loss: float = 0.20
-    lateral_slip: float = 0.30
-    physics_substeps: int = 2
+    torque_deadzone: float = 0.008
+    speed_loss: float = 0.12
+    lateral_slip: float = 0.35
+    traction_velocity: float = 0.35
+    load_transfer: float = 0.12
+    tire_saturation: float = 0.25
+    actuator_offset_x: float = 0.025
+    physics_substeps: int = 4
 
     def __post_init__(self) -> None:
         scalar_parameters = {
@@ -153,8 +179,15 @@ class NonlinearRobotConfig:
         strictly_positive = {
             "dt": self.dt,
             "mass": self.mass,
+            "inertia": self.inertia,
+            "body_length": self.body_length,
+            "body_width": self.body_width,
             "friction_velocity": self.friction_velocity,
+            "angular_friction_velocity": self.angular_friction_velocity,
             "actuator_limit": self.actuator_limit,
+            "lateral_force_limit": self.lateral_force_limit,
+            "torque_limit": self.torque_limit,
+            "traction_velocity": self.traction_velocity,
         }
         for name, value in strictly_positive.items():
             if float(value) <= 0.0:
@@ -163,14 +196,24 @@ class NonlinearRobotConfig:
         nonnegative = {
             "pre_kp": self.pre_kp,
             "pre_kd": self.pre_kd,
+            "yaw_pre_kp": self.yaw_pre_kp,
+            "yaw_pre_kd": self.yaw_pre_kd,
             "cubic_stiffness": self.cubic_stiffness,
+            "yaw_cubic_stiffness": self.yaw_cubic_stiffness,
+            "longitudinal_drag": self.longitudinal_drag,
+            "lateral_drag": self.lateral_drag,
             "quadratic_drag": self.quadratic_drag,
+            "lateral_quadratic_drag": self.lateral_quadratic_drag,
             "coulomb_friction": self.coulomb_friction,
-            "gyro_gain": self.gyro_gain,
-            "gyro_position_scale": self.gyro_position_scale,
+            "angular_drag": self.angular_drag,
+            "angular_quadratic_drag": self.angular_quadratic_drag,
+            "angular_coulomb_friction": self.angular_coulomb_friction,
             "actuator_deadzone": self.actuator_deadzone,
+            "torque_deadzone": self.torque_deadzone,
             "speed_loss": self.speed_loss,
             "lateral_slip": self.lateral_slip,
+            "load_transfer": self.load_transfer,
+            "tire_saturation": self.tire_saturation,
         }
         for name, value in nonnegative.items():
             if float(value) < 0.0:
@@ -178,116 +221,291 @@ class NonlinearRobotConfig:
         if float(self.pre_kp) == 0.0 and float(self.cubic_stiffness) == 0.0:
             raise ValueError("The nonlinear robot needs a positive restoring term.")
         if (
-            float(self.pre_kd) == 0.0
+            float(self.yaw_pre_kp) == 0.0
+            and float(self.yaw_cubic_stiffness) == 0.0
+        ):
+            raise ValueError("The nonlinear robot needs a positive yaw restoring term.")
+        if (
+            float(self.pre_kd) + float(self.longitudinal_drag) == 0.0
             and float(self.quadratic_drag) == 0.0
             and float(self.coulomb_friction) == 0.0
         ):
-            raise ValueError("The nonlinear robot needs a positive dissipative term.")
+            raise ValueError(
+                "The nonlinear robot needs longitudinal dissipation."
+            )
+        if (
+            float(self.pre_kd) + float(self.lateral_drag) == 0.0
+            and float(self.lateral_quadratic_drag) == 0.0
+            and float(self.coulomb_friction) == 0.0
+        ):
+            raise ValueError("The nonlinear robot needs lateral dissipation.")
+        if (
+            float(self.yaw_pre_kd) + float(self.angular_drag) == 0.0
+            and float(self.angular_quadratic_drag) == 0.0
+            and float(self.angular_coulomb_friction) == 0.0
+        ):
+            raise ValueError("The nonlinear robot needs angular dissipation.")
+        if float(self.actuator_deadzone) >= min(
+            float(self.actuator_limit), float(self.lateral_force_limit)
+        ):
+            raise ValueError(
+                "actuator_deadzone must be smaller than both force limits."
+            )
+        if float(self.torque_deadzone) >= float(self.torque_limit):
+            raise ValueError("torque_deadzone must be smaller than torque_limit.")
         if int(substeps) < 1:
             raise ValueError(
                 f"physics_substeps must be at least one, got {self.physics_substeps}."
             )
 
-        # The continuous energy argument is not enough if a user makes the
-        # semi-implicit step arbitrarily stiff.  Linearizing at the origin gives
-        # damping kd + coulomb/friction_velocity and stiffness kp.  The Jury
-        # condition below keeps that discrete 2x2 position/velocity map Schur
-        # stable (or inside its nonlinear-damping boundary cases).
+        # The continuous energy argument is not sufficient if a user makes a
+        # semi-implicit substep arbitrarily stiff.  The Jury conditions below
+        # keep the linearized translation and yaw maps Schur stable.  The
+        # conservative cubic terms have zero derivative at the origin.
         substep_dt = float(self.dt) / int(substeps)
-        local_damping = float(self.pre_kd) + (
+        coulomb_slope = (
             float(self.coulomb_friction) / float(self.friction_velocity)
         )
-        stability_lhs = (
+        local_damping = float(self.pre_kd) + max(
+            float(self.longitudinal_drag), float(self.lateral_drag)
+        ) + coulomb_slope
+        translation_lhs = (
             2.0 * substep_dt * local_damping
             + substep_dt * substep_dt * float(self.pre_kp)
         )
-        stability_rhs = 4.0 * float(self.mass)
-        if stability_lhs >= stability_rhs:
+        translation_rhs = 4.0 * float(self.mass)
+        if translation_lhs >= translation_rhs:
             raise ValueError(
-                "Nonlinear robot parameters make the discrete pre-stabilizer "
-                "locally unstable: require "
-                "2*(dt/substeps)*(pre_kd + coulomb_friction/friction_velocity) "
-                "+ (dt/substeps)^2*pre_kp < 4*mass. Increase mass or physics "
-                "substeps, or reduce dt/pre_kp/pre_kd/friction. "
-                f"Got {stability_lhs:g} >= {stability_rhs:g}."
+                "Rigid-body parameters make the discrete translation "
+                "pre-stabilizer locally unstable. Increase mass or physics "
+                "substeps, or reduce dt/stiffness/damping. "
+                f"Got {translation_lhs:g} >= {translation_rhs:g}."
+            )
+        angular_coulomb_slope = float(self.angular_coulomb_friction) / float(
+            self.angular_friction_velocity
+        )
+        angular_damping = (
+            float(self.yaw_pre_kd)
+            + float(self.angular_drag)
+            + angular_coulomb_slope
+        )
+        rotation_lhs = (
+            2.0 * substep_dt * angular_damping
+            + substep_dt * substep_dt * float(self.yaw_pre_kp)
+        )
+        rotation_rhs = 4.0 * float(self.inertia)
+        if rotation_lhs >= rotation_rhs:
+            raise ValueError(
+                "Rigid-body parameters make the discrete yaw pre-stabilizer "
+                "locally unstable. Increase inertia or physics substeps, or "
+                "reduce dt/yaw stiffness/angular damping. "
+                f"Got {rotation_lhs:g} >= {rotation_rhs:g}."
             )
 
 
 def nonlinear_robot_acceleration(
     config: NonlinearRobotConfig,
-    position: torch.Tensor,
-    velocity: torch.Tensor,
+    state: torch.Tensor,
     control: torch.Tensor,
 ) -> torch.Tensor:
-    """Continuous-time acceleration of the nonlinear pre-stabilized robot.
+    """Return ``(a_x, a_y, yaw_acceleration)`` for one rigid-body state.
 
-    The unforced conservative part is a radial Duffing oscillator.  Every
-    friction term does non-positive work, while the state-dependent gyroscopic
-    term is perpendicular to velocity and therefore energy-neutral.  Control
-    passes through a smooth dead-zone, a circular acceleration envelope,
-    speed-related authority loss, and cross-speed-dependent traction loss.
+    The state and control accept ``(B, D)`` or ``(B, T, D)`` tensors and must
+    have final dimensions six and three respectively.  Passive body-frame
+    resistance always does non-positive work.  The actuator model applies a
+    smooth component dead-zone, a coupled ellipsoidal wrench envelope, and
+    orientation/speed/slip-dependent grip.  It is instantaneous and therefore
+    adds no unobserved actuator state.
     """
+    state = as_bt(state)
+    control = as_bt(control)
+    if state.shape[-1] != 6:
+        raise ValueError(
+            "Nonlinear rigid-body state must have six channels "
+            "(x, y, yaw, vx, vy, yaw_rate), got "
+            f"shape {tuple(state.shape)}."
+        )
+    if control.shape[-1] != 3:
+        raise ValueError(
+            "Nonlinear rigid-body control must have three channels "
+            "(longitudinal_force, lateral_force, torque), got "
+            f"shape {tuple(control.shape)}."
+        )
+    if state.shape[:-1] != control.shape[:-1]:
+        raise ValueError(
+            "Rigid-body state and control batch/time dimensions must match, "
+            f"got {tuple(state.shape)} and {tuple(control.shape)}."
+        )
+
+    position = state[..., 0:2]
+    heading = state[..., 2:3]
+    velocity_world = state[..., 3:5]
+    yaw_rate = state[..., 5:6]
+
+    cos_heading = torch.cos(heading)
+    sin_heading = torch.sin(heading)
+    velocity_longitudinal = (
+        cos_heading * velocity_world[..., 0:1]
+        + sin_heading * velocity_world[..., 1:2]
+    )
+    velocity_lateral = (
+        -sin_heading * velocity_world[..., 0:1]
+        + cos_heading * velocity_world[..., 1:2]
+    )
+    velocity_body = torch.cat(
+        (velocity_longitudinal, velocity_lateral), dim=-1
+    )
+
+    # World-frame radial Duffing potential pre-stabilizes translation.  Body-
+    # frame resistance produces orientation-dependent rolling/lateral losses.
     position_sq = position.square().sum(dim=-1, keepdim=True)
-    velocity_sq = velocity.square().sum(dim=-1, keepdim=True)
-    speed = torch.linalg.vector_norm(velocity, dim=-1, keepdim=True)
-
-    restoring_force = (
+    restoring_world = (
         -float(config.pre_kp) * position
-        -float(config.cubic_stiffness) * position_sq * position
+        - float(config.cubic_stiffness) * position_sq * position
     )
-    friction_force = (
-        -float(config.pre_kd) * velocity
-        -float(config.quadratic_drag) * speed * velocity
-        -float(config.coulomb_friction)
-        * torch.tanh(velocity / float(config.friction_velocity))
+    linear_drag = torch.cat(
+        (
+            torch.full_like(
+                velocity_longitudinal,
+                float(config.pre_kd) + float(config.longitudinal_drag),
+            ),
+            torch.full_like(
+                velocity_lateral,
+                float(config.pre_kd) + float(config.lateral_drag),
+            ),
+        ),
+        dim=-1,
+    )
+    quadratic_drag = torch.cat(
+        (
+            torch.full_like(
+                velocity_longitudinal, float(config.quadratic_drag)
+            ),
+            torch.full_like(
+                velocity_lateral, float(config.lateral_quadratic_drag)
+            ),
+        ),
+        dim=-1,
+    )
+    passive_force_body = (
+        -linear_drag * velocity_body
+        - quadratic_drag * velocity_body.abs() * velocity_body
+        - float(config.coulomb_friction)
+        * torch.tanh(velocity_body / float(config.friction_velocity))
     )
 
-    deadzone = float(config.actuator_deadzone)
-    if deadzone > 0.0:
-        # Smooth counterpart of sign(u) * max(|u| - deadzone, 0).  It is odd,
-        # differentiable, and exactly zero at the origin.
-        command = control - deadzone * torch.tanh(control / deadzone)
-    else:
-        command = control
+    force_command = control[..., 0:2]
+    torque_command = control[..., 2:3]
+    force_deadzone = float(config.actuator_deadzone)
+    if force_deadzone > 0.0:
+        force_command = force_command - force_deadzone * torch.tanh(
+            force_command / force_deadzone
+        )
+    torque_deadzone = float(config.torque_deadzone)
+    if torque_deadzone > 0.0:
+        torque_command = torque_command - torque_deadzone * torch.tanh(
+            torque_command / torque_deadzone
+        )
 
-    # A radial tanh envelope limits the norm of the total command instead of
-    # clipping axes independently.  The series branch preserves a unit small-
-    # signal gain when the optional dead-zone is disabled.
-    command_norm = torch.linalg.vector_norm(command, dim=-1, keepdim=True)
-    saturation_ratio = command_norm / float(config.actuator_limit)
-    regular_scale = torch.tanh(saturation_ratio) / saturation_ratio.clamp_min(1e-6)
+    # Saturate the complete wrench, not each actuator independently.  This is
+    # a smooth friction-ellipse analogue: requesting large force leaves less
+    # authority for simultaneous torque and vice versa.
+    normalized_wrench = torch.cat(
+        (
+            force_command[..., 0:1] / float(config.actuator_limit),
+            force_command[..., 1:2] / float(config.lateral_force_limit),
+            torque_command / float(config.torque_limit),
+        ),
+        dim=-1,
+    )
+    saturation_ratio = torch.linalg.vector_norm(
+        normalized_wrench, dim=-1, keepdim=True
+    )
+    regular_scale = torch.tanh(saturation_ratio) / saturation_ratio.clamp_min(
+        1e-7
+    )
     saturation_scale = torch.where(
         saturation_ratio < 1e-4,
         1.0 - saturation_ratio.square() / 3.0,
         regular_scale,
     )
+    force_command = force_command * saturation_scale
+    torque_command = torque_command * saturation_scale
 
-    # At high cross-axis speed a wheeled/ground robot cannot realize as much
-    # force without slipping.  Both factors remain positive and bounded by one.
-    slip = float(config.lateral_slip)
-    traction = torch.cat(
+    translational_speed_sq = velocity_world.square().sum(dim=-1, keepdim=True)
+    edge_speed_sq = (
+        0.5 * float(config.body_length) * yaw_rate
+    ).square()
+    speed_authority = 1.0 / (
+        1.0
+        + float(config.speed_loss) * (translational_speed_sq + edge_speed_sq)
+    )
+    smooth_abs_yaw_rate = torch.sqrt(yaw_rate.square() + 1e-12)
+    longitudinal_grip = 1.0 / (
+        1.0
+        + float(config.lateral_slip) * velocity_lateral.square()
+        + float(config.load_transfer)
+        * smooth_abs_yaw_rate
+        * velocity_lateral.abs()
+    )
+    lateral_grip = 1.0 / (
+        1.0
+        + float(config.lateral_slip) * velocity_longitudinal.square()
+        + float(config.tire_saturation)
+        * (velocity_lateral / float(config.traction_velocity)).square()
+        + float(config.load_transfer)
+        * smooth_abs_yaw_rate
+        * velocity_longitudinal.abs()
+    )
+    grip = torch.cat((longitudinal_grip, lateral_grip), dim=-1)
+    actuator_force_body = force_command * speed_authority * grip
+    actuator_torque = torque_command / (
+        1.0 + float(config.speed_loss) * yaw_rate.square()
+    )
+
+    total_force_body = passive_force_body + actuator_force_body
+    total_force_world = torch.cat(
         (
-            1.0 / (1.0 + slip * velocity[..., 1:2].square()),
-            1.0 / (1.0 + slip * velocity[..., 0:1].square()),
+            cos_heading * total_force_body[..., 0:1]
+            - sin_heading * total_force_body[..., 1:2],
+            sin_heading * total_force_body[..., 0:1]
+            + cos_heading * total_force_body[..., 1:2],
         ),
         dim=-1,
-    )
-    actuator_force = (
-        command * saturation_scale * traction
-        / (1.0 + float(config.speed_loss) * velocity_sq)
-    )
+    ) + restoring_world
 
-    rotated_velocity = torch.stack(
-        (-velocity[..., 1], velocity[..., 0]), dim=-1
+    yaw_shape = torch.sin(heading)
+    yaw_restoring_torque = (
+        -float(config.yaw_pre_kp) * yaw_shape
+        - float(config.yaw_cubic_stiffness)
+        * (1.0 - torch.cos(heading))
+        * yaw_shape
     )
-    gyro_coefficient = float(config.gyro_gain) * torch.tanh(
-        float(config.gyro_position_scale)
-        * position[..., 0:1]
-        * position[..., 1:2]
+    passive_yaw_torque = (
+        -float(config.yaw_pre_kd) * yaw_rate
+        - float(config.angular_drag) * yaw_rate
+        - float(config.angular_quadratic_drag) * yaw_rate.abs() * yaw_rate
+        - float(config.angular_coulomb_friction)
+        * torch.tanh(yaw_rate / float(config.angular_friction_velocity))
     )
-    return (
-        (restoring_force + friction_force + actuator_force) / float(config.mass)
-        + gyro_coefficient * rotated_velocity
+    # A lateral force applied away from the centre of mass creates a real yaw
+    # moment, coupling translation and attitude without artificial gyroscopic
+    # forces that would violate inertial-frame rigid-body mechanics.
+    force_offset_torque = (
+        float(config.actuator_offset_x) * actuator_force_body[..., 1:2]
+    )
+    total_torque = (
+        yaw_restoring_torque
+        + passive_yaw_torque
+        + actuator_torque
+        + force_offset_torque
+    )
+    return torch.cat(
+        (
+            total_force_world / float(config.mass),
+            total_torque / float(config.inertia),
+        ),
+        dim=-1,
     )
 
 
@@ -297,39 +515,79 @@ def integrate_nonlinear_robot(
     *,
     config: NonlinearRobotConfig,
 ) -> torch.Tensor:
-    """One semi-implicit nonlinear robot step with optional physics substeps."""
+    """One stable semi-implicit rigid-body step with physics substeps."""
     state = as_bt(x)
     control = as_bt(u)
-    position = state[..., :2]
-    velocity = state[..., 2:]
+    if state.shape[-1] != 6:
+        raise ValueError(
+            "Nonlinear rigid-body state must have six channels, got "
+            f"shape {tuple(state.shape)}."
+        )
+    if control.shape[-1] != 3:
+        raise ValueError(
+            "Nonlinear rigid-body control must have three channels, got "
+            f"shape {tuple(control.shape)}."
+        )
+    if state.shape[:-1] != control.shape[:-1]:
+        raise ValueError(
+            "Rigid-body state and control batch/time dimensions must match, "
+            f"got {tuple(state.shape)} and {tuple(control.shape)}."
+        )
+    position = state[..., 0:2]
+    heading = state[..., 2:3]
+    velocity = state[..., 3:5]
+    yaw_rate = state[..., 5:6]
     step = float(config.dt) / int(config.physics_substeps)
     for _ in range(int(config.physics_substeps)):
-        acceleration = nonlinear_robot_acceleration(
-            config, position, velocity, control
+        substep_state = torch.cat(
+            (position, heading, velocity, yaw_rate), dim=-1
         )
-        velocity = velocity + step * acceleration
+        acceleration = nonlinear_robot_acceleration(
+            config, substep_state, control
+        )
+        velocity = velocity + step * acceleration[..., 0:2]
+        yaw_rate = yaw_rate + step * acceleration[..., 2:3]
         position = position + step * velocity
-    return torch.cat((position, velocity), dim=-1)
+        # Keep yaw unwrapped.  This avoids a discontinuous modulo operation in
+        # the autograd graph; rendering may wrap it for display if desired.
+        heading = heading + step * yaw_rate
+    return torch.cat((position, heading, velocity, yaw_rate), dim=-1)
 
 
 def nonlinear_robot_energy(
     config: NonlinearRobotConfig,
     x: torch.Tensor,
 ) -> torch.Tensor:
-    """Lyapunov energy of the unforced nonlinear robot subsystem."""
+    """Mechanical Lyapunov energy of the unforced rigid-body subsystem."""
     state = as_bt(x)
-    position = state[..., :2]
-    velocity = state[..., 2:]
+    if state.shape[-1] != 6:
+        raise ValueError(
+            "Nonlinear rigid-body state must have six channels, got "
+            f"shape {tuple(state.shape)}."
+        )
+    position = state[..., 0:2]
+    heading = state[..., 2]
+    velocity = state[..., 3:5]
+    yaw_rate = state[..., 5]
     position_sq = position.square().sum(dim=-1)
+    yaw_potential_shape = 1.0 - torch.cos(heading)
     return (
         0.5 * float(config.mass) * velocity.square().sum(dim=-1)
-        +0.5 * float(config.pre_kp) * position_sq
-        +0.25 * float(config.cubic_stiffness) * position_sq.square()
+        + 0.5 * float(config.inertia) * yaw_rate.square()
+        + 0.5 * float(config.pre_kp) * position_sq
+        + 0.25 * float(config.cubic_stiffness) * position_sq.square()
+        + float(config.yaw_pre_kp) * yaw_potential_shape
+        + 0.5
+        * float(config.yaw_cubic_stiffness)
+        * yaw_potential_shape.square()
     )
 
 
 class NonlinearRobotNominal:
-    """Strongly nonlinear nominal robot, pre-stabilized at the origin."""
+    """Six-state rigid-body nominal robot, pre-stabilized at the origin."""
+
+    state_dim = 6
+    control_dim = 3
 
     def __init__(self, config: NonlinearRobotConfig | None = None) -> None:
         self.config = config or NonlinearRobotConfig()
@@ -345,7 +603,10 @@ class NonlinearRobotNominal:
 
 
 class NonlinearRobotTrue:
-    """True wrapper exactly matched to :class:`NonlinearRobotNominal`."""
+    """True rigid body exactly matched to :class:`NonlinearRobotNominal`."""
+
+    state_dim = 6
+    control_dim = 3
 
     def __init__(self, config: NonlinearRobotConfig | None = None) -> None:
         self.config = config or NonlinearRobotConfig()

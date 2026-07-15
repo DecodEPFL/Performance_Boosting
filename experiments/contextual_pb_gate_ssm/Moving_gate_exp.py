@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -223,8 +224,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["legacy", "nonlinear"],
         help="Robot dynamics used consistently for scheduling, training, evaluation, "
              "and plots. 'legacy' preserves the original pre-stabilized double "
-             "integrator. 'nonlinear' activates the strongly nonlinear, realistic "
-             "pre-stabilized robot model.",
+             "integrator bit-for-bit. 'nonlinear' activates the six-state planar "
+             "rigid body and every nonlinear/body-aware experiment modification.",
     )
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--pre_kp", type=float, default=0.32)
@@ -235,29 +236,83 @@ def build_parser() -> argparse.ArgumentParser:
                              "dynamics). 0 = linear double integrator. ~0.5-2 is 'a bit'.")
     parser.add_argument("--nonlinear_mass", type=float, default=1.0,
                         help="Nonlinear model only: robot mass (> 0).")
+    parser.add_argument("--nonlinear_pre_kp", type=float, default=0.32,
+                        help="Nonlinear model only: translational origin-restoring gain.")
+    parser.add_argument("--nonlinear_pre_kd", type=float, default=0.35,
+                        help="Nonlinear model only: translational pre-stabilizer damping.")
+    parser.add_argument("--nonlinear_inertia", type=float, default=0.012,
+                        help="Nonlinear model only: yaw moment of inertia (> 0).")
+    parser.add_argument("--nonlinear_body_length", type=float, default=0.16,
+                        help="Nonlinear model only: oriented rigid-body length (> 0).")
+    parser.add_argument("--nonlinear_body_width", type=float, default=0.10,
+                        help="Nonlinear model only: oriented rigid-body width (> 0).")
+    parser.add_argument("--nonlinear_yaw_pre_kp", type=float, default=0.22,
+                        help="Nonlinear model only: origin yaw pre-stabilizer stiffness.")
+    parser.add_argument("--nonlinear_yaw_pre_kd", type=float, default=0.16,
+                        help="Nonlinear model only: origin yaw pre-stabilizer damping.")
     parser.add_argument("--nonlinear_cubic_stiffness", type=float, default=0.10,
                         help="Nonlinear model only: radial Duffing restoring-force "
                              "coefficient multiplying ||position||^2 position.")
-    parser.add_argument("--nonlinear_quadratic_drag", type=float, default=0.35,
-                        help="Nonlinear model only: dissipative ||velocity|| velocity drag.")
-    parser.add_argument("--nonlinear_coulomb_friction", type=float, default=0.06,
+    parser.add_argument("--nonlinear_yaw_cubic_stiffness", type=float, default=0.06,
+                        help="Nonlinear model only: nonlinear yaw restoring stiffness.")
+    parser.add_argument("--nonlinear_longitudinal_drag", type=float, default=0.15,
+                        help="Nonlinear model only: body-longitudinal linear resistance.")
+    parser.add_argument("--nonlinear_lateral_drag", type=float, default=0.85,
+                        help="Nonlinear model only: larger lateral tire/traction resistance.")
+    parser.add_argument("--nonlinear_quadratic_drag", type=float, default=0.28,
+                        help="Nonlinear model only: longitudinal quadratic drag.")
+    parser.add_argument("--nonlinear_lateral_quadratic_drag", type=float, default=0.55,
+                        help="Nonlinear model only: lateral quadratic tire resistance.")
+    parser.add_argument("--nonlinear_coulomb_friction", type=float, default=0.05,
                         help="Nonlinear model only: smooth rolling/Coulomb friction magnitude.")
     parser.add_argument("--nonlinear_friction_velocity", type=float, default=0.12,
                         help="Nonlinear model only: velocity scale that smooths Coulomb friction.")
-    parser.add_argument("--nonlinear_gyro_gain", type=float, default=0.18,
-                        help="Nonlinear model only: energy-neutral cross-axis/gyroscopic coupling.")
-    parser.add_argument("--nonlinear_gyro_position_scale", type=float, default=1.0,
-                        help="Nonlinear model only: position dependence of gyroscopic coupling.")
+    parser.add_argument("--nonlinear_angular_drag", type=float, default=0.05,
+                        help="Nonlinear model only: linear yaw-rate resistance.")
+    parser.add_argument("--nonlinear_angular_quadratic_drag", type=float, default=0.025,
+                        help="Nonlinear model only: quadratic yaw-rate resistance.")
+    parser.add_argument("--nonlinear_angular_coulomb_friction", type=float, default=0.012,
+                        help="Nonlinear model only: smooth angular Coulomb friction.")
+    parser.add_argument("--nonlinear_angular_friction_velocity", type=float, default=0.18,
+                        help="Nonlinear model only: smoothing scale for angular friction.")
     parser.add_argument("--nonlinear_actuator_limit", type=float, default=2.5,
-                        help="Nonlinear model only: smooth limit on total actuator-force norm.")
+                        help="Nonlinear model only: longitudinal actuator force limit.")
+    parser.add_argument("--nonlinear_lateral_force_limit", type=float, default=1.7,
+                        help="Nonlinear model only: lateral actuator force limit.")
+    parser.add_argument("--nonlinear_torque_limit", type=float, default=0.18,
+                        help="Nonlinear model only: yaw torque limit.")
     parser.add_argument("--nonlinear_actuator_deadzone", type=float, default=0.06,
                         help="Nonlinear model only: smooth low-command actuator dead-zone.")
-    parser.add_argument("--nonlinear_speed_loss", type=float, default=0.20,
+    parser.add_argument("--nonlinear_torque_deadzone", type=float, default=0.008,
+                        help="Nonlinear model only: smooth yaw-torque dead-zone.")
+    parser.add_argument("--nonlinear_speed_loss", type=float, default=0.12,
                         help="Nonlinear model only: actuator-authority loss proportional "
                              "to squared speed.")
-    parser.add_argument("--nonlinear_lateral_slip", type=float, default=0.30,
-                        help="Nonlinear model only: cross-speed-dependent traction loss.")
-    parser.add_argument("--nonlinear_physics_substeps", type=int, default=2,
+    parser.add_argument("--nonlinear_lateral_slip", type=float, default=0.35,
+                        help="Nonlinear model only: lateral-speed-dependent traction loss.")
+    parser.add_argument("--nonlinear_traction_velocity", type=float, default=0.35,
+                        help="Nonlinear model only: combined-slip velocity scale.")
+    parser.add_argument("--nonlinear_load_transfer", type=float, default=0.12,
+                        help="Nonlinear model only: yaw/slip load-transfer coupling.")
+    parser.add_argument("--nonlinear_tire_saturation", type=float, default=0.25,
+                        help="Nonlinear model only: combined tire-force saturation strength.")
+    parser.add_argument("--nonlinear_actuator_offset_x", type=float, default=0.025,
+                        help="Nonlinear model only: longitudinal offset of applied lateral force.")
+    parser.add_argument("--nonlinear_yaw_goal_weight", type=float, default=0.15,
+                        help="Nonlinear model only: relative yaw error weight in goal losses.")
+    parser.add_argument("--nonlinear_goal_yaw_tol", type=float, default=0.35,
+                        help="Nonlinear model only: absolute wrapped-yaw success tolerance (rad).")
+    parser.add_argument("--nonlinear_goal_speed_tol", type=float, default=0.12,
+                        help="Nonlinear model only: terminal linear-speed success tolerance.")
+    parser.add_argument("--nonlinear_goal_yaw_rate_tol", type=float, default=0.25,
+                        help="Nonlinear model only: terminal absolute yaw-rate success tolerance.")
+    parser.add_argument("--nonlinear_velocity_scale", type=float, default=1.0,
+                        help="Nonlinear model only: reference linear speed used to "
+                             "nondimensionalize velocity penalties (> 0).")
+    parser.add_argument("--nonlinear_yaw_rate_scale", type=float, default=2.0,
+                        help="Nonlinear model only: reference yaw rate used to "
+                             "nondimensionalize velocity penalties (> 0).")
+    parser.add_argument("--nonlinear_physics_substeps", type=int, default=4,
                         help="Nonlinear model only: semi-implicit physics substeps per dt.")
     parser.add_argument("--start_x_min", type=float, default=1.7)
     parser.add_argument("--start_x_max", type=float, default=2.1)
@@ -335,6 +390,10 @@ def build_parser() -> argparse.ArgumentParser:
     # Disturbance process.
     parser.add_argument("--noise_pos_sigma", type=float, default=3e-4)
     parser.add_argument("--noise_vel_sigma", type=float, default=1.2e-3)
+    parser.add_argument("--nonlinear_noise_yaw_sigma", type=float, default=2e-4,
+                        help="Nonlinear model only: per-step yaw process-noise std.")
+    parser.add_argument("--nonlinear_noise_yaw_rate_sigma", type=float, default=8e-4,
+                        help="Nonlinear model only: per-step yaw-rate process-noise std.")
     parser.add_argument("--gust_count_min", type=int, default=2)
     parser.add_argument("--gust_count_max", type=int, default=4)
     parser.add_argument("--gust_duration_min", type=int, default=4)
@@ -585,24 +644,158 @@ NavigationNominalPlant = DoubleIntegratorNominal | NonlinearRobotNominal
 NavigationTruePlant = DoubleIntegratorTrue | NonlinearRobotTrue
 
 
+def nonlinear_robot_enabled(args: argparse.Namespace) -> bool:
+    """Whether the opt-in rigid-body package is active."""
+    return str(getattr(args, "robot_model", "legacy")).strip().lower() == "nonlinear"
+
+
+def navigation_dimensions(args: argparse.Namespace) -> tuple[int, int]:
+    """Return ``(state_dim, control_dim)`` without changing the legacy ABI."""
+    return (6, 3) if nonlinear_robot_enabled(args) else (4, 2)
+
+
+def linear_velocity(state: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    """World-frame linear velocity for either state layout."""
+    return state[..., 3:5] if nonlinear_robot_enabled(args) else state[..., 2:4]
+
+
+def body_heading(state: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    """Rigid-body heading, or zero for the original point model."""
+    if nonlinear_robot_enabled(args):
+        return state[..., 2]
+    return torch.zeros_like(state[..., 0])
+
+
+def robot_body_dimensions(args: argparse.Namespace) -> tuple[float, float]:
+    """Physical ``(length, width)``; exactly zero for the legacy point model."""
+    if not nonlinear_robot_enabled(args):
+        return 0.0, 0.0
+    length = float(getattr(args, "nonlinear_body_length", 0.16))
+    width = float(getattr(args, "nonlinear_body_width", 0.10))
+    if not np.isfinite(length) or length <= 0.0:
+        raise ValueError(f"nonlinear_body_length must be finite and positive, got {length}.")
+    if not np.isfinite(width) or width <= 0.0:
+        raise ValueError(f"nonlinear_body_width must be finite and positive, got {width}.")
+    return length, width
+
+
+def body_vertical_half_extent(
+    args: argparse.Namespace, heading: torch.Tensor | float,
+) -> torch.Tensor | float:
+    """Vertical projection of the oriented rectangular footprint."""
+    length, width = robot_body_dimensions(args)
+    if torch.is_tensor(heading):
+        return 0.5 * (
+            length * torch.sin(heading).abs()
+            + width * torch.cos(heading).abs()
+        )
+    angle = float(heading)
+    return 0.5 * (length * abs(np.sin(angle)) + width * abs(np.cos(angle)))
+
+
+def maximum_body_half_extent(args: argparse.Namespace) -> float:
+    """Orientation-independent conservative half extent of the rigid body."""
+    length, width = robot_body_dimensions(args)
+    return 0.5 * float(np.hypot(length, width))
+
+
+def effective_gate_half_width(
+    args: argparse.Namespace, *, training: bool = False,
+) -> float:
+    """Maximum safe center-to-gate error for the robot's full footprint."""
+    margin = 0.0
+    if training and is_continuous_gate(args):
+        margin = max(0.0, float(getattr(args, "gate_margin_train", 0.0)))
+    return float(args.gate_half_width) - maximum_body_half_extent(args) - margin
+
+
+def effective_corridor_limit(args: argparse.Namespace) -> float:
+    """Maximum safe absolute center-y before the body touches a side wall."""
+    return float(args.corridor_limit) - maximum_body_half_extent(args)
+
+
+def validate_robot_body_geometry(args: argparse.Namespace) -> None:
+    """Fail early on invalid nonlinear task/footprint parameters."""
+    if not nonlinear_robot_enabled(args):
+        return
+    robot_body_dimensions(args)
+    positive = {
+        "nonlinear_goal_yaw_tol": float(args.nonlinear_goal_yaw_tol),
+        "nonlinear_goal_speed_tol": float(args.nonlinear_goal_speed_tol),
+        "nonlinear_goal_yaw_rate_tol": float(args.nonlinear_goal_yaw_rate_tol),
+        "nonlinear_velocity_scale": float(args.nonlinear_velocity_scale),
+        "nonlinear_yaw_rate_scale": float(args.nonlinear_yaw_rate_scale),
+    }
+    for name, value in positive.items():
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be finite and positive, got {value}.")
+    if float(args.nonlinear_goal_yaw_tol) > np.pi:
+        raise ValueError("nonlinear_goal_yaw_tol cannot exceed pi radians.")
+    nonnegative = {
+        "nonlinear_yaw_goal_weight": float(args.nonlinear_yaw_goal_weight),
+        "nonlinear_noise_yaw_sigma": float(args.nonlinear_noise_yaw_sigma),
+        "nonlinear_noise_yaw_rate_sigma": float(args.nonlinear_noise_yaw_rate_sigma),
+    }
+    for name, value in nonnegative.items():
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative, got {value}.")
+    if effective_gate_half_width(args) <= 0.0:
+        raise ValueError(
+            "The nonlinear rigid body cannot fit through the gate for all "
+            "orientations: reduce nonlinear_body_length/body_width or widen the gate."
+        )
+    if effective_corridor_limit(args) <= 0.0:
+        raise ValueError(
+            "The nonlinear rigid body cannot fit inside the corridor: reduce "
+            "nonlinear_body_length/body_width or widen the corridor."
+        )
+
+
 def nonlinear_robot_config_from_args(args: argparse.Namespace) -> NonlinearRobotConfig:
     """Translate experiment parameters into the shared nonlinear-plant config."""
+    body_length, body_width = robot_body_dimensions(args)
     return NonlinearRobotConfig(
         dt=float(getattr(args, "dt", 0.05)),
-        pre_kp=float(getattr(args, "pre_kp", 0.32)),
-        pre_kd=float(getattr(args, "pre_kd", 0.80)),
+        pre_kp=float(getattr(args, "nonlinear_pre_kp", 0.32)),
+        pre_kd=float(getattr(args, "nonlinear_pre_kd", 0.35)),
+        yaw_pre_kp=float(getattr(args, "nonlinear_yaw_pre_kp", 0.22)),
+        yaw_pre_kd=float(getattr(args, "nonlinear_yaw_pre_kd", 0.16)),
         mass=float(getattr(args, "nonlinear_mass", 1.0)),
+        inertia=float(getattr(args, "nonlinear_inertia", 0.012)),
+        body_length=body_length,
+        body_width=body_width,
         cubic_stiffness=float(getattr(args, "nonlinear_cubic_stiffness", 0.10)),
-        quadratic_drag=float(getattr(args, "nonlinear_quadratic_drag", 0.35)),
-        coulomb_friction=float(getattr(args, "nonlinear_coulomb_friction", 0.06)),
+        yaw_cubic_stiffness=float(getattr(args, "nonlinear_yaw_cubic_stiffness", 0.06)),
+        longitudinal_drag=float(getattr(args, "nonlinear_longitudinal_drag", 0.15)),
+        lateral_drag=float(getattr(args, "nonlinear_lateral_drag", 0.85)),
+        quadratic_drag=float(getattr(args, "nonlinear_quadratic_drag", 0.28)),
+        lateral_quadratic_drag=float(
+            getattr(args, "nonlinear_lateral_quadratic_drag", 0.55)
+        ),
+        coulomb_friction=float(getattr(args, "nonlinear_coulomb_friction", 0.05)),
         friction_velocity=float(getattr(args, "nonlinear_friction_velocity", 0.12)),
-        gyro_gain=float(getattr(args, "nonlinear_gyro_gain", 0.18)),
-        gyro_position_scale=float(getattr(args, "nonlinear_gyro_position_scale", 1.0)),
+        angular_drag=float(getattr(args, "nonlinear_angular_drag", 0.05)),
+        angular_quadratic_drag=float(
+            getattr(args, "nonlinear_angular_quadratic_drag", 0.025)
+        ),
+        angular_coulomb_friction=float(
+            getattr(args, "nonlinear_angular_coulomb_friction", 0.012)
+        ),
+        angular_friction_velocity=float(
+            getattr(args, "nonlinear_angular_friction_velocity", 0.18)
+        ),
         actuator_limit=float(getattr(args, "nonlinear_actuator_limit", 2.5)),
+        lateral_force_limit=float(getattr(args, "nonlinear_lateral_force_limit", 1.7)),
+        torque_limit=float(getattr(args, "nonlinear_torque_limit", 0.18)),
         actuator_deadzone=float(getattr(args, "nonlinear_actuator_deadzone", 0.06)),
-        speed_loss=float(getattr(args, "nonlinear_speed_loss", 0.20)),
-        lateral_slip=float(getattr(args, "nonlinear_lateral_slip", 0.30)),
-        physics_substeps=int(getattr(args, "nonlinear_physics_substeps", 2)),
+        torque_deadzone=float(getattr(args, "nonlinear_torque_deadzone", 0.008)),
+        speed_loss=float(getattr(args, "nonlinear_speed_loss", 0.12)),
+        lateral_slip=float(getattr(args, "nonlinear_lateral_slip", 0.35)),
+        traction_velocity=float(getattr(args, "nonlinear_traction_velocity", 0.35)),
+        load_transfer=float(getattr(args, "nonlinear_load_transfer", 0.12)),
+        tire_saturation=float(getattr(args, "nonlinear_tire_saturation", 0.25)),
+        actuator_offset_x=float(getattr(args, "nonlinear_actuator_offset_x", 0.025)),
+        physics_substeps=int(getattr(args, "nonlinear_physics_substeps", 4)),
     )
 
 
@@ -625,6 +818,7 @@ def build_navigation_plants(
         }
         return DoubleIntegratorNominal(**kwargs), DoubleIntegratorTrue(**kwargs)
     if model == "nonlinear":
+        validate_robot_body_geometry(args)
         config = nonlinear_robot_config_from_args(args)
         return NonlinearRobotNominal(config), NonlinearRobotTrue(config)
     raise ValueError(
@@ -747,12 +941,13 @@ def find_matched_ssm_d_model(
     mp_in_dim: int,
 ) -> int:
     """Return the smallest d_model (stepping by 4) such that
-    MpDeepSSM(mp_in_dim, nu=2, d_model=d_model, ...) has >= target_params.
+    MpDeepSSM(mp_in_dim, nu=model_control_dim, d_model=d_model, ...) has
+    at least ``target_params``.
 
     Throwaway probe modules stay on CPU — parameter counts are device-independent
     and this avoids churning GPU memory/startup time on the cluster.
     """
-    nu = 2
+    _, nu = navigation_dimensions(args)
     n_layers = int(args.mp_only_ssm_layers or args.ssm_layers)
     start = int(args.ssm_d_model)
     for d_model in range(start, 1024, 4):
@@ -887,7 +1082,7 @@ def variant_specs(args=None) -> list[tuple[str, str]]:
 CONTEXT_FEATURE_ORDER = [
     "gate_obs", "gate_vel", "gate_ema", "gate_slow_ema", "gate_error",
     "rel_wall_x", "goal_dx", "goal_dy", "approach", "switch_age", "time_to_wall",
-    "vel_x", "vel_y",
+    "vel_x", "vel_y", "heading_sin", "heading_cos", "yaw_rate",
 ]
 # key -> (group, human label, experiments-it-applies-to). 'fair' = observation +
 # own state + known geometry; 'privileged' = gate dynamics / schedule ("cheating").
@@ -905,6 +1100,9 @@ CONTEXT_FEATURE_META = {
     "time_to_wall":  ("privileged", "Normalized time-to-wall (schedule)",    ("switch", "continuous")),
     "vel_x":         ("fair",       "Own velocity vx",                       ("switch", "continuous")),
     "vel_y":         ("fair",       "Own velocity vy",                       ("switch", "continuous")),
+    "heading_sin":   ("fair",       "Body heading sin(yaw)",                 ("continuous",)),
+    "heading_cos":   ("fair",       "Body heading cos(yaw)",                 ("continuous",)),
+    "yaw_rate":      ("fair",       "Body yaw rate",                         ("continuous",)),
 }
 # Default fair set for the continuous experiment: observation, causal gate-motion
 # history, own state, and known geometry.
@@ -912,6 +1110,10 @@ FAIR_CONTEXT_DEFAULT = [
     "gate_obs", "gate_vel", "gate_ema", "gate_error",
     "rel_wall_x", "goal_dx", "goal_dy", "approach",
 ]
+NONLINEAR_CONTEXT_DEFAULT = FAIR_CONTEXT_DEFAULT + [
+    "vel_x", "vel_y", "heading_sin", "heading_cos", "yaw_rate",
+]
+RIGID_BODY_CONTEXT_FEATURES = {"heading_sin", "heading_cos", "yaw_rate"}
 # Legacy --context_mode 'full' stays the ORIGINAL 11 features (frozen so old
 # runs/checkpoints keep their context_dim); opt into velocity via
 # --context_features / the launcher checkboxes instead.
@@ -946,11 +1148,24 @@ def resolve_context_features(args=None) -> list[str]:
                 f"Unknown context feature(s) {sorted(unknown)}. "
                 f"Choose from {CONTEXT_FEATURE_ORDER}."
             )
+        if args is not None and not nonlinear_robot_enabled(args):
+            # Rigid-body observations belong to the nonlinear package and must
+            # never alter a legacy controller/checkpoint input dimension.
+            sel -= RIGID_BODY_CONTEXT_FEATURES
         return [k for k in CONTEXT_FEATURE_ORDER if k in sel]
     if args is not None and is_continuous_gate(args) and getattr(args, "context_mode", "full") == "minimal":
-        return list(FAIR_CONTEXT_DEFAULT)
+        return list(
+            NONLINEAR_CONTEXT_DEFAULT
+            if nonlinear_robot_enabled(args) else FAIR_CONTEXT_DEFAULT
+        )
     if args is not None and getattr(args, "context_mode", "full") == "minimal":
         return list(_MINIMAL_FEATURES)
+    if args is not None and nonlinear_robot_enabled(args):
+        # "Full" in the opt-in package includes the complete observable rigid
+        # state; only the frozen legacy full layout stays at eleven features.
+        return list(_FULL_FEATURES) + [
+            "vel_x", "vel_y", "heading_sin", "heading_cos", "yaw_rate",
+        ]
     return list(_FULL_FEATURES)
 
 
@@ -997,8 +1212,14 @@ def build_gate_features(gates: np.ndarray, ema_alpha: float) -> tuple[np.ndarray
 def estimate_expected_cross_index(args: argparse.Namespace) -> int:
     _, plant = build_navigation_plants(args)
     start_x = 0.5 * (float(args.start_x_min) + float(args.start_x_max))
-    x = torch.tensor([[[start_x, 0.0, 0.0, 0.0]]], dtype=torch.float32)
-    u = torch.zeros(1, 1, 2, dtype=torch.float32)
+    if nonlinear_robot_enabled(args):
+        x = torch.zeros(1, 1, 6, dtype=torch.float32)
+        x[..., 0] = start_x
+        u = torch.zeros(1, 1, 3, dtype=torch.float32)
+    else:
+        # Literal legacy construction: preserve dtype, layout, and trajectory.
+        x = torch.tensor([[[start_x, 0.0, 0.0, 0.0]]], dtype=torch.float32)
+        u = torch.zeros(1, 1, 2, dtype=torch.float32)
     xs = []
     for _ in range(int(args.horizon)):
         x = plant.forward(x, u)
@@ -1057,9 +1278,10 @@ def cross_index_interpolator(args: argparse.Namespace, x_lo: float, x_hi: float)
     lo, hi = float(min(x_lo, x_hi)), float(max(x_lo, x_hi))
     grid = np.linspace(lo, hi, num=17, dtype=np.float64)
     _, plant = build_navigation_plants(args)
-    x = torch.zeros(len(grid), 1, 4, dtype=torch.float32)
+    nx, nu = navigation_dimensions(args)
+    x = torch.zeros(len(grid), 1, nx, dtype=torch.float32)
     x[:, 0, 0] = torch.from_numpy(grid.astype(np.float32))
-    u = torch.zeros(len(grid), 1, 2, dtype=torch.float32)
+    u = torch.zeros(len(grid), 1, nu, dtype=torch.float32)
     steps = []
     for _ in range(horizon):
         x = plant.forward(x, u)
@@ -1194,13 +1416,31 @@ def sample_paired_process_noise(
     paired: bool,
 ) -> np.ndarray:
     horizon = int(args.horizon)
-    nx = 4
+    nx, _ = navigation_dimensions(args)
     noise = np.zeros((batch_size, horizon, nx), dtype=np.float32)
 
     def draw_one() -> np.ndarray:
         seq = np.zeros((horizon, nx), dtype=np.float32)
-        seq[:, :2] += rng.normal(scale=float(args.noise_pos_sigma), size=(horizon, 2)).astype(np.float32)
-        seq[:, 2:] += rng.normal(scale=float(args.noise_vel_sigma), size=(horizon, 2)).astype(np.float32)
+        seq[:, :2] += rng.normal(
+            scale=float(args.noise_pos_sigma), size=(horizon, 2),
+        ).astype(np.float32)
+        if nonlinear_robot_enabled(args):
+            seq[:, 2] += rng.normal(
+                scale=float(args.nonlinear_noise_yaw_sigma), size=horizon,
+            ).astype(np.float32)
+            seq[:, 3:5] += rng.normal(
+                scale=float(args.noise_vel_sigma), size=(horizon, 2),
+            ).astype(np.float32)
+            seq[:, 5] += rng.normal(
+                scale=float(args.nonlinear_noise_yaw_rate_sigma), size=horizon,
+            ).astype(np.float32)
+            vx_idx, vy_idx = 3, 4
+        else:
+            # Keep the original RNG draw count/order and state indices exactly.
+            seq[:, 2:] += rng.normal(
+                scale=float(args.noise_vel_sigma), size=(horizon, 2),
+            ).astype(np.float32)
+            vx_idx, vy_idx = 2, 3
         burst_count = int(rng.integers(int(args.gust_count_min), int(args.gust_count_max) + 1))
         for _ in range(burst_count):
             duration = int(rng.integers(int(args.gust_duration_min), int(args.gust_duration_max) + 1))
@@ -1208,9 +1448,11 @@ def sample_paired_process_noise(
             amp_y = float(rng.uniform(float(args.gust_vel_y_min), float(args.gust_vel_y_max)))
             amp_y *= float(rng.choice([-1.0, 1.0]))
             amp_x = float(rng.uniform(-float(args.gust_vel_x_max), float(args.gust_vel_x_max)))
-            seq[start : start + duration, 3] += amp_y
-            seq[start : start + duration, 2] += amp_x
-        seq[:, 3] = np.clip(seq[:, 3], -float(args.gust_clip_y), float(args.gust_clip_y))
+            seq[start : start + duration, vy_idx] += amp_y
+            seq[start : start + duration, vx_idx] += amp_x
+        seq[:, vy_idx] = np.clip(
+            seq[:, vy_idx], -float(args.gust_clip_y), float(args.gust_clip_y),
+        )
         return seq
 
     if paired:
@@ -1314,9 +1556,18 @@ def sample_batch(
     )
 
 
-def make_x0(batch: ScenarioBatch, device: torch.device) -> torch.Tensor:
-    vel0 = torch.zeros(batch.start.shape[0], 2, device=device, dtype=batch.start.dtype)
-    return torch.cat([batch.start.to(device), vel0], dim=-1).unsqueeze(1)
+def make_x0(
+    batch: ScenarioBatch, device: torch.device, args: argparse.Namespace,
+) -> torch.Tensor:
+    if not nonlinear_robot_enabled(args):
+        # Literal original implementation for legacy checkpoint/replay parity.
+        vel0 = torch.zeros(batch.start.shape[0], 2, device=device, dtype=batch.start.dtype)
+        return torch.cat([batch.start.to(device), vel0], dim=-1).unsqueeze(1)
+    rigid_tail = torch.zeros(
+        batch.start.shape[0], 4, device=device, dtype=batch.start.dtype,
+    )
+    # [x, y] + [yaw=0, vx=0, vy=0, yaw_rate=0]
+    return torch.cat([batch.start.to(device), rigid_tail], dim=-1).unsqueeze(1)
 
 
 def build_context(
@@ -1332,8 +1583,14 @@ def build_context(
     pos = state[..., :2]
     x_pos = pos[..., 0]
     y_pos = pos[..., 1]
-    vel_x = state[..., 2]
-    vel_y = state[..., 3]
+    velocity = linear_velocity(state, args)
+    vel_x = velocity[..., 0]
+    vel_y = velocity[..., 1]
+    heading = body_heading(state, args)
+    yaw_rate = (
+        state[..., 5]
+        if nonlinear_robot_enabled(args) else torch.zeros_like(x_pos)
+    )
 
     # Apply observation delay: controller sees gate from `delay` steps ago
     delay = int(args.gate_obs_delay)
@@ -1371,6 +1628,9 @@ def build_context(
         # |v| at O(1) over the sampled start ranges, so no extra normalization.
         "vel_x": vel_x,
         "vel_y": vel_y,
+        "heading_sin": torch.sin(heading),
+        "heading_cos": torch.cos(heading),
+        "yaw_rate": yaw_rate,
     }
     feats = resolve_context_features(args)
     z_t = float(args.z_scale) * torch.cat([feat_map[k] for k in feats], dim=-1)
@@ -1417,6 +1677,28 @@ def cli_has_override(cli_overrides: set[str], dest: str) -> bool:
 
 def apply_saved_config(args: argparse.Namespace, saved_cfg: dict, cli_overrides: set[str], *,
                        log_prefix: str) -> None:
+    saved_model = str(saved_cfg.get("robot_model", "legacy")).strip().lower()
+    requested_model = (
+        str(getattr(args, "robot_model", "legacy")).strip().lower()
+        if cli_has_override(cli_overrides, "robot_model")
+        else saved_model
+    )
+    if requested_model != saved_model:
+        raise RuntimeError(
+            f"[{log_prefix}] A saved {saved_model!r} checkpoint cannot be "
+            f"reinterpreted as {requested_model!r}; its state/control ABI differs."
+        )
+    if saved_model == "nonlinear":
+        schema = saved_cfg.get("model_schema")
+        state_dim = saved_cfg.get("state_dim")
+        control_dim = saved_cfg.get("control_dim")
+        if (schema, state_dim, control_dim) != ("rigid6-v1", 6, 3):
+            raise RuntimeError(
+                f"[{log_prefix}] This nonlinear checkpoint predates the rigid-body "
+                "model (required model_schema='rigid6-v1', state_dim=6, "
+                "control_dim=3). Old four-state nonlinear checkpoints are "
+                "intentionally incompatible; retrain with the new nonlinear toggle."
+            )
     for k, v in saved_cfg.items():
         if not cli_has_override(cli_overrides, k) and hasattr(args, k):
             setattr(args, k, v)
@@ -1433,6 +1715,125 @@ def apply_saved_config(args: argparse.Namespace, saved_cfg: dict, cli_overrides:
               f"ctx_z_scale=z_scale ({float(args.ctx_z_scale):g}).")
 
 
+def config_payload_for_args(args: argparse.Namespace) -> dict:
+    """Serialize experiment arguments with an explicit nonlinear ABI marker."""
+    payload = dict(vars(args))
+    if nonlinear_robot_enabled(args):
+        payload.update({
+            "model_schema": "rigid6-v1",
+            "state_dim": 6,
+            "control_dim": 3,
+        })
+    return payload
+
+
+def validate_existing_run_model(
+    run_dir: Path, args: argparse.Namespace, *, log_prefix: str,
+) -> None:
+    """Refuse to mix legacy and rigid-body checkpoints in one run directory."""
+    requested_model = "nonlinear" if nonlinear_robot_enabled(args) else "legacy"
+    requested_abi = {
+        "robot_model": requested_model,
+        "model_schema": "rigid6-v1" if requested_model == "nonlinear" else "legacy4-v1",
+        "state_dim": 6 if requested_model == "nonlinear" else 4,
+        "control_dim": 3 if requested_model == "nonlinear" else 2,
+    }
+
+    def ensure_atomic_abi_marker() -> None:
+        """Claim an empty run id atomically, including across RCP fan-out jobs."""
+        marker_path = run_dir / ".robot_model_abi.json"
+        marker_payload = json.dumps(requested_abi, sort_keys=True) + "\n"
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=".robot_model_abi.", suffix=".tmp", dir=run_dir,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(marker_payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                # Publishing a hard link is atomic and never replaces an
+                # existing claim. Unlike open("x") followed by json.dump(), a
+                # competing reader cannot observe a partial JSON document.
+                os.link(temporary_name, marker_path)
+                return
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise RuntimeError(
+                    f"[{log_prefix}] Cannot publish atomic ABI marker "
+                    f"{marker_path}: {exc}. Use a new run_id."
+                ) from exc
+        finally:
+            try:
+                Path(temporary_name).unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"[{log_prefix}] Cannot validate atomic ABI marker {marker_path}: "
+                f"{exc}. Use a new run_id."
+            ) from exc
+        if marker != requested_abi:
+            marker_model = (
+                marker.get("robot_model", "an unknown model")
+                if isinstance(marker, dict)
+                else "an invalid marker"
+            )
+            raise RuntimeError(
+                f"[{log_prefix}] Run {run_dir.name!r} was concurrently claimed "
+                f"for {marker_model!r}; cannot "
+                f"use it for {requested_model!r}. Choose a new run_id."
+            )
+
+    config_path = run_dir / "config.json"
+    checkpoints = list(run_dir.glob("*_controller*.pt"))
+    if not config_path.exists():
+        if checkpoints:
+            names = ", ".join(sorted(path.name for path in checkpoints[:3]))
+            raise RuntimeError(
+                f"[{log_prefix}] {run_dir} contains checkpoint(s) ({names}) but "
+                "no config.json proving their robot-model ABI. Use a new run_id; "
+                "the files will not be guessed or overwritten."
+            )
+        ensure_atomic_abi_marker()
+        return
+    try:
+        saved_cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"[{log_prefix}] Cannot validate existing {config_path}: {exc}. "
+            "Use a new run_id rather than overwriting unknown provenance."
+        ) from exc
+    if not isinstance(saved_cfg, dict):
+        raise RuntimeError(
+            f"[{log_prefix}] Existing {config_path} is not a JSON object; "
+            "use a new run_id."
+        )
+
+    saved_model = str(saved_cfg.get("robot_model", "legacy")).strip().lower()
+    if saved_model != requested_model:
+        raise RuntimeError(
+            f"[{log_prefix}] Run {run_dir.name!r} already belongs to the "
+            f"{saved_model!r} robot model and cannot be reused for "
+            f"{requested_model!r}. Choose a new run_id so checkpoints and "
+            "metrics remain strictly separated."
+        )
+    if requested_model == "nonlinear" and (
+        saved_cfg.get("model_schema"),
+        saved_cfg.get("state_dim"),
+        saved_cfg.get("control_dim"),
+    ) != ("rigid6-v1", 6, 3):
+        raise RuntimeError(
+            f"[{log_prefix}] Run {run_dir.name!r} contains an old nonlinear "
+            "checkpoint ABI. The new rigid body requires model_schema='rigid6-v1', "
+            "state_dim=6, control_dim=3; choose a new run_id and retrain."
+        )
+    ensure_atomic_abi_marker()
+
+
 def build_contextual_controller(
     device: torch.device,
     args: argparse.Namespace,
@@ -1444,8 +1845,7 @@ def build_contextual_controller(
     L2-projected by --ctx_filter, the 'mixer' router is bounded by
     --ctx_mixer_bound, and an optional prescribed L2 cap is set via --ctx_gamma.
     """
-    nx = 4
-    nu = 2
+    nx, nu = navigation_dimensions(args)
     z_dim = context_dim(args)
 
     modes = tuple(m.strip().lower() for m in str(args.ctx_modes).split(",") if m.strip())
@@ -1557,8 +1957,7 @@ def build_controller(
     if contextual:
         return build_contextual_controller(device, args)
 
-    nx = 4
-    nu = 2
+    nx, nu = navigation_dimensions(args)
     z_dim = context_dim(args)
     feat_dim = int(factor_rank_override if factor_rank_override is not None else args.feat_dim)
     if feat_dim <= 0:
@@ -1667,11 +2066,12 @@ def rollout_nominal(
 ) -> RolloutArtifacts:
     batch = batch.to(device)
     _, plant_true = build_navigation_plants(args)
-    x = make_x0(batch, device)
+    x = make_x0(batch, device, args)
     x_log = []
     u_log = []
     w_log = []
-    u_zero = torch.zeros(x.shape[0], 1, 2, device=device, dtype=x.dtype)
+    _, nu = navigation_dimensions(args)
+    u_zero = torch.zeros(x.shape[0], 1, nu, device=device, dtype=x.dtype)
     for t in range(int(args.horizon)):
         x_next = plant_true.forward(x, u_zero, t=t) + batch.process_noise[:, t : t + 1, :]
         w_t = x_next - plant_true.forward(x, u_zero, t=t)
@@ -1698,7 +2098,7 @@ def rollout_pb_variant(
     training: bool = False,
 ) -> RolloutArtifacts:
     batch = batch.to(device)
-    x0 = make_x0(batch, device)
+    x0 = make_x0(batch, device, args)
     z_dim = context_dim(args)
 
     if zero_context:
@@ -1769,11 +2169,32 @@ def wall_weights(x_pos: torch.Tensor, wall_x: float, sigma: float) -> torch.Tens
 
 
 def loss_gate_half_width(args: argparse.Namespace, training: bool) -> float:
-    half_width = float(args.gate_half_width)
-    if training and is_continuous_gate(args):
-        margin = max(0.0, float(getattr(args, "gate_margin_train", 0.0)))
-        half_width = max(1e-4, half_width - margin)
-    return half_width
+    if not nonlinear_robot_enabled(args):
+        # Literal original point-model threshold behavior.
+        half_width = float(args.gate_half_width)
+        if training and is_continuous_gate(args):
+            margin = max(0.0, float(getattr(args, "gate_margin_train", 0.0)))
+            half_width = max(1e-4, half_width - margin)
+        return half_width
+    return max(1e-4, effective_gate_half_width(args, training=training))
+
+
+def nonlinear_control_scales(args: argparse.Namespace) -> tuple[float, float, float]:
+    """Physical wrench limits used to nondimensionalize nonlinear controls."""
+    return (
+        max(float(args.nonlinear_actuator_limit), 1e-6),
+        max(float(args.nonlinear_lateral_force_limit), 1e-6),
+        max(float(args.nonlinear_torque_limit), 1e-6),
+    )
+
+
+def normalized_control_tensor(
+    args: argparse.Namespace, control: torch.Tensor,
+) -> torch.Tensor:
+    """Dimensionless nonlinear wrench; literal identity for legacy controls."""
+    if not nonlinear_robot_enabled(args):
+        return control
+    return control / control.new_tensor(nonlinear_control_scales(args))
 
 
 # Loss term key -> the legacy raw-mode *_weight argument that scales it.
@@ -1807,21 +2228,52 @@ def _raw_loss_terms(
     goal_delta = pos - goal
     goal_dist = F.huber_loss(pos, goal.expand_as(pos), reduction="none", delta=0.5).sum(dim=-1)
     goal_dist_l2 = torch.norm(goal_delta, dim=-1)
+    if nonlinear_robot_enabled(args):
+        heading = body_heading(rollout.x_seq, args)
+        yaw_weight = max(0.0, float(getattr(args, "nonlinear_yaw_goal_weight", 0.15)))
+        wrapped_yaw_cost = 1.0 - torch.cos(heading)
+        goal_dist = goal_dist + yaw_weight * wrapped_yaw_cost
+        goal_dist_l2 = goal_dist_l2 + yaw_weight * wrapped_yaw_cost
 
     w_wall = wall_weights(x_pos, float(args.wall_x), float(args.wall_focus_sigma))
     gate_error = y_pos - gate
     sharpness = collision_sharpness_override if collision_sharpness_override is not None else float(args.collision_sharpness)
-    gate_half_width_loss = loss_gate_half_width(args, training=training)
-    collision_soft = F.softplus(
-        sharpness * (gate_error.abs() - gate_half_width_loss)
-    ) / max(sharpness, 1e-6)
+    if nonlinear_robot_enabled(args):
+        margin = (
+            max(0.0, float(getattr(args, "gate_margin_train", 0.0)))
+            if training and is_continuous_gate(args) else 0.0
+        )
+        vertical_extent = body_vertical_half_extent(args, heading)
+        safe_half_width = (
+            float(args.gate_half_width) - margin - vertical_extent
+        ).clamp_min(1e-4)
+        collision_soft = F.softplus(
+            sharpness * (gate_error.abs() - safe_half_width)
+        ) / max(sharpness, 1e-6)
+        corridor_excess = y_pos.abs() + vertical_extent - float(args.corridor_limit)
+    else:
+        # Literal original point-model loss geometry.
+        gate_half_width_loss = loss_gate_half_width(args, training=training)
+        collision_soft = F.softplus(
+            sharpness * (gate_error.abs() - gate_half_width_loss)
+        ) / max(sharpness, 1e-6)
+        corridor_excess = y_pos.abs() - float(args.corridor_limit)
     corridor_soft = F.softplus(
-        float(args.corridor_sharpness) * (y_pos.abs() - float(args.corridor_limit))
+        float(args.corridor_sharpness) * corridor_excess
     ) / float(args.corridor_sharpness)
 
     terminal_vel = torch.zeros_like(goal_dist_l2[:, -1])
     if getattr(args, "use_terminal_vel", True):
-        terminal_vel = torch.sum(rollout.x_seq[:, -1, 2:].square(), dim=-1)
+        if nonlinear_robot_enabled(args):
+            velocity_scale = max(float(args.nonlinear_velocity_scale), 1e-6)
+            yaw_rate_scale = max(float(args.nonlinear_yaw_rate_scale), 1e-6)
+            terminal_vel = (
+                rollout.x_seq[:, -1, 3:5].square().sum(dim=-1)
+                / (velocity_scale ** 2)
+                + rollout.x_seq[:, -1, 5].square() / (yaw_rate_scale ** 2)
+            )
+        else:
+            terminal_vel = torch.sum(rollout.x_seq[:, -1, 2:].square(), dim=-1)
 
     # Deceleration-near-goal penalty: speed weighted by a Gaussian in distance-to-
     # goal (normalized over time). Penalizes carrying velocity into the target, so
@@ -1829,7 +2281,20 @@ def _raw_loss_terms(
     settle_sigma = max(float(getattr(args, "settle_sigma", 0.35)), 1e-6)
     w_goal = torch.exp(-0.5 * goal_delta.square().sum(dim=-1) / (settle_sigma ** 2))
     w_goal = w_goal / w_goal.sum(dim=1, keepdim=True).clamp_min(1e-6)
-    vel_sq = rollout.x_seq[..., 2:].square().sum(dim=-1)
+    if nonlinear_robot_enabled(args):
+        velocity_scale = max(float(args.nonlinear_velocity_scale), 1e-6)
+        yaw_rate_scale = max(float(args.nonlinear_yaw_rate_scale), 1e-6)
+        vel_sq = (
+            rollout.x_seq[..., 3:5].square().sum(dim=-1) / (velocity_scale ** 2)
+            + rollout.x_seq[..., 5].square() / (yaw_rate_scale ** 2)
+        )
+        control_cost = (
+            normalized_control_tensor(args, rollout.u_seq)
+            .square().sum(dim=-1).mean(dim=1)
+        )
+    else:
+        vel_sq = rollout.x_seq[..., 2:].square().sum(dim=-1)
+        control_cost = torch.sum(rollout.u_seq.square(), dim=-1).mean(dim=1)
     settle_vel = (w_goal * vel_sq).sum(dim=1)
 
     return {
@@ -1838,7 +2303,7 @@ def _raw_loss_terms(
         "terminal_vel": terminal_vel,
         "wall_track": (w_wall * gate_error.square()).sum(dim=1),
         "wall_collision": (w_wall * collision_soft).sum(dim=1),
-        "control": torch.sum(rollout.u_seq.square(), dim=-1).mean(dim=1),
+        "control": control_cost,
         "corridor": corridor_soft.mean(dim=1),
         "settle_vel": settle_vel,
     }
@@ -1952,6 +2417,171 @@ def interpolated_wall_crossing(
     return cross_idx, y_cross, g_cross
 
 
+def physical_wall_collision(
+    *,
+    args: argparse.Namespace,
+    state_seq: torch.Tensor,
+    gate: torch.Tensor,
+    cross_error: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact oriented-rectangle contact with the gate wall.
+
+    At every sampled pose, intersect the rigid body's rectangle with the
+    vertical line ``x == wall_x``.  The resulting vertical slice must fit
+    inside the instantaneous opening.  We additionally evaluate the
+    interpolated centre crossing so a single integration step cannot jump the
+    complete wall/body overlap unnoticed.
+    """
+    if not nonlinear_robot_enabled(args):
+        # This helper is deliberately outside the frozen legacy evaluation
+        # path, but keeping point semantics here makes it safe for direct use.
+        clearance = float(args.gate_half_width) - cross_error.abs()
+        return clearance < 0.0, clearance
+    if state_seq.shape[-1] != 6:
+        raise ValueError(
+            "The nonlinear wall-collision check expects state (..., 6) = "
+            "[x, y, yaw, vx, vy, yaw_rate]."
+        )
+
+    def slice_clearance(
+        state: torch.Tensor, gate_center: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        length, width = robot_body_dimensions(args)
+        half_length = 0.5 * length
+        half_width = 0.5 * width
+        dx = float(args.wall_x) - state[..., 0]
+        heading = state[..., 2]
+        c = torch.cos(heading)
+        s = torch.sin(heading)
+        eps = 1e-7
+        inf = torch.full_like(dx, float("inf"))
+        neg_inf = -inf
+
+        # |c*dx + s*dy| <= half_length.
+        safe_s = torch.where(s.abs() > eps, s, torch.ones_like(s))
+        u0 = (-half_length - c * dx) / safe_s
+        u1 = (half_length - c * dx) / safe_s
+        u_lo = torch.minimum(u0, u1)
+        u_hi = torch.maximum(u0, u1)
+        u_parallel_ok = (c * dx).abs() <= half_length
+        u_lo = torch.where(s.abs() > eps, u_lo, torch.where(u_parallel_ok, neg_inf, inf))
+        u_hi = torch.where(s.abs() > eps, u_hi, torch.where(u_parallel_ok, inf, neg_inf))
+
+        # |-s*dx + c*dy| <= half_width.
+        safe_c = torch.where(c.abs() > eps, c, torch.ones_like(c))
+        v0 = (-half_width + s * dx) / safe_c
+        v1 = (half_width + s * dx) / safe_c
+        v_lo = torch.minimum(v0, v1)
+        v_hi = torch.maximum(v0, v1)
+        v_parallel_ok = (s * dx).abs() <= half_width
+        v_lo = torch.where(c.abs() > eps, v_lo, torch.where(v_parallel_ok, neg_inf, inf))
+        v_hi = torch.where(c.abs() > eps, v_hi, torch.where(v_parallel_ok, inf, neg_inf))
+
+        dy_lo = torch.maximum(u_lo, v_lo)
+        dy_hi = torch.minimum(u_hi, v_hi)
+        intersects = dy_lo <= dy_hi
+        lower_clearance = state[..., 1] + dy_lo - (
+            gate_center - float(args.gate_half_width)
+        )
+        upper_clearance = (
+            gate_center + float(args.gate_half_width)
+        ) - (state[..., 1] + dy_hi)
+        clearance = torch.minimum(lower_clearance, upper_clearance)
+        clearance = torch.where(intersects, clearance, inf)
+        return intersects, clearance
+
+    intersects, clearance = slice_clearance(state_seq, gate)
+    collided = (intersects & (clearance < 0.0)).any(dim=1)
+    sampled_min = clearance.amin(dim=1)
+
+    x_pos = state_seq[..., 0]
+    cross_idx = crossing_indices(x_pos, float(args.wall_x))
+    row = torch.arange(state_seq.shape[0], device=state_seq.device)
+    prev_idx = (cross_idx - 1).clamp_min(0)
+    state0 = state_seq[row, prev_idx]
+    state1 = state_seq[row, cross_idx]
+    x0 = state0[..., 0]
+    x1 = state1[..., 0]
+    denom = x1 - x0
+    valid = (
+        (cross_idx > 0)
+        & (((x0 - float(args.wall_x)) * (x1 - float(args.wall_x))) <= 0.0)
+        & (denom.abs() > 1e-8)
+    )
+    alpha = torch.where(
+        valid,
+        ((float(args.wall_x) - x0) / torch.where(valid, denom, torch.ones_like(denom))).clamp(0.0, 1.0),
+        torch.ones_like(denom),
+    )
+    crossing_state = state0 + alpha.unsqueeze(-1) * (state1 - state0)
+    # Interpolate yaw along the shortest arc rather than through a 2*pi jump.
+    yaw_delta = torch.atan2(
+        torch.sin(state1[..., 2] - state0[..., 2]),
+        torch.cos(state1[..., 2] - state0[..., 2]),
+    )
+    crossing_state[..., 2] = state0[..., 2] + alpha * yaw_delta
+    gate0 = gate[row, prev_idx]
+    gate1 = gate[row, cross_idx]
+    crossing_gate = gate0 + alpha * (gate1 - gate0)
+    crossing_intersects, crossing_clearance = slice_clearance(
+        crossing_state, crossing_gate,
+    )
+    sampled_intersection = intersects.any(dim=1)
+    conservative_jump_clearance = (
+        float(args.gate_half_width)
+        - maximum_body_half_extent(args)
+        - cross_error.abs()
+    )
+    # The only unobserved contact interval is a first integration step that
+    # lands completely beyond the wall (the configured starts are on its
+    # right). A robot that simply remains far from the wall must be a goal
+    # miss, not a fabricated wall collision based on its lateral coordinate.
+    unobserved_first_step_jump = (
+        (~sampled_intersection)
+        & (~valid)
+        & (cross_idx == 0)
+        & (x_pos[:, 0] <= float(args.wall_x))
+        & (float(args.start_x_min) > float(args.wall_x))
+    )
+    crossing_clearance = torch.where(
+        valid & crossing_intersects,
+        crossing_clearance,
+        torch.where(
+            sampled_intersection,
+            torch.full_like(crossing_clearance, float("inf")),
+            torch.where(
+                unobserved_first_step_jump,
+                conservative_jump_clearance,
+                torch.zeros_like(crossing_clearance),
+            ),
+        ),
+    )
+    collided = collided | (crossing_clearance < 0.0)
+    min_clearance = torch.minimum(sampled_min, crossing_clearance)
+    return collided, min_clearance
+
+
+def physical_corridor_collision(
+    *, args: argparse.Namespace, state_seq: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return oriented full-footprint side-wall collision and clearance."""
+    y_pos = state_seq[..., 1]
+    if nonlinear_robot_enabled(args):
+        if state_seq.shape[-1] != 6:
+            raise ValueError("The nonlinear corridor check expects six-state poses.")
+        vertical_extent = body_vertical_half_extent(args, state_seq[..., 2])
+        corridor_clearance = (
+            float(args.corridor_limit) - y_pos.abs() - vertical_extent
+        )
+    else:
+        corridor_clearance = float(args.corridor_limit) - y_pos.abs()
+    min_clearance = corridor_clearance.amin(dim=1)
+    if not nonlinear_robot_enabled(args):
+        # Historical point-model success depended only on the gate wall.
+        return torch.zeros_like(min_clearance, dtype=torch.bool), min_clearance
+    return min_clearance < 0.0, min_clearance
+
+
 @torch.no_grad()
 def evaluate_variant(
     *,
@@ -1978,31 +2608,114 @@ def evaluate_variant(
                 expected_cross_index=expected_cross_index,
             )
             avg_cost, loss_parts = compute_loss(args=args, batch=batch_dev, rollout=rollout)
-        pos = rollout.x_seq[..., :2]
+        # BF16 is appropriate for the differentiable rollout/loss, but the
+        # nonlinear body's millimetre-scale contact clearances must be measured
+        # in FP32 or near-tangent poses can quantize across the collision
+        # boundary. The aliases are literal identities in legacy mode.
+        metric_state = (
+            rollout.x_seq.float() if nonlinear_robot_enabled(args)
+            else rollout.x_seq
+        )
+        metric_gate = (
+            batch_dev.gate_y.float() if nonlinear_robot_enabled(args)
+            else batch_dev.gate_y
+        )
+        pos = metric_state[..., :2]
         x_pos = pos[..., 0]
         y_pos = pos[..., 1]
         cross_idx, y_cross, g_cross = interpolated_wall_crossing(
             x_pos=x_pos,
             y_pos=y_pos,
-            gate=batch_dev.gate_y,
+            gate=metric_gate,
             wall_x=float(args.wall_x),
         )
         cross_error = y_cross - g_cross
-        collided = cross_error.abs() > float(args.gate_half_width)
+        if not nonlinear_robot_enabled(args):
+            # Frozen legacy evaluation path.  Keep the original point-mass
+            # outcome definition, metric schema, and rollout schema verbatim so
+            # old scripts/checkpoints receive identical outputs.
+            collided = cross_error.abs() > float(args.gate_half_width)
+            terminal_dist = torch.norm(pos[:, -1, :] - batch_dev.goal, dim=-1)
+            goal_success = terminal_dist < float(args.goal_tol)
+            success = (~collided) & goal_success
+
+            metrics = tensor_scalars_to_floats({
+                "avg_cost": avg_cost,
+                "success_rate": success.float().mean(),
+                "wall_success_rate": (~collided).float().mean(),
+                "goal_success_rate": goal_success.float().mean(),
+                "collision_rate": collided.float().mean(),
+                "avg_abs_cross_error": cross_error.abs().mean(),
+                "avg_terminal_dist": terminal_dist.mean(),
+                "avg_control_energy": torch.sum(rollout.u_seq.square(), dim=-1).mean(),
+                "avg_abs_reconstructed_w": rollout.w_seq.abs().mean(),
+            })
+            metrics.update(loss_parts)
+            metrics["rollout"] = {
+                "x_seq": rollout.x_seq.detach().cpu().float(),
+                "u_seq": rollout.u_seq.detach().cpu().float(),
+                "w_seq": rollout.w_seq.detach().cpu().float(),
+                "cross_idx": cross_idx.detach().cpu(),
+                "success": success.detach().cpu(),
+                "collided": collided.detach().cpu(),
+            }
+            return metrics
+
+        wall_collided, min_gate_clearance = physical_wall_collision(
+            args=args,
+            state_seq=metric_state,
+            gate=metric_gate,
+            cross_error=cross_error,
+        )
+
+        corridor_collided, min_corridor_clearance = physical_corridor_collision(
+            args=args, state_seq=metric_state,
+        )
+        collided = wall_collided | corridor_collided
         terminal_dist = torch.norm(pos[:, -1, :] - batch_dev.goal, dim=-1)
-        goal_success = terminal_dist < float(args.goal_tol)
+        terminal_yaw_error = torch.atan2(
+            torch.sin(metric_state[:, -1, 2]),
+            torch.cos(metric_state[:, -1, 2]),
+        ).abs()
+        terminal_speed = torch.linalg.vector_norm(
+            metric_state[:, -1, 3:5], dim=-1,
+        )
+        terminal_yaw_rate = metric_state[:, -1, 5].abs()
+        position_success = terminal_dist < float(args.goal_tol)
+        yaw_success = terminal_yaw_error < float(args.nonlinear_goal_yaw_tol)
+        speed_success = terminal_speed < float(args.nonlinear_goal_speed_tol)
+        yaw_rate_success = (
+            terminal_yaw_rate < float(args.nonlinear_goal_yaw_rate_tol)
+        )
+        goal_success = (
+            position_success & yaw_success & speed_success & yaw_rate_success
+        )
         success = (~collided) & goal_success
 
         metrics = tensor_scalars_to_floats({
             "avg_cost": avg_cost,
             "success_rate": success.float().mean(),
-            "wall_success_rate": (~collided).float().mean(),
+            "wall_success_rate": (~wall_collided).float().mean(),
+            "corridor_success_rate": (~corridor_collided).float().mean(),
             "goal_success_rate": goal_success.float().mean(),
+            "position_success_rate": position_success.float().mean(),
+            "yaw_success_rate": yaw_success.float().mean(),
+            "speed_success_rate": speed_success.float().mean(),
+            "yaw_rate_success_rate": yaw_rate_success.float().mean(),
             "collision_rate": collided.float().mean(),
+            "wall_collision_rate": wall_collided.float().mean(),
+            "corridor_collision_rate": corridor_collided.float().mean(),
             "avg_abs_cross_error": cross_error.abs().mean(),
+            "avg_min_gate_clearance": min_gate_clearance.mean(),
+            "avg_min_corridor_clearance": min_corridor_clearance.mean(),
             "avg_terminal_dist": terminal_dist.mean(),
-            "avg_control_energy": torch.sum(rollout.u_seq.square(), dim=-1).mean(),
-            "avg_abs_reconstructed_w": rollout.w_seq.abs().mean(),
+            "avg_abs_terminal_yaw_error": terminal_yaw_error.mean(),
+            "avg_terminal_speed": terminal_speed.mean(),
+            "avg_abs_terminal_yaw_rate": terminal_yaw_rate.mean(),
+            "avg_control_energy": torch.sum(
+                normalized_control_tensor(args, rollout.u_seq.float()).square(), dim=-1,
+            ).mean(),
+            "avg_abs_reconstructed_w": rollout.w_seq.float().abs().mean(),
         })
         metrics.update(loss_parts)
         # Under CUDA BF16 autocast the rollout comes out bfloat16, which numpy
@@ -2016,6 +2729,10 @@ def evaluate_variant(
             # Per-episode outcomes (bool, (B,)) for the start-generalization map.
             "success": success.detach().cpu(),
             "collided": collided.detach().cpu(),
+            "wall_collided": wall_collided.detach().cpu(),
+            "corridor_collided": corridor_collided.detach().cpu(),
+            "min_gate_clearance": min_gate_clearance.detach().cpu().float(),
+            "min_corridor_clearance": min_corridor_clearance.detach().cpu().float(),
         }
     return metrics
 
@@ -2372,10 +3089,18 @@ def plot_wall_style_summary(
     draw_wall(ax1, float(args.wall_x), gate_center, float(args.gate_half_width), float(args.corridor_limit))
 
     for mode, label in variant_order:
-        traj = test_metrics[mode]["rollout"]["x_seq"][sample_idx, :, :2].numpy()
+        rollout = test_metrics[mode]["rollout"]
+        state_traj = rollout["x_seq"][sample_idx].numpy()
+        traj = state_traj[:, :2]
         traj_full = np.vstack([start, traj])
         lw = 2.6 if mode in ("context", "mad_context", "rpb_context", "mp_only_context", "contextual_ssm") else 2.0
         ax1.plot(traj_full[:, 0], traj_full[:, 1], color=colors[mode], lw=lw, label=label)
+        if nonlinear_robot_enabled(args):
+            cross_idx = min(int(rollout["cross_idx"][sample_idx].item()), len(traj) - 1)
+            draw_robot_body(
+                ax1, state_traj[cross_idx], args, color=colors[mode],
+                zorder=6, linewidth=1.0, point_size=52,
+            )
 
     ax1.scatter([start_x], [start_y], color="#6b7280", s=36, zorder=4, label="Start")
     ax1.scatter([0.0], [0.0], color="#111827", marker="*", s=95, zorder=5, label="Goal (0,0)")
@@ -2399,14 +3124,20 @@ def plot_wall_style_summary(
     ax3 = fig.add_subplot(gs[1, 1])
     avg_miss = [float(test_metrics[mode]["avg_abs_cross_error"]) for mode, _ in variant_order]
     ax3.bar(bar_labels, avg_miss, color=bar_colors, alpha=0.82)
+    safe_half_width = effective_gate_half_width(args)
+    finite_body = nonlinear_robot_enabled(args)
+    threshold_name = "Body-safe" if finite_body else "Safe"
     ax3.set_title(
-        f"Avg |y - g_t| at Wall (Safe threshold < {float(args.gate_half_width):.2f})",
+        f"Avg |y - g_t| at Wall ({threshold_name} threshold < {safe_half_width:.2f})",
         fontsize=12,
         fontweight="bold",
     )
-    ax3.axhline(float(args.gate_half_width), color="red", linestyle="--", label="Safe bound")
+    ax3.axhline(
+        safe_half_width, color="red", linestyle="--",
+        label="Body-safe bound" if finite_body else "Safe bound",
+    )
     ax3.legend(loc="best")
-    y_offset = max(0.03, 0.05 * max(avg_miss + [float(args.gate_half_width)]))
+    y_offset = max(0.03, 0.05 * max(avg_miss + [safe_half_width]))
     for idx, value in enumerate(avg_miss):
         ax3.text(idx, value + y_offset, f"{value:.2f}", ha="center", fontweight="bold")
 
@@ -2495,6 +3226,10 @@ def plot_control_magnitude(
     fig, ax = plt.subplots(figsize=(8.6, 4.8))
     for mode, label in variant_order:
         u_seq = test_metrics[mode]["rollout"]["u_seq"].numpy()
+        if nonlinear_robot_enabled(args):
+            u_seq = u_seq / np.asarray(
+                nonlinear_control_scales(args), dtype=u_seq.dtype,
+            )
         u_mag = np.linalg.norm(u_seq, axis=-1)
         mean = np.mean(u_mag, axis=0)
         q10 = np.quantile(u_mag, 0.10, axis=0)
@@ -2503,7 +3238,10 @@ def plot_control_magnitude(
         ax.fill_between(t, q10, q90, color=colors[mode], alpha=0.12)
     ax.set_title("Control magnitude over time")
     ax.set_xlabel("time step")
-    ax.set_ylabel(r"$\|u_t\|_2$")
+    ax.set_ylabel(
+        r"$\|u_t/u_{\max}\|_2$" if nonlinear_robot_enabled(args)
+        else r"$\|u_t\|_2$"
+    )
     ax.legend(loc="best")
     fig.tight_layout()
     fig.savefig(run_dir / "control_magnitude_over_time.png", bbox_inches="tight")
@@ -2515,7 +3253,8 @@ def plot_control_magnitude(
 def select_trajectory_indices(batch: ScenarioBatch, args: argparse.Namespace) -> list[int]:
     gate = batch.gate_y.numpy()
     noise = batch.process_noise.numpy()
-    strength = np.mean(np.abs(noise[..., 3]), axis=1)
+    lateral_velocity_idx = 4 if nonlinear_robot_enabled(args) else 3
+    strength = np.mean(np.abs(noise[..., lateral_velocity_idx]), axis=1)
     cross_gate = np.mean(gate[:, -12:], axis=1)
     idx_pos = int(np.argmax(np.where(cross_gate > 0, strength, -np.inf))) if np.any(cross_gate > 0) else 0
     idx_neg = int(np.argmax(np.where(cross_gate < 0, strength, -np.inf))) if np.any(cross_gate < 0) else idx_pos
@@ -2535,6 +3274,56 @@ def draw_wall(ax, wall_x: float, gate_center: float, half_width: float, y_limit:
     ax.axhline(-y_limit, color="#6b7280", lw=1.5, ls="-", zorder=1)
     ax.axhspan(y_limit, y_limit * 2, color="#e5e7eb", alpha=0.6, zorder=0)
     ax.axhspan(-y_limit * 2, -y_limit, color="#e5e7eb", alpha=0.6, zorder=0)
+
+
+def robot_body_vertices(center, args: argparse.Namespace) -> np.ndarray:
+    """World-frame corners of the nonlinear robot's rectangular footprint."""
+    values = np.asarray(center)
+    if values.size < 3:
+        raise ValueError("An oriented robot drawing requires [x, y, yaw].")
+    length, width = robot_body_dimensions(args)
+    local = np.asarray([
+        [0.5 * length, 0.5 * width],
+        [0.5 * length, -0.5 * width],
+        [-0.5 * length, -0.5 * width],
+        [-0.5 * length, 0.5 * width],
+    ])
+    c, s = np.cos(float(values[2])), np.sin(float(values[2]))
+    rotation = np.asarray([[c, -s], [s, c]])
+    return local @ rotation.T + values[:2]
+
+
+def draw_robot_body(
+    ax,
+    center,
+    args: argparse.Namespace,
+    *,
+    color: str,
+    zorder: int = 6,
+    alpha: float = 0.95,
+    edgecolor: str = "white",
+    linewidth: float = 0.9,
+    point_size: float = 45.0,
+):
+    """Draw an oriented physical body, or the original legacy point marker."""
+    values = np.asarray(center)
+    x, y = float(values[0]), float(values[1])
+    if not nonlinear_robot_enabled(args):
+        return ax.scatter(
+            [x], [y], color=color, s=point_size, zorder=zorder,
+            edgecolors=edgecolor, linewidths=linewidth,
+        )
+
+    from matplotlib.patches import Polygon
+
+    vertices = robot_body_vertices(values, args)
+    ax.set_aspect("equal", adjustable="box")
+    body = Polygon(
+        vertices, closed=True, facecolor=color, edgecolor=edgecolor,
+        linewidth=linewidth, alpha=alpha, zorder=zorder,
+    )
+    ax.add_patch(body)
+    return body
 
 
 def plot_trajectory_samples(
@@ -2562,10 +3351,18 @@ def plot_trajectory_samples(
         gate_center = float(test_batch.gate_y[idx, cross_idx].item())
         draw_wall(ax, float(args.wall_x), gate_center, float(args.gate_half_width), float(args.corridor_limit))
         for mode, label in variant_order:
-            traj = test_metrics[mode]["rollout"]["x_seq"][idx, :, :2].numpy()
+            rollout = test_metrics[mode]["rollout"]
+            state_traj = rollout["x_seq"][idx].numpy()
+            traj = state_traj[:, :2]
             start = test_batch.start[idx].numpy()
             traj_full = np.vstack([start, traj])
             ax.plot(traj_full[:, 0], traj_full[:, 1], color=colors[mode], lw=2.2, label=label)
+            if nonlinear_robot_enabled(args):
+                mode_cross_idx = min(int(rollout["cross_idx"][idx].item()), len(traj) - 1)
+                draw_robot_body(
+                    ax, state_traj[mode_cross_idx], args, color=colors[mode],
+                    zorder=6, linewidth=1.0, point_size=45,
+                )
         ax.scatter([test_batch.start[idx, 0].item()], [test_batch.start[idx, 1].item()], color="#6b7280", s=32, zorder=4)
         ax.scatter([0.0], [0.0], color="#111827", marker="*", s=90, zorder=5, label="Goal (0,0)")
         ax.set_title(f"Sample #{idx} | gate @ wall = {gate_center:+.2f}")
@@ -2603,12 +3400,13 @@ def plot_waiting_behavior(
     setup_plot_style(plt)
 
     roll      = reference_rollout_metrics(test_metrics)["rollout"]
-    x_seq_t   = roll["x_seq"]                          # (B, T, 4)
+    x_seq_t   = roll["x_seq"]
     cross_idx = roll["cross_idx"]                       # (B,)
     B, T, _   = x_seq_t.shape
 
-    vx        = x_seq_t[:, :, 2].numpy()               # forward velocity  (B, T)
-    vy        = x_seq_t[:, :, 3].numpy()               # lateral velocity  (B, T)
+    vel_start = 3 if nonlinear_robot_enabled(args) else 2
+    vx        = x_seq_t[:, :, vel_start].numpy()       # world velocity x  (B, T)
+    vy        = x_seq_t[:, :, vel_start + 1].numpy()   # world velocity y  (B, T)
     y_pos     = x_seq_t[:, :, 1].numpy()               # y position        (B, T)
     gate_np   = test_batch.gate_y.numpy()              # (B, T)
     sw_age    = test_batch.switch_age.numpy()          # (B, T)
@@ -2724,8 +3522,13 @@ def plot_waiting_behavior(
         ax_err.fill_between(t_rel, p_lo, p_hi, color=color, alpha=0.18)
         ax_err.plot(t_rel, mu, color=color, lw=2.4)
 
-    ax_err.axhline(float(args.gate_half_width), color="#ef4444", lw=1.3,
-                   linestyle=":", label=f"gate half-width {args.gate_half_width:.2f}")
+    safe_half_width = effective_gate_half_width(args)
+    ax_err.axhline(safe_half_width, color="#ef4444", lw=1.3,
+                   linestyle=":", label=(
+                       f"body-safe half-width {safe_half_width:.2f}"
+                       if nonlinear_robot_enabled(args) else
+                       f"gate half-width {safe_half_width:.2f}"
+                   ))
     ax_err.set_ylabel(r"$|y - g_t|$  gate error")
     ax_err.set_title("|y \u2212 gate| around wall crossing", fontweight="bold")
     ax_err.legend(fontsize=9, loc="best")
@@ -2793,24 +3596,34 @@ def _animate_one_sample(
 ) -> None:
     """Render and save one animated GIF for the given sample index."""
     from matplotlib.animation import FuncAnimation, PillowWriter
-    from matplotlib.patches import Rectangle
+    from matplotlib.patches import Polygon, Rectangle
     import matplotlib.patheffects as pe
 
     colors  = variant_colors()
     horizon = int(args.horizon)
     wall_x  = float(args.wall_x)
     half_w  = float(args.gate_half_width)
+    safe_half_w = effective_gate_half_width(args)
+    finite_body = nonlinear_robot_enabled(args)
     corr    = float(args.corridor_limit)
     x_max   = float(args.start_x_max) + 0.15
 
     gate_traj = test_batch.gate_y[sample_idx].numpy()
     start_np  = test_batch.start[sample_idx].numpy()
 
-    # per-variant trajectories: prepend start -> (T+1, 2)
+    # Per-variant trajectories.  Keep the original two-coordinate arrays in
+    # legacy mode; the nonlinear animation additionally carries yaw so the
+    # physical rectangle rotates with the simulated state.
     trajs: dict[str, np.ndarray] = {}
+    state_trajs: dict[str, np.ndarray] = {}
     for mode, _ in variant_order:
-        xy = test_metrics[mode]["rollout"]["x_seq"][sample_idx, :, :2].numpy()
+        state = test_metrics[mode]["rollout"]["x_seq"][sample_idx].numpy()
+        xy = state[:, :2]
         trajs[mode] = np.vstack([start_np, xy])
+        if finite_body:
+            start_state = np.zeros(6, dtype=state.dtype)
+            start_state[:2] = start_np
+            state_trajs[mode] = np.vstack([start_state, state])
 
     # outcome labels shown in title
     def _outcome(mode: str) -> str:
@@ -2818,12 +3631,37 @@ def _animate_one_sample(
         ci     = int(roll["cross_idx"][sample_idx].item())
         y_cross = float(trajs[mode][ci + 1, 1])
         g_cross = float(gate_traj[ci])
-        hit     = abs(y_cross - g_cross) <= half_w
+        wall_collided = roll.get("wall_collided")
+        hit = (
+            not bool(wall_collided[sample_idx].item())
+            if wall_collided is not None
+            else abs(y_cross - g_cross) <= safe_half_w
+        )
         x_term  = float(trajs[mode][-1, 0])
         y_term  = float(trajs[mode][-1, 1])
         goal_ok = (x_term ** 2 + y_term ** 2) ** 0.5 < float(args.goal_tol)
+        if finite_body:
+            terminal_yaw = float(state_trajs[mode][-1, 2])
+            yaw_error = abs(float(np.arctan2(np.sin(terminal_yaw), np.cos(terminal_yaw))))
+            terminal_speed = float(np.linalg.norm(state_trajs[mode][-1, 3:5]))
+            terminal_yaw_rate = abs(float(state_trajs[mode][-1, 5]))
+            goal_ok = (
+                goal_ok
+                and yaw_error < float(args.nonlinear_goal_yaw_tol)
+                and terminal_speed < float(args.nonlinear_goal_speed_tol)
+                and terminal_yaw_rate < float(args.nonlinear_goal_yaw_rate_tol)
+            )
+        corridor_collided = roll.get("corridor_collided")
+        corridor_ok = (
+            not bool(corridor_collided[sample_idx].item())
+            if corridor_collided is not None
+            else True
+        )
         gate_sym = "[G:pass]" if hit else "[G:fail]"
+        body_sym = "[C:clear]" if corridor_ok else "[C:hit]"
         goal_sym = "[O:pass]" if goal_ok else "[O:fail]"
+        if finite_body:
+            return f"{gate_sym} {body_sym} {goal_sym}"
         return f"{gate_sym} {goal_sym}"
 
     # ── figure ────────────────────────────────────────────────────────────────
@@ -2846,6 +3684,8 @@ def _animate_one_sample(
     # ── static arena elements ─────────────────────────────────────────────────
     ax_arena.set_xlim(-0.15, x_max)
     ax_arena.set_ylim(-corr - 0.12, corr + 0.12)
+    if finite_body:
+        ax_arena.set_aspect("equal", adjustable="box")
     ax_arena.axhline(corr, color="#475569", lw=1.5, ls="-", zorder=1)
     ax_arena.axhline(-corr, color="#475569", lw=1.5, ls="-", zorder=1)
     ax_arena.axhspan(corr, corr + 0.5, color="#334155", alpha=0.5, zorder=0)
@@ -2863,7 +3703,7 @@ def _animate_one_sample(
                       color=colors[mode], lw=1.2, alpha=0.15, zorder=2)
 
     trail_lines: dict[str, object] = {}
-    dots: dict[str, object] = {}
+    bodies: dict[str, object] = {}
     for mode, lbl in variant_order:
         lw = 2.8 if mode in ("context", "mad_context", "rpb_context", "mp_only_context", "contextual_ssm") else 1.8
         outcome = _outcome(mode)
@@ -2871,11 +3711,21 @@ def _animate_one_sample(
                             label=f"{lbl}  {outcome}",
                             path_effects=[pe.withStroke(linewidth=lw + 1.5,
                                                         foreground="#0f172a")])
-        dot, = ax_arena.plot([], [], "o", color=colors[mode], ms=9, zorder=7,
-                             path_effects=[pe.withStroke(linewidth=2.5,
-                                                         foreground="#0f172a")])
+        if finite_body:
+            body = Polygon(
+                robot_body_vertices(state_trajs[mode][0], args), closed=True,
+                facecolor=colors[mode], edgecolor="white", linewidth=1.5,
+                alpha=0.92, zorder=7,
+            )
+            ax_arena.add_patch(body)
+        else:
+            body, = ax_arena.plot(
+                [], [], "o", color=colors[mode], ms=9, zorder=7,
+                path_effects=[pe.withStroke(linewidth=2.5,
+                                            foreground="#0f172a")],
+            )
         trail_lines[mode] = ln
-        dots[mode]        = dot
+        bodies[mode] = body
 
     # wall: two solid rects + transparent gate opening rect (updated each frame)
     rect_upper = Rectangle((wall_x - 0.015, 0.0),    0.030, corr + 0.12,
@@ -2938,7 +3788,11 @@ def _animate_one_sample(
         for mode, _ in variant_order:
             xy = trajs[mode][:ti + 1]
             trail_lines[mode].set_data(xy[:, 0], xy[:, 1])
-            dots[mode].set_data([xy[-1, 0]], [xy[-1, 1]])
+            body = bodies[mode]
+            if finite_body:
+                body.set_xy(robot_body_vertices(state_trajs[mode][ti], args))
+            else:
+                body.set_data([xy[-1, 0]], [xy[-1, 1]])
 
         step_text.set_text(f"step {frame:03d}/{horizon - 1:03d}")
         vline.set_xdata([frame, frame])
@@ -2946,7 +3800,7 @@ def _animate_one_sample(
             ln.set_data(t_ax[:frame + 1], y_seq[:frame + 1])
 
         return (rect_upper, rect_lower, gate_patch, step_text, vline,
-                *trail_lines.values(), *dots.values(),
+                *trail_lines.values(), *bodies.values(),
                 *[ln for ln, _ in y_lines.values()])
 
     frames      = list(range(0, horizon, 2))
@@ -3101,15 +3955,24 @@ def plot_adversarial_switching(
     adv_succ, stable_succ = [], []
     for mode, _ in pb_modes:
         roll = test_metrics[mode]["rollout"]
-        cross_idx = roll["cross_idx"].numpy().astype(int)
-        y_cross = test_metrics[mode]["rollout"]["x_seq"][:, :, 1]
-        g_cross = torch.from_numpy(gate_np)[torch.arange(B), torch.from_numpy(cross_idx)]
-        err = (y_cross[torch.arange(B), torch.from_numpy(cross_idx)] - g_cross).abs().numpy()
-        pos = test_metrics[mode]["rollout"]["x_seq"][:, -1, :2].numpy()
-        goal_dist = np.linalg.norm(pos, axis=-1)
-        wall_ok  = err <= float(args.gate_half_width)
-        goal_ok  = goal_dist < float(args.goal_tol)
-        success  = wall_ok & goal_ok
+        if nonlinear_robot_enabled(args):
+            success = roll["success"].numpy().astype(bool)
+        else:
+            # Frozen legacy plotting policy: recompute the original discrete
+            # crossing/goal outcome instead of using interpolated evaluation.
+            cross_idx = roll["cross_idx"].numpy().astype(int)
+            y_cross = roll["x_seq"][:, :, 1]
+            g_cross = torch.from_numpy(gate_np)[
+                torch.arange(B), torch.from_numpy(cross_idx)
+            ]
+            err = (
+                y_cross[torch.arange(B), torch.from_numpy(cross_idx)] - g_cross
+            ).abs().numpy()
+            pos = roll["x_seq"][:, -1, :2].numpy()
+            goal_dist = np.linalg.norm(pos, axis=-1)
+            wall_ok = err <= float(args.gate_half_width)
+            goal_ok = goal_dist < float(args.goal_tol)
+            success = wall_ok & goal_ok
         adv_succ.append(float(success[adv_mask].mean()) if adv_mask.any() else 0.0)
         stable_succ.append(float(success[stable_mask].mean()) if stable_mask.any() else 0.0)
 
@@ -3146,8 +4009,13 @@ def plot_adversarial_switching(
         for body, (mode, _) in zip(vp["bodies"], pb_modes):
             body.set_facecolor(colors[mode])
             body.set_alpha(0.65)
-    ax_err_adv.axhline(float(args.gate_half_width), color="#ef4444", lw=1.5,
-                       linestyle="--", label=f"half-width {args.gate_half_width:.2f}")
+    safe_half_width = effective_gate_half_width(args)
+    ax_err_adv.axhline(safe_half_width, color="#ef4444", lw=1.5,
+                       linestyle="--", label=(
+                           f"body-safe half-width {safe_half_width:.2f}"
+                           if nonlinear_robot_enabled(args) else
+                           f"half-width {safe_half_width:.2f}"
+                       ))
     ax_err_adv.set_xticks(range(len(pb_modes)))
     ax_err_adv.set_xticklabels([labels[m] for m, _ in pb_modes],
                                  rotation=12, ha="right", fontsize=8)
@@ -3178,12 +4046,22 @@ def plot_adversarial_switching(
             for mode, label in variant_order:
                 if mode == "nominal":
                     continue
-                xy = test_metrics[mode]["rollout"]["x_seq"][idx, :, :2].numpy()
+                state = test_metrics[mode]["rollout"]["x_seq"][idx].numpy()
+                xy = state[:, :2]
                 start = test_batch.start[idx].numpy()
                 traj = np.vstack([start, xy])
                 lw = 2.2 if mode in ("context", "mad_context", "rpb_context", "mp_only_context", "contextual_ssm") else 1.4
                 ax_traj.plot(traj[:, 0], traj[:, 1], color=colors[mode], lw=lw,
                              alpha=0.8, label=label if idx == int(adv_indices[0]) else "")
+                if nonlinear_robot_enabled(args):
+                    mode_ci = min(
+                        int(test_metrics[mode]["rollout"]["cross_idx"][idx].item()),
+                        len(xy) - 1,
+                    )
+                    draw_robot_body(
+                        ax_traj, state[mode_ci], args, color=colors[mode],
+                        zorder=6, linewidth=0.8, point_size=28,
+                    )
         corr_adv = float(args.corridor_limit)
         ax_traj.axhline(corr_adv, color="#6b7280", lw=1.5, ls="-", zorder=1)
         ax_traj.axhline(-corr_adv, color="#6b7280", lw=1.5, ls="-", zorder=1)
@@ -3255,19 +4133,26 @@ def plot_sample_trajectory(
     # Helper: extend a trajectory past the control horizon using zero-input nominal dynamics
     nominal_plant_ext, _ = build_navigation_plants(args)
 
-    def extend_traj(xy: np.ndarray) -> np.ndarray:
-        """xy: (T, 2) — extend to (T_plot, 2) with u=0 nominal rollout."""
+    def extend_traj(state_seq: np.ndarray) -> np.ndarray:
+        """Extend a state trajectory with zero input; return its x/y trace."""
+        xy = state_seq[:, :2]
         if T_plot <= T:
             return xy
-        x = torch.tensor(xy[-1], dtype=torch.float32).view(1, 1, 2)
-        # Pad velocity to 4-D state — assume zero velocity at T (conservative)
-        x4 = torch.zeros(1, 1, 4, dtype=torch.float32)
-        x4[..., :2] = x
+        nx, nu = navigation_dimensions(args)
+        if nonlinear_robot_enabled(args):
+            x_state = torch.tensor(
+                state_seq[-1], dtype=torch.float32,
+            ).view(1, 1, nx)
+        else:
+            # Literal legacy plotting policy: discard terminal velocity.
+            x = torch.tensor(xy[-1], dtype=torch.float32).view(1, 1, 2)
+            x_state = torch.zeros(1, 1, 4, dtype=torch.float32)
+            x_state[..., :2] = x
         tail = [xy[-1]]
-        u_zero = torch.zeros(1, 1, 2, dtype=torch.float32)
+        u_zero = torch.zeros(1, 1, nu, dtype=torch.float32)
         for _ in range(T_plot - T):
-            x4 = nominal_plant_ext.nominal_dynamics(x4, u_zero)
-            tail.append(x4[0, 0, :2].numpy())
+            x_state = nominal_plant_ext.nominal_dynamics(x_state, u_zero)
+            tail.append(x_state[0, 0, :2].numpy())
         return np.concatenate([xy, np.stack(tail[1:])], axis=0)
 
     fig, (ax_top, ax_ts) = plt.subplots(
@@ -3304,8 +4189,8 @@ def plot_sample_trajectory(
     for mode, label in variant_order:
         if mode not in test_metrics:
             continue
-        traj = test_metrics[mode]["rollout"]["x_seq"][sample_idx, :, :2].numpy()  # (T, 2)
-        traj = extend_traj(traj)
+        state_seq = test_metrics[mode]["rollout"]["x_seq"][sample_idx].numpy()
+        traj = extend_traj(state_seq)
         x_traj, y_traj = traj[:, 0], traj[:, 1]
         # Colour trajectory by time
         pts = np.stack([x_traj, y_traj], axis=1)[np.newaxis]  # (1, T, 2)
@@ -3313,9 +4198,21 @@ def plot_sample_trajectory(
         lc = LineCollection(segs, cmap="viridis", linewidth=2.0, alpha=0.85, zorder=5)  # noqa
         lc.set_array(np.linspace(0, 1, len(segs)))
         ax_top.add_collection(lc)
-        # Mark start and end
+        # Mark start, wall crossing (at physical scale), and end.
         ax_top.scatter(x_traj[0], y_traj[0], s=40, color=colors.get(mode, "#888"),
                        zorder=6, marker="o")
+        if nonlinear_robot_enabled(args):
+            mode_cross_idx = min(
+                int(test_metrics[mode]["rollout"]["cross_idx"][sample_idx].item()),
+                len(traj) - 1,
+            )
+            draw_robot_body(
+                ax_top,
+                test_metrics[mode]["rollout"]["x_seq"][sample_idx, mode_cross_idx].numpy(),
+                args,
+                color=colors.get(mode, "#888"), zorder=7,
+                linewidth=1.0, point_size=48,
+            )
         ax_top.scatter(x_traj[-1], y_traj[-1], s=40, color=colors.get(mode, "#888"),
                        zorder=6, marker="x")
 
@@ -3342,7 +4239,7 @@ def plot_sample_trajectory(
         if mode not in test_metrics:
             continue
         y_seq_ctrl = test_metrics[mode]["rollout"]["x_seq"][sample_idx, :, 1].numpy()
-        traj_ext = extend_traj(test_metrics[mode]["rollout"]["x_seq"][sample_idx, :, :2].numpy())
+        traj_ext = extend_traj(test_metrics[mode]["rollout"]["x_seq"][sample_idx].numpy())
         y_seq = traj_ext[:, 1]
         cross_idx = int(test_metrics[mode]["rollout"]["cross_idx"][sample_idx].item())
         c = colors.get(mode, "#888")
@@ -3489,16 +4386,65 @@ def _storyboard_episode_outcome(
     gate_center = float(test_batch.gate_y[episode_idx, cross_idx].item())
     cross_error = abs(float(xy[cross_idx, 1].item()) - gate_center)
     terminal_distance = float(torch.linalg.vector_norm(xy[-1]).item())
-    wall_clear = cross_error <= float(args.gate_half_width)
-    goal_reached = terminal_distance <= float(args.goal_tol)
+    if not nonlinear_robot_enabled(args):
+        # Literal original storyboard outcome/schema for legacy runs.
+        wall_clear = cross_error <= float(args.gate_half_width)
+        goal_reached = terminal_distance <= float(args.goal_tol)
+        return {
+            "cross_idx": cross_idx,
+            "cross_error": cross_error,
+            "gate_clearance": float(args.gate_half_width) - cross_error,
+            "terminal_distance": terminal_distance,
+            "wall_clear": wall_clear,
+            "goal_reached": goal_reached,
+            "success": wall_clear and goal_reached,
+        }
+
+    wall_collided = rollout.get("wall_collided")
+    wall_clear = (
+        not bool(wall_collided[episode_idx].item())
+        if wall_collided is not None
+        else cross_error <= effective_gate_half_width(args)
+    )
+    corridor_collided = rollout.get("corridor_collided")
+    corridor_clear = (
+        not bool(corridor_collided[episode_idx].item())
+        if corridor_collided is not None
+        else True
+    )
+    terminal_yaw = float(rollout["x_seq"][episode_idx, -1, 2].item())
+    terminal_yaw_error = abs(float(np.arctan2(np.sin(terminal_yaw), np.cos(terminal_yaw))))
+    terminal_speed = float(torch.linalg.vector_norm(
+        rollout["x_seq"][episode_idx, -1, 3:5],
+    ).item())
+    terminal_yaw_rate = abs(float(
+        rollout["x_seq"][episode_idx, -1, 5].item()
+    ))
+    goal_reached = (
+        terminal_distance <= float(args.goal_tol)
+        and terminal_yaw_error <= float(args.nonlinear_goal_yaw_tol)
+        and terminal_speed <= float(args.nonlinear_goal_speed_tol)
+        and terminal_yaw_rate <= float(args.nonlinear_goal_yaw_rate_tol)
+    )
+    min_gate_clearance = rollout.get("min_gate_clearance")
+    gate_clearance = (
+        float(min_gate_clearance[episode_idx].item())
+        if min_gate_clearance is not None
+        else effective_gate_half_width(args) - cross_error
+    )
     return {
         "cross_idx": cross_idx,
         "cross_error": cross_error,
-        "gate_clearance": float(args.gate_half_width) - cross_error,
+        "gate_clearance": gate_clearance,
         "terminal_distance": terminal_distance,
+        "terminal_yaw_error": terminal_yaw_error,
+        "terminal_speed": terminal_speed,
+        "terminal_yaw_rate": terminal_yaw_rate,
         "wall_clear": wall_clear,
+        "corridor_clear": corridor_clear,
+        "body_clear": wall_clear and corridor_clear,
         "goal_reached": goal_reached,
-        "success": wall_clear and goal_reached,
+        "success": wall_clear and corridor_clear and goal_reached,
     }
 
 
@@ -3570,7 +4516,7 @@ def _pick_comparison_storyboard_episode(
         }
         for episode_idx in range(n_episodes)
     ]
-    half_width = float(args.gate_half_width)
+    half_width = effective_gate_half_width(args)
     central_pass_limit = 0.55 * half_width
 
     display_names = {
@@ -3845,7 +4791,11 @@ def plot_architecture_comparison_storyboard(
         draw_status_badge(
             ax, y=0.48,
             icon="cross" if crashed else "check",
-            label="Wall crash" if crashed else "Gate passed",
+            label=(
+                ("Body collision" if crashed else "Collision-free")
+                if nonlinear_robot_enabled(args) else
+                ("Wall crash" if crashed else "Gate passed")
+            ),
             color="#dc2626" if crashed else "#16a34a",
         )
         draw_status_badge(
@@ -3865,13 +4815,18 @@ def plot_architecture_comparison_storyboard(
     phase_names = ("approach", "commit", "wall event", "end")
     first_row_axes = []
     for row, (mode, label) in enumerate(selected):
+        state_sequence = test_metrics[mode]["rollout"]["x_seq"][chosen].numpy()
         trajectory = np.vstack([
             start,
-            test_metrics[mode]["rollout"]["x_seq"][chosen, :, :2].numpy(),
+            state_sequence[:, :2],
         ])
+        if nonlinear_robot_enabled(args):
+            start_state = np.zeros(6, dtype=state_sequence.dtype)
+            start_state[:2] = start
+            state_trajectory = np.vstack([start_state, state_sequence])
         outcome = outcomes[mode]
         wall_clear = bool(outcome["wall_clear"])
-        crashed = not wall_clear
+        crashed = not bool(outcome.get("body_clear", outcome["wall_clear"]))
         goal_reached = bool(outcome["goal_reached"])
 
         for col, (phase, t_snap) in enumerate(zip(phase_names, row_snapshot_steps(int(outcome["cross_idx"])))):
@@ -3901,11 +4856,25 @@ def plot_architecture_comparison_storyboard(
             ax.plot(trail[:, 0], trail[:, 1], color=colors[mode], lw=3.4, zorder=4)
             at_wall_event = col == 2
             marker = "o" if (not at_wall_event or wall_clear) else "X"
-            ax.scatter(
-                trail[-1, 0], trail[-1, 1], marker=marker,
-                color=colors[mode], s=110 if marker == "o" else 145,
-                edgecolors="white", linewidths=1.4, zorder=6,
-            )
+            if nonlinear_robot_enabled(args):
+                draw_robot_body(
+                    ax, state_trajectory[t_snap + 1], args,
+                    color=colors[mode], zorder=6,
+                    linewidth=1.4, point_size=110,
+                )
+            else:
+                # Frozen legacy marker styling.
+                ax.scatter(
+                    trail[-1, 0], trail[-1, 1], marker=marker,
+                    color=colors[mode], s=110 if marker == "o" else 145,
+                    edgecolors="white", linewidths=1.4, zorder=6,
+                )
+            if nonlinear_robot_enabled(args) and marker == "X":
+                ax.scatter(
+                    trail[-1, 0], trail[-1, 1], marker="X",
+                    color="#dc2626", s=145, edgecolors="white",
+                    linewidths=1.4, zorder=7,
+                )
             ax.scatter(start[0], start[1], color="#475569", s=46, edgecolors="white", linewidths=0.8, zorder=5)
             ax.scatter(0.0, 0.0, color="#111827", marker="*", s=135, zorder=7)
 
@@ -4005,6 +4974,7 @@ def plot_unified_architecture_comparison(
     gate = test_batch.gate_y[chosen].numpy()
     start = test_batch.start[chosen, :2].numpy()
     half_width = float(args.gate_half_width)
+    safe_half_width = effective_gate_half_width(args)
     corridor = float(args.corridor_limit)
     wall_x = float(args.wall_x)
     x_min = -0.15
@@ -4045,7 +5015,8 @@ def plot_unified_architecture_comparison(
 
     # Draw the preferred architecture last so coincident sections remain visible.
     for mode, label in reversed(selected):
-        xy = test_metrics[mode]["rollout"]["x_seq"][chosen, :, :2].numpy()
+        state = test_metrics[mode]["rollout"]["x_seq"][chosen].numpy()
+        xy = state[:, :2]
         trajectory = np.vstack([start, xy])
         line, = ax_xy.plot(
             trajectory[:, 0], trajectory[:, 1],
@@ -4057,13 +5028,26 @@ def plot_unified_architecture_comparison(
         ])
         cross_idx = int(outcomes[mode]["cross_idx"])
         wall_clear = bool(outcomes[mode]["wall_clear"])
-        ax_xy.scatter(
-            xy[cross_idx, 0], xy[cross_idx, 1],
-            marker="o" if wall_clear else "X",
-            s=120 if wall_clear else 155,
-            color=colors[mode], edgecolors="white", linewidths=1.5,
-            zorder=8,
-        )
+        if nonlinear_robot_enabled(args):
+            draw_robot_body(
+                ax_xy, state[cross_idx], args, color=colors[mode], zorder=8,
+                linewidth=1.5, point_size=120,
+            )
+        else:
+            # Frozen legacy crossing marker.
+            ax_xy.scatter(
+                xy[cross_idx, 0], xy[cross_idx, 1],
+                marker="o" if wall_clear else "X",
+                s=120 if wall_clear else 155,
+                color=colors[mode], edgecolors="white", linewidths=1.5,
+                zorder=8,
+            )
+        if nonlinear_robot_enabled(args) and not wall_clear:
+            ax_xy.scatter(
+                xy[cross_idx, 0], xy[cross_idx, 1], marker="X",
+                s=155, color="#dc2626", edgecolors="white",
+                linewidths=1.5, zorder=9,
+            )
 
     ax_xy.scatter(
         start[0], start[1], marker="o", s=90,
@@ -4092,7 +5076,7 @@ def plot_unified_architecture_comparison(
     # Align each gate-error trace to that controller's own crossing event. This
     # makes pass/fail directly comparable even though absolute crossing times differ.
     pre_steps, post_steps = 30, 12
-    max_abs_error = half_width
+    max_abs_error = safe_half_width
     for mode, _label in selected:
         xy = test_metrics[mode]["rollout"]["x_seq"][chosen, :, :2].numpy()
         cross_idx = int(outcomes[mode]["cross_idx"])
@@ -4114,15 +5098,16 @@ def plot_unified_architecture_comparison(
             edgecolors="white", linewidths=1.4, zorder=7,
         )
 
-    ax_error.axhspan(-half_width, half_width, color="#bbf7d0", alpha=0.55, zorder=0)
-    ax_error.axhline(half_width, color="#16a34a", lw=1.3, ls="--", alpha=0.75, zorder=1)
-    ax_error.axhline(-half_width, color="#16a34a", lw=1.3, ls="--", alpha=0.75, zorder=1)
+    ax_error.axhspan(-safe_half_width, safe_half_width, color="#bbf7d0", alpha=0.55, zorder=0)
+    ax_error.axhline(safe_half_width, color="#16a34a", lw=1.3, ls="--", alpha=0.75, zorder=1)
+    ax_error.axhline(-safe_half_width, color="#16a34a", lw=1.3, ls="--", alpha=0.75, zorder=1)
     ax_error.axvline(0, color="#64748b", lw=2.0, ls=":", zorder=2)
     ax_error.text(
-        -pre_steps + 1.0, half_width * 0.72, "safe gate band",
+        -pre_steps + 1.0, safe_half_width * 0.72,
+        "body-safe gate band" if nonlinear_robot_enabled(args) else "safe gate band",
         fontsize=11.5, color="#15803d", va="center",
     )
-    error_lim = min(corridor * 1.05, max(half_width * 1.8, 1.08 * max_abs_error))
+    error_lim = min(corridor * 1.05, max(safe_half_width * 1.8, 1.08 * max_abs_error))
     ax_error.set_xlim(-pre_steps, post_steps)
     ax_error.set_ylim(-error_lim, error_lim)
     ax_error.set_xlabel("Steps relative to each controller's wall crossing $\\tau$", fontsize=15)
@@ -4269,9 +5254,15 @@ def plot_trajectory_storyboard(
 
     # ── Trajectories (prepend start -> T+1 pts) ────────────────────────────────
     trajs: dict[str, np.ndarray] = {}
+    state_trajs: dict[str, np.ndarray] = {}
     for mode, _ in variant_order:
-        xy = test_metrics[mode]["rollout"]["x_seq"][chosen, :, :2].numpy()
+        state = test_metrics[mode]["rollout"]["x_seq"][chosen].numpy()
+        xy = state[:, :2]
         trajs[mode] = np.vstack([start_np[:2], xy])
+        if nonlinear_robot_enabled(args):
+            start_state = np.zeros(6, dtype=state.dtype)
+            start_state[:2] = start_np[:2]
+            state_trajs[mode] = np.vstack([start_state, state])
 
     # ── Layout: 5 arena panels (tall) + 1 gate strip (short) ─────────────────
     fig = plt.figure(figsize=(17.0, 5.2))
@@ -4317,9 +5308,16 @@ def plot_trajectory_storyboard(
             trail = trajs[mode][:t_snap + 2]
             ax.plot(trail[:, 0], trail[:, 1],
                     color=colors[mode], lw=2.0, alpha=0.90, zorder=4)
-            ax.scatter(trail[-1, 0], trail[-1, 1],
-                       color=colors[mode], s=45, zorder=6,
-                       edgecolors="white", linewidths=0.8)
+            if nonlinear_robot_enabled(args):
+                draw_robot_body(
+                    ax, state_trajs[mode][t_snap + 1], args,
+                    color=colors[mode], zorder=6,
+                    linewidth=0.8, point_size=45,
+                )
+            else:
+                ax.scatter(trail[-1, 0], trail[-1, 1],
+                           color=colors[mode], s=45, zorder=6,
+                           edgecolors="white", linewidths=0.8)
 
         # Start marker (first panel only)
         if col == 0:
@@ -4480,9 +5478,15 @@ def plot_trajectory_storyboard_compact(
     cursor_colors = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#7c3aed"]
 
     trajs: dict[str, np.ndarray] = {}
+    state_trajs: dict[str, np.ndarray] = {}
     for mode, _ in variant_order:
-        xy = test_metrics[mode]["rollout"]["x_seq"][chosen, :, :2].numpy()
+        state = test_metrics[mode]["rollout"]["x_seq"][chosen].numpy()
+        xy = state[:, :2]
         trajs[mode] = np.vstack([start_np[:2], xy])
+        if nonlinear_robot_enabled(args):
+            start_state = np.zeros(6, dtype=state.dtype)
+            start_state[:2] = start_np[:2]
+            state_trajs[mode] = np.vstack([start_state, state])
 
     # ── Compact layout: 5 narrow panels + slim gate strip ─────────────────────
     fig = plt.figure(figsize=(7.2, 3.4))
@@ -4525,9 +5529,16 @@ def plot_trajectory_storyboard_compact(
             trail = trajs[mode][:t_snap + 2]
             ax.plot(trail[:, 0], trail[:, 1],
                     color=colors[mode], lw=1.5, alpha=0.90, zorder=4)
-            ax.scatter(trail[-1, 0], trail[-1, 1],
-                       color=colors[mode], s=18, zorder=6,
-                       edgecolors="white", linewidths=0.5)
+            if nonlinear_robot_enabled(args):
+                draw_robot_body(
+                    ax, state_trajs[mode][t_snap + 1], args,
+                    color=colors[mode], zorder=6,
+                    linewidth=0.5, point_size=18,
+                )
+            else:
+                ax.scatter(trail[-1, 0], trail[-1, 1],
+                           color=colors[mode], s=18, zorder=6,
+                           edgecolors="white", linewidths=0.5)
 
         # Start (first panel) + goal
         if col == 0:
@@ -4749,6 +5760,14 @@ def _run_ablation_sweep(args: argparse.Namespace, device: torch.device, *,
     run_name = args.run_id or f"{run_prefix}_{arch}_{timestamp}"
     run_dir = Path(__file__).resolve().parent / "runs" / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    validate_existing_run_model(run_dir, args, log_prefix=run_prefix)
+    # Persist ABI provenance before the first checkpoint so a preempted or
+    # fanned-out sweep can always be resumed/combined safely.
+    initial_config = config_payload_for_args(args)
+    initial_config["expected_cross_index"] = int(expected_cross_index)
+    initial_config["ablation_only_label"] = ""
+    initial_config.update(extra_config)
+    save_json(run_dir / "config.json", initial_config)
 
     val_batch = sample_batch(args=args, batch_size=int(args.val_batch), seed=int(args.seed) + 50_000,
                              paired=True, shuffle=False, expected_cross_index=expected_cross_index)
@@ -4832,7 +5851,7 @@ def _run_ablation_sweep(args: argparse.Namespace, device: torch.device, *,
         merge_json(run_dir / "val_metrics.json", {label: strip_rollout(best_val)})
         merge_json(run_dir / "train_history.json", {label: history})
 
-    config_payload = dict(vars(args))
+    config_payload = config_payload_for_args(args)
     config_payload["expected_cross_index"] = int(expected_cross_index)
     config_payload["ablation_only_label"] = ""
     config_payload.update(extra_config)
@@ -5009,7 +6028,8 @@ def run_custom_rollout(args: argparse.Namespace, device: torch.device) -> None:
             probe, _ = build_controller(torch.device("cpu"), args)
             target = count_params(probe)
             del probe
-            base_w_dim = 8 if getattr(args, "use_w_augment", False) else 4
+            nx, _ = navigation_dimensions(args)
+            base_w_dim = nx * 2 if getattr(args, "use_w_augment", False) else nx
             mp_in_dim = base_w_dim + (
                 int(args.mp_context_lift_dim) if bool(args.mp_context_lift) else 0
             )
@@ -5087,8 +6107,14 @@ def run_custom_rollout(args: argparse.Namespace, device: torch.device) -> None:
     for mode, label in specs:
         m = test_metrics[mode]
         roll = m["rollout"]
-        outcome = ("SUCCESS" if bool(roll["success"][0])
-                   else ("WALL HIT" if bool(roll["collided"][0]) else "MISSED GOAL"))
+        if bool(roll["success"][0]):
+            outcome = "SUCCESS"
+        elif bool(roll.get("wall_collided", roll["collided"])[0]):
+            outcome = "WALL HIT"
+        elif bool(roll.get("corridor_collided", roll["collided"])[0]):
+            outcome = "CORRIDOR HIT"
+        else:
+            outcome = "MISSED GOAL"
         print(f"{label:40s} {outcome:12s} cross_err={m['avg_abs_cross_error']:.3f} "
               f"terminal={m['avg_terminal_dist']:.3f}")
         summary[mode] = {"outcome": outcome,
@@ -5114,7 +6140,16 @@ def run_custom_rollout(args: argparse.Namespace, device: torch.device) -> None:
     ax.scatter([0.0], [0.0], marker="*", s=150, color="#f59e0b", label="goal", zorder=5)
     ax.scatter([start[0]], [start[1]], s=55, color="#334155", label="start", zorder=5)
     for mode, label in specs:
-        xy = test_metrics[mode]["rollout"]["x_seq"][0, :, :2].numpy()
+        rollout = test_metrics[mode]["rollout"]
+        state_raw = rollout["x_seq"][0].numpy()
+        xy_raw = state_raw[:, :2]
+        cross_idx = min(int(rollout["cross_idx"][0].item()), len(xy_raw) - 1)
+        if nonlinear_robot_enabled(args):
+            draw_robot_body(
+                ax, state_raw[cross_idx], args, color=colors[mode],
+                zorder=6, linewidth=1.0, point_size=48,
+            )
+        xy = xy_raw
         xy = np.vstack([start, xy])
         ax.plot(xy[:, 0], xy[:, 1], color=colors[mode], lw=2.0,
                 label=f"{label} — {summary[mode]['outcome'].lower()}")
@@ -5344,8 +6379,9 @@ def main() -> None:
     run_name = args.run_id or f"{_gate_tag}_xy_{timestamp}"
     run_dir = Path(__file__).resolve().parent / "runs" / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    validate_existing_run_model(run_dir, args, log_prefix="run")
 
-    config_payload = dict(vars(args))
+    config_payload = config_payload_for_args(args)
     config_payload["context_dim"] = int(context_dim(args))
     config_payload["expected_cross_index"] = int(expected_cross_index)
     save_json(run_dir / "config.json", config_payload)
@@ -5396,7 +6432,7 @@ def main() -> None:
         factorized_total = count_params(_tmp_ctrl)
         del _tmp_ctrl
 
-        nx = 4
+        nx, _ = navigation_dimensions(args)
         base_w_dim = nx * 2 if getattr(args, "use_w_augment", False) else nx
         mp_in_dim_with_lift = base_w_dim + (int(args.mp_context_lift_dim) if bool(args.mp_context_lift) else 0)
         if args.mp_only_ssm_d_model is not None:
@@ -5560,7 +6596,7 @@ def plot_start_generalization(
 ) -> None:
     """Per-variant map of TEST-episode outcomes at their start positions.
 
-    Green = success, red x = wall hit, hollow orange = reached the wall but
+    Green = success, red x = collision, hollow orange = reached the wall but
     missed the goal. The dotted box marks the TRAINING start region, so
     out-of-distribution starts (via --test_start_*) are immediately visible.
     """
@@ -5585,7 +6621,9 @@ def plot_start_generalization(
         ax.scatter(starts[succ, 0], starts[succ, 1], s=14, color="#16a34a",
                    alpha=0.75, label="success", zorder=3)
         ax.scatter(starts[coll, 0], starts[coll, 1], s=20, color="#dc2626",
-                   marker="x", alpha=0.85, label="wall hit", zorder=3)
+                   marker="x", alpha=0.85,
+                   label=("body collision" if nonlinear_robot_enabled(args) else "wall hit"),
+                   zorder=3)
         ax.scatter(starts[miss, 0], starts[miss, 1], s=18, facecolors="none",
                    edgecolors="#f59e0b", alpha=0.85, label="missed goal", zorder=3)
         ax.axvline(float(args.wall_x), color="#475569", lw=1.2, ls="--")
