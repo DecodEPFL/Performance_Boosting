@@ -25,7 +25,13 @@ os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".mp
 
 from bounded_mlp_operator import BoundedMLPOperator, DiagonalBoundedMLPOperator
 from context_lifting import LpContextLifter
-from nav_plants import DoubleIntegratorNominal, DoubleIntegratorTrue
+from nav_plants import (
+    DoubleIntegratorNominal,
+    DoubleIntegratorTrue,
+    NonlinearRobotConfig,
+    NonlinearRobotNominal,
+    NonlinearRobotTrue,
+)
 from pb_core import PBController, as_bt, rollout_pb, validate_component_compatibility, WIntegralAugmenter
 from pb_core.factories import build_factorized_controller
 from ssm_operators import MpDeepSSM, MpContextualSSM
@@ -192,13 +198,67 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_storyboard_compact", dest="use_storyboard_compact", action="store_true")
     parser.add_argument("--no_storyboard_compact", dest="use_storyboard_compact", action="store_false")
     parser.set_defaults(use_storyboard_compact=True)
+    parser.add_argument("--use_comparison_storyboard", dest="use_comparison_storyboard", action="store_true",
+                        help="Create the journal-scale comparison storyboard for architecture, "
+                             "context-ablation, or SSM-depth comparisons. "
+                             "Each controller gets its own row and its own crossing snapshot; "
+                             "for C. Factorization/MAD/rPB comparisons, prefer a held-out "
+                             "episode where C. Factorization cleanly passes while MAD, rPB, "
+                             "and the context-agnostic baseline miss the gate.")
+    parser.add_argument("--no_comparison_storyboard", dest="use_comparison_storyboard", action="store_false")
+    parser.set_defaults(use_comparison_storyboard=True)
+    parser.add_argument("--use_unified_comparison", dest="use_unified_comparison", action="store_true",
+                        help="Create the compact two-panel architecture figure: overlaid spatial "
+                             "trajectories with controller-specific gate openings, plus gate error "
+                             "aligned to each controller's own wall-crossing time.")
+    parser.add_argument("--no_unified_comparison", dest="use_unified_comparison", action="store_false")
+    parser.set_defaults(use_unified_comparison=True)
+    parser.add_argument("--use_animations", dest="use_animations", action="store_true",
+                        help="Render rollout GIFs after all static figures. Disable for a "
+                             "faster plot-only replay or on slow synchronized filesystems.")
+    parser.add_argument("--no_animations", dest="use_animations", action="store_false")
+    parser.set_defaults(use_animations=True)
+    parser.add_argument(
+        "--robot_model", type=str, default="legacy",
+        choices=["legacy", "nonlinear"],
+        help="Robot dynamics used consistently for scheduling, training, evaluation, "
+             "and plots. 'legacy' preserves the original pre-stabilized double "
+             "integrator. 'nonlinear' activates the strongly nonlinear, realistic "
+             "pre-stabilized robot model.",
+    )
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--pre_kp", type=float, default=0.32)
     parser.add_argument("--pre_kd", type=float, default=0.80)
     parser.add_argument("--drag_coeff", type=float, default=0.0,
-                        help="Quadratic velocity-drag coefficient c in the plant: "
+                        help="Legacy-model quadratic velocity-drag coefficient c: "
                              "acc -= c*||vel||*vel (added to BOTH nominal and true "
                              "dynamics). 0 = linear double integrator. ~0.5-2 is 'a bit'.")
+    parser.add_argument("--nonlinear_mass", type=float, default=1.0,
+                        help="Nonlinear model only: robot mass (> 0).")
+    parser.add_argument("--nonlinear_cubic_stiffness", type=float, default=0.10,
+                        help="Nonlinear model only: radial Duffing restoring-force "
+                             "coefficient multiplying ||position||^2 position.")
+    parser.add_argument("--nonlinear_quadratic_drag", type=float, default=0.35,
+                        help="Nonlinear model only: dissipative ||velocity|| velocity drag.")
+    parser.add_argument("--nonlinear_coulomb_friction", type=float, default=0.06,
+                        help="Nonlinear model only: smooth rolling/Coulomb friction magnitude.")
+    parser.add_argument("--nonlinear_friction_velocity", type=float, default=0.12,
+                        help="Nonlinear model only: velocity scale that smooths Coulomb friction.")
+    parser.add_argument("--nonlinear_gyro_gain", type=float, default=0.18,
+                        help="Nonlinear model only: energy-neutral cross-axis/gyroscopic coupling.")
+    parser.add_argument("--nonlinear_gyro_position_scale", type=float, default=1.0,
+                        help="Nonlinear model only: position dependence of gyroscopic coupling.")
+    parser.add_argument("--nonlinear_actuator_limit", type=float, default=2.5,
+                        help="Nonlinear model only: smooth limit on total actuator-force norm.")
+    parser.add_argument("--nonlinear_actuator_deadzone", type=float, default=0.06,
+                        help="Nonlinear model only: smooth low-command actuator dead-zone.")
+    parser.add_argument("--nonlinear_speed_loss", type=float, default=0.20,
+                        help="Nonlinear model only: actuator-authority loss proportional "
+                             "to squared speed.")
+    parser.add_argument("--nonlinear_lateral_slip", type=float, default=0.30,
+                        help="Nonlinear model only: cross-speed-dependent traction loss.")
+    parser.add_argument("--nonlinear_physics_substeps", type=int, default=2,
+                        help="Nonlinear model only: semi-implicit physics substeps per dt.")
     parser.add_argument("--start_x_min", type=float, default=1.7)
     parser.add_argument("--start_x_max", type=float, default=2.1)
     parser.add_argument("--start_y_max", type=float, default=0.40)
@@ -334,7 +394,7 @@ def build_parser() -> argparse.ArgumentParser:
     # the mixer (router) / input (driver) / gate ports.  Added as an extra variant
     # alongside the hand-rolled factorized M_b x M_p controllers.
     parser.add_argument("--contextual_comparison", dest="contextual_comparison", action="store_true",
-                        help="Include the ContextualDeepSSM variant (default on).")
+                        help="Include the C. Factorization variant (default on).")
     parser.add_argument("--no_contextual_comparison", dest="contextual_comparison", action="store_false")
     parser.set_defaults(contextual_comparison=True)
     parser.add_argument("--match_to_contextual", dest="match_to_contextual", action="store_true",
@@ -345,7 +405,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no_match_to_contextual", dest="match_to_contextual", action="store_false")
     parser.set_defaults(match_to_contextual=False)
     parser.add_argument("--ctx_modes", type=str, default="mixer,input,gate",
-                        help="Comma-separated context ports for ContextualDeepSSM: any of "
+                        help="Comma-separated context ports for C. Factorization: any of "
                              "mixer,input,gate,select.")
     parser.add_argument("--ctx_filter", type=str, default="taper",
                         choices=["auto", "finite_horizon", "taper", "exponential", "polynomial",
@@ -361,7 +421,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ctx_d_features", type=int, default=16,
                         help="Core feature width fed to the mixer (analogous to feat_dim).")
     parser.add_argument("--ctx_gamma", type=float, default=0.0,
-                        help="Prescribed L2 gain cap for the ContextualDeepSSM core. "
+                        help="Prescribed L2 gain cap for the C. Factorization core. "
                              "0 -> no cap (free finite gain, matches the other SSM variants).")
     parser.add_argument("--ctx_gate_per_channel", dest="ctx_gate_per_channel", action="store_true",
                         help="Per-channel (vs scalar) sigmoid gates in the 'gate' port.")
@@ -373,7 +433,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "Adds 'select' to --ctx_modes if not already present.")
     parser.set_defaults(ctx_select=False)
     parser.add_argument("--ctx_z_scale", type=float, default=1.0,
-                        help="Target per-feature scale of the context fed to ContextualDeepSSM. "
+                        help="Target per-feature scale of the context fed to C. Factorization. "
                              "The shared context builder multiplies its physically-normalized "
                              "features by --z_scale (tuned for the bounded-MLP M_b); the "
                              "contextual operator rescales them by ctx_z_scale/z_scale before "
@@ -519,6 +579,57 @@ def build_parser() -> argparse.ArgumentParser:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return build_parser().parse_args(argv)
+
+
+NavigationNominalPlant = DoubleIntegratorNominal | NonlinearRobotNominal
+NavigationTruePlant = DoubleIntegratorTrue | NonlinearRobotTrue
+
+
+def nonlinear_robot_config_from_args(args: argparse.Namespace) -> NonlinearRobotConfig:
+    """Translate experiment parameters into the shared nonlinear-plant config."""
+    return NonlinearRobotConfig(
+        dt=float(getattr(args, "dt", 0.05)),
+        pre_kp=float(getattr(args, "pre_kp", 0.32)),
+        pre_kd=float(getattr(args, "pre_kd", 0.80)),
+        mass=float(getattr(args, "nonlinear_mass", 1.0)),
+        cubic_stiffness=float(getattr(args, "nonlinear_cubic_stiffness", 0.10)),
+        quadratic_drag=float(getattr(args, "nonlinear_quadratic_drag", 0.35)),
+        coulomb_friction=float(getattr(args, "nonlinear_coulomb_friction", 0.06)),
+        friction_velocity=float(getattr(args, "nonlinear_friction_velocity", 0.12)),
+        gyro_gain=float(getattr(args, "nonlinear_gyro_gain", 0.18)),
+        gyro_position_scale=float(getattr(args, "nonlinear_gyro_position_scale", 1.0)),
+        actuator_limit=float(getattr(args, "nonlinear_actuator_limit", 2.5)),
+        actuator_deadzone=float(getattr(args, "nonlinear_actuator_deadzone", 0.06)),
+        speed_loss=float(getattr(args, "nonlinear_speed_loss", 0.20)),
+        lateral_slip=float(getattr(args, "nonlinear_lateral_slip", 0.30)),
+        physics_substeps=int(getattr(args, "nonlinear_physics_substeps", 2)),
+    )
+
+
+def build_navigation_plants(
+    args: argparse.Namespace,
+) -> tuple[NavigationNominalPlant, NavigationTruePlant]:
+    """Build a bit-for-bit matched nominal/true pair for the selected model.
+
+    ``getattr(..., 'legacy')`` is intentional: old saved configurations and
+    hand-built Namespaces predate ``--robot_model`` and must continue to replay
+    with the original double integrator.
+    """
+    model = str(getattr(args, "robot_model", "legacy")).strip().lower()
+    if model == "legacy":
+        kwargs = {
+            "dt": float(getattr(args, "dt", 0.05)),
+            "pre_kp": float(getattr(args, "pre_kp", 0.32)),
+            "pre_kd": float(getattr(args, "pre_kd", 0.80)),
+            "drag_coeff": float(getattr(args, "drag_coeff", 0.0)),
+        }
+        return DoubleIntegratorNominal(**kwargs), DoubleIntegratorTrue(**kwargs)
+    if model == "nonlinear":
+        config = nonlinear_robot_config_from_args(args)
+        return NonlinearRobotNominal(config), NonlinearRobotTrue(config)
+    raise ValueError(
+        f"Unknown robot model {model!r}; choose 'legacy' or 'nonlinear'."
+    )
 
 
 def set_seeds(seed: int) -> None:
@@ -707,24 +818,20 @@ def find_matched_d_model(
 
 
 def contextual_label(args=None) -> str:
-    modes = "mixer,input,gate"
-    if args is not None:
-        modes = str(getattr(args, "ctx_modes", modes))
-        if getattr(args, "ctx_select", False) and "select" not in modes.split(","):
-            modes = f"{modes},select"
-    return f"PB+SSM: ContextualDeepSSM ({modes})"
+    """Paper-facing name for the contextual factorization architecture."""
+    return "C. Factorization"
 
 
 # Canonical label for every supported variant (used by --variants selection).
 ALL_VARIANTS: dict[str, str] = {
     "nominal": "Nominal only",
-    "disturbance_only": "PB+SSM: no context",
+    "disturbance_only": "Context-agnostic",
     "context": "PB+SSM: factorized M_b x M_p",
-    "mad_context": "PB+SSM: MAD s=1",
-    "rpb_context": "rPB: diagonal context mixer",
+    "mad_context": "MAD",
+    "rpb_context": "rPB",
     "mp_only_context": "PB+SSM: M_p-only + lift (matched params)",
     "context_no_lift": "PB+SSM: factorized M_b x M_p (no lift)",
-    "contextual_ssm": "PB+SSM: ContextualDeepSSM",
+    "contextual_ssm": "C. Factorization",
 }
 
 
@@ -749,22 +856,22 @@ def variant_specs(args=None) -> list[tuple[str, str]]:
     if args is not None and getattr(args, "simple_comparison", False) and not lift_cmp:
         specs = [
             ("nominal", "Nominal only"),
-            ("disturbance_only", "PB+SSM: no context"),
+            ("disturbance_only", ALL_VARIANTS["disturbance_only"]),
             ("context", "PB+SSM: factorized M_b x M_p"),
         ]
         if mad_cmp:
-            specs.append(("mad_context", "PB+SSM: MAD s=1"))
+            specs.append(("mad_context", ALL_VARIANTS["mad_context"]))
         if ctx_cmp:
             specs.append(("contextual_ssm", contextual_label(args)))
         return specs
     specs = [
         ("nominal", "Nominal only"),
-        ("disturbance_only", "PB+SSM: no context"),
+        ("disturbance_only", ALL_VARIANTS["disturbance_only"]),
         ("context", "PB+SSM: factorized M_b x M_p"),
     ]
     if mad_cmp:
-        specs.append(("mad_context", "PB+SSM: MAD s=1"))
-    specs.append(("rpb_context", "rPB: diagonal context mixer"))
+        specs.append(("mad_context", ALL_VARIANTS["mad_context"]))
+    specs.append(("rpb_context", ALL_VARIANTS["rpb_context"]))
     specs.append(("mp_only_context", "PB+SSM: M_p-only + lift (matched params)"))
     if args is not None and getattr(args, "lift_comparison", False):
         specs.append(("context_no_lift", "PB+SSM: factorized M_b x M_p (no lift)"))
@@ -888,7 +995,7 @@ def build_gate_features(gates: np.ndarray, ema_alpha: float) -> tuple[np.ndarray
 
 
 def estimate_expected_cross_index(args: argparse.Namespace) -> int:
-    plant = DoubleIntegratorTrue(dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd), drag_coeff=float(args.drag_coeff))
+    _, plant = build_navigation_plants(args)
     start_x = 0.5 * (float(args.start_x_min) + float(args.start_x_max))
     x = torch.tensor([[[start_x, 0.0, 0.0, 0.0]]], dtype=torch.float32)
     u = torch.zeros(1, 1, 2, dtype=torch.float32)
@@ -949,8 +1056,7 @@ def cross_index_interpolator(args: argparse.Namespace, x_lo: float, x_hi: float)
     horizon = int(args.horizon)
     lo, hi = float(min(x_lo, x_hi)), float(max(x_lo, x_hi))
     grid = np.linspace(lo, hi, num=17, dtype=np.float64)
-    plant = DoubleIntegratorTrue(dt=float(args.dt), pre_kp=float(args.pre_kp),
-                                 pre_kd=float(args.pre_kd), drag_coeff=float(args.drag_coeff))
+    _, plant = build_navigation_plants(args)
     x = torch.zeros(len(grid), 1, 4, dtype=torch.float32)
     x[:, 0, 0] = torch.from_numpy(grid.astype(np.float32))
     u = torch.zeros(len(grid), 1, 2, dtype=torch.float32)
@@ -1299,7 +1405,14 @@ class ContextRescale(torch.nn.Module):
 
 def cli_has_override(cli_overrides: set[str], dest: str) -> bool:
     flag = f"--{dest}"
-    return flag in cli_overrides or any(tok.startswith(f"{flag}=") for tok in cli_overrides)
+    negative_flags = {f"--no_{dest}"}
+    if dest.startswith("use_"):
+        negative_flags.add(f"--no_{dest.removeprefix('use_')}")
+    return (
+        flag in cli_overrides
+        or any(tok.startswith(f"{flag}=") for tok in cli_overrides)
+        or bool(negative_flags & cli_overrides)
+    )
 
 
 def apply_saved_config(args: argparse.Namespace, saved_cfg: dict, cli_overrides: set[str], *,
@@ -1323,7 +1436,7 @@ def apply_saved_config(args: argparse.Namespace, saved_cfg: dict, cli_overrides:
 def build_contextual_controller(
     device: torch.device,
     args: argparse.Namespace,
-) -> tuple[PBController, DoubleIntegratorTrue]:
+) -> tuple[PBController, NavigationTruePlant]:
     """Build a PBController whose operator is a single neural_ssm.ContextualDeepSSM.
 
     Context is injected through the ports named in --ctx_modes (mixer/input/gate/
@@ -1364,14 +1477,7 @@ def build_contextual_controller(
     if abs(rescale - 1.0) > 1e-9:
         context_encoder = ContextRescale(rescale)
 
-    nominal_plant = DoubleIntegratorNominal(
-        dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd),
-        drag_coeff=float(args.drag_coeff),
-    )
-    true_plant = DoubleIntegratorTrue(
-        dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd),
-        drag_coeff=float(args.drag_coeff),
-    )
+    nominal_plant, true_plant = build_navigation_plants(args)
 
     operator = MpContextualSSM(
         nx,
@@ -1431,7 +1537,7 @@ def build_controller(
     ssm_layers_override: int | None = None,
     diagonal_mixer: bool = False,
     contextual: bool = False,
-) -> tuple[PBController, DoubleIntegratorTrue]:
+) -> tuple[PBController, NavigationTruePlant]:
     """Build a PBController + true plant.
 
     Args:
@@ -1482,18 +1588,7 @@ def build_controller(
         ).to(device)
         mp_in_dim = w_dim + int(args.mp_context_lift_dim)
 
-    nominal_plant = DoubleIntegratorNominal(
-        dt=float(args.dt),
-        pre_kp=float(args.pre_kp),
-        pre_kd=float(args.pre_kd),
-        drag_coeff=float(args.drag_coeff),
-    )
-    true_plant = DoubleIntegratorTrue(
-        dt=float(args.dt),
-        pre_kp=float(args.pre_kp),
-        pre_kd=float(args.pre_kd),
-        drag_coeff=float(args.drag_coeff),
-    )
+    nominal_plant, true_plant = build_navigation_plants(args)
 
     ssm_d_model = int(ssm_d_model_override if ssm_d_model_override is not None else args.ssm_d_model)
     ssm_n_layers = int(ssm_layers_override if ssm_layers_override is not None else args.ssm_layers)
@@ -1571,7 +1666,7 @@ def rollout_nominal(
     device: torch.device,
 ) -> RolloutArtifacts:
     batch = batch.to(device)
-    plant_true = DoubleIntegratorTrue(dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd), drag_coeff=float(args.drag_coeff))
+    _, plant_true = build_navigation_plants(args)
     x = make_x0(batch, device)
     x_log = []
     u_log = []
@@ -1597,7 +1692,7 @@ def rollout_pb_variant(
     batch: ScenarioBatch,
     device: torch.device,
     controller: PBController,
-    plant_true: DoubleIntegratorTrue,
+    plant_true: NavigationTruePlant,
     zero_context: bool,
     expected_cross_index: int = 0,
     training: bool = False,
@@ -1635,7 +1730,7 @@ def rollout_variant(
     device: torch.device,
     mode: str,
     controller: PBController | None,
-    plant_true: DoubleIntegratorTrue | None,
+    plant_true: NavigationTruePlant | None,
     expected_cross_index: int = 0,
     training: bool = False,
 ) -> RolloutArtifacts:
@@ -1865,7 +1960,7 @@ def evaluate_variant(
     device: torch.device,
     mode: str,
     controller: PBController | None,
-    plant_true: DoubleIntegratorTrue | None,
+    plant_true: NavigationTruePlant | None,
     expected_cross_index: int = 0,
 ) -> dict:
     # Pure evaluation: no autograd graph. Halves eval peak memory (important on
@@ -1984,7 +2079,7 @@ def train_controller(
     contextual: bool = False,
     run_dir: Path | None = None,
     save_tag: str | None = None,
-) -> tuple[PBController | None, DoubleIntegratorTrue | None, list[dict], dict]:
+) -> tuple[PBController | None, NavigationTruePlant | None, list[dict], dict]:
     """Train one variant. When ``run_dir`` is given, the best checkpoint and the
     training history are additionally persisted at every eval (as
     ``{tag}_controller.partial.pt`` / ``train_history_partial.json``) so a
@@ -3158,10 +3253,7 @@ def plot_sample_trajectory(
                                np.full(T_plot - T, gate_np_ctrl[-1])]) if T_plot > T else gate_np_ctrl
 
     # Helper: extend a trajectory past the control horizon using zero-input nominal dynamics
-    nominal_plant_ext = DoubleIntegratorNominal(
-        dt=float(args.dt), pre_kp=float(args.pre_kp), pre_kd=float(args.pre_kd),
-        drag_coeff=float(args.drag_coeff),
-    )
+    nominal_plant_ext, _ = build_navigation_plants(args)
 
     def extend_traj(xy: np.ndarray) -> np.ndarray:
         """xy: (T, 2) — extend to (T_plot, 2) with u=0 nominal rollout."""
@@ -3379,6 +3471,716 @@ def _storyboard_snapshot_steps(
         steps.insert(i + 1, steps[i] + width // 2)
         steps = sorted(set(steps))
     return steps, cross_step
+
+
+def _storyboard_episode_outcome(
+    *,
+    args: argparse.Namespace,
+    test_batch: ScenarioBatch,
+    test_metrics: dict[str, dict],
+    mode: str,
+    episode_idx: int,
+) -> dict[str, float | int | bool]:
+    """Compute a controller-specific crossing outcome for one shared episode."""
+    rollout = test_metrics[mode]["rollout"]
+    horizon = int(test_batch.gate_y.shape[1])
+    cross_idx = int(np.clip(int(rollout["cross_idx"][episode_idx].item()), 0, horizon - 1))
+    xy = rollout["x_seq"][episode_idx, :, :2]
+    gate_center = float(test_batch.gate_y[episode_idx, cross_idx].item())
+    cross_error = abs(float(xy[cross_idx, 1].item()) - gate_center)
+    terminal_distance = float(torch.linalg.vector_norm(xy[-1]).item())
+    wall_clear = cross_error <= float(args.gate_half_width)
+    goal_reached = terminal_distance <= float(args.goal_tol)
+    return {
+        "cross_idx": cross_idx,
+        "cross_error": cross_error,
+        "gate_clearance": float(args.gate_half_width) - cross_error,
+        "terminal_distance": terminal_distance,
+        "wall_clear": wall_clear,
+        "goal_reached": goal_reached,
+        "success": wall_clear and goal_reached,
+    }
+
+
+def _comparison_storyboard_modes(
+    variant_order: list[tuple[str, str]],
+    test_metrics: dict[str, dict],
+    *,
+    args: argparse.Namespace | None = None,
+    max_modes: int = 4,
+) -> list[tuple[str, str]]:
+    """Pick the most informative rows for a journal comparison figure."""
+    available = [(mode, label) for mode, label in variant_order if mode in test_metrics]
+    if args is not None and (
+        getattr(args, "ablate_context", False) or getattr(args, "ablate_layers", False)
+    ):
+        return available
+    preferred = (
+        "contextual_ssm", "mad_context", "rpb_context", "disturbance_only",
+        "context", "mp_only_context", "context_no_lift", "nominal",
+    )
+    by_mode = {mode: label for mode, label in available}
+    selected = [(mode, by_mode[mode]) for mode in preferred if mode in by_mode]
+    selected.extend((mode, label) for mode, label in available if mode not in {m for m, _ in selected})
+    return selected[:max_modes]
+
+
+def _pick_comparison_storyboard_episode(
+    *,
+    args: argparse.Namespace,
+    test_batch: ScenarioBatch,
+    test_metrics: dict[str, dict],
+    modes: list[str],
+    sample_idx: int,
+) -> tuple[int, str, dict[str, dict[str, float | int | bool]]]:
+    """Choose a reproducible held-out episode that makes an architecture contrast clear.
+
+    When C. Factorization, MAD, rPB, and a context-agnostic baseline are all
+    present, the first preference is a clean C. Factorization success with wall
+    collisions for all three baselines. The same rule degrades gracefully for
+    smaller comparisons, and the decision is written next to the figure.
+    """
+    n_episodes = int(test_batch.gate_y.shape[0])
+    is_ablation = bool(
+        getattr(args, "ablate_context", False) or getattr(args, "ablate_layers", False)
+    )
+    if is_ablation:
+        primary = max(
+            modes,
+            key=lambda mode: (
+                float(test_metrics[mode].get("success_rate", 0.0)),
+                int(mode == "full"),
+                -float(test_metrics[mode].get("avg_abs_cross_error", float("inf"))),
+            ),
+        )
+    else:
+        primary = "contextual_ssm" if "contextual_ssm" in modes else modes[0]
+    challengers = [mode for mode in ("mad_context", "rpb_context") if mode in modes]
+    context_agnostic = next(
+        (mode for mode in ("disturbance_only", "nominal") if mode in modes),
+        None,
+    )
+    all_outcomes = [
+        {
+            mode: _storyboard_episode_outcome(
+                args=args, test_batch=test_batch, test_metrics=test_metrics,
+                mode=mode, episode_idx=episode_idx,
+            )
+            for mode in modes
+        }
+        for episode_idx in range(n_episodes)
+    ]
+    half_width = float(args.gate_half_width)
+    central_pass_limit = 0.55 * half_width
+
+    display_names = {
+        "contextual_ssm": "C. Factorization",
+        "mad_context": "MAD",
+        "rpb_context": "rPB",
+        "context": "Factorized PB",
+        "disturbance_only": "the context-agnostic baseline",
+        "nominal": "the nominal baseline",
+    }
+    primary_name = display_names.get(primary, primary)
+    rules = []
+    if is_ablation:
+        comparison_modes = [mode for mode in modes if mode != primary]
+        if comparison_modes:
+            rules.extend([
+                (
+                    f"{primary_name} cleanly passes; all other settings hit the wall",
+                    lambda outcome: (
+                        bool(outcome[primary]["success"])
+                        and float(outcome[primary]["cross_error"]) <= central_pass_limit
+                        and all(not bool(outcome[mode]["wall_clear"])
+                                for mode in comparison_modes)
+                    ),
+                ),
+                (
+                    f"{primary_name} succeeds; all other settings hit the wall",
+                    lambda outcome: (
+                        bool(outcome[primary]["success"])
+                        and all(not bool(outcome[mode]["wall_clear"])
+                                for mode in comparison_modes)
+                    ),
+                ),
+                (
+                    f"{primary_name} succeeds; at least one other setting hits the wall",
+                    lambda outcome: (
+                        bool(outcome[primary]["success"])
+                        and any(not bool(outcome[mode]["wall_clear"])
+                                for mode in comparison_modes)
+                    ),
+                ),
+            ])
+    elif challengers:
+        names = " and ".join(display_names.get(mode, mode) for mode in challengers)
+        if context_agnostic is not None:
+            baseline_name = display_names[context_agnostic]
+            all_names = ", ".join(
+                [display_names.get(mode, mode) for mode in challengers]
+            ) + f", and {baseline_name}"
+            rules.append((
+                f"{primary_name} cleanly passes; {all_names} hit the wall",
+                lambda outcome: (
+                    bool(outcome[primary]["success"])
+                    and float(outcome[primary]["cross_error"]) <= central_pass_limit
+                    and all(not bool(outcome[mode]["wall_clear"]) for mode in challengers)
+                    and not bool(outcome[context_agnostic]["wall_clear"])
+                ),
+            ))
+            rules.append((
+                f"{primary_name} succeeds; {all_names} hit the wall",
+                lambda outcome: (
+                    bool(outcome[primary]["success"])
+                    and all(not bool(outcome[mode]["wall_clear"]) for mode in challengers)
+                    and not bool(outcome[context_agnostic]["wall_clear"])
+                ),
+            ))
+        rules.append((
+            f"{primary_name} cleanly passes; {names} hit the wall",
+            lambda outcome: (
+                bool(outcome[primary]["success"])
+                and float(outcome[primary]["cross_error"]) <= central_pass_limit
+                and all(not bool(outcome[mode]["wall_clear"]) for mode in challengers)
+            ),
+        ))
+        rules.append((
+            f"{primary_name} succeeds; {names} hit the wall",
+            lambda outcome: (
+                bool(outcome[primary]["success"])
+                and all(not bool(outcome[mode]["wall_clear"]) for mode in challengers)
+            ),
+        ))
+        rules.append((
+            f"{primary_name} succeeds; at least one constrained baseline hits the wall",
+            lambda outcome: (
+                bool(outcome[primary]["success"])
+                and any(not bool(outcome[mode]["wall_clear"]) for mode in challengers)
+            ),
+        ))
+    rules.extend([
+        (f"{primary_name} succeeds", lambda outcome: bool(outcome[primary]["success"])),
+        (f"{primary_name} clears the gate", lambda outcome: bool(outcome[primary]["wall_clear"])),
+        ("best available held-out episode", lambda outcome: True),
+    ])
+
+    def score(episode_idx: int) -> tuple[float, int]:
+        outcome = all_outcomes[episode_idx]
+        primary_outcome = outcome[primary]
+        if is_ablation:
+            contrast_modes = [mode for mode in modes if mode != primary]
+        else:
+            contrast_modes = challengers + ([context_agnostic] if context_agnostic is not None else [])
+        contrast = sum(
+            max(0.0, -float(outcome[mode]["gate_clearance"]))
+            for mode in contrast_modes
+        )
+        quality = (
+            3.0 * max(0.0, float(primary_outcome["gate_clearance"]))
+            - 0.25 * float(primary_outcome["terminal_distance"])
+            + contrast
+        )
+        return quality, int(episode_idx == sample_idx)
+
+    for reason, predicate in rules:
+        candidates = [idx for idx, outcome in enumerate(all_outcomes) if predicate(outcome)]
+        if candidates:
+            chosen = max(candidates, key=score)
+            return chosen, reason, all_outcomes[chosen]
+    raise RuntimeError("Could not choose an episode for the comparison storyboard.")
+
+
+def plot_architecture_comparison_storyboard(
+    *,
+    args: argparse.Namespace,
+    run_dir: Path,
+    variant_order: list[tuple[str, str]],
+    test_batch: ScenarioBatch,
+    test_metrics: dict[str, dict],
+    show_plots: bool = False,
+    sample_idx: int = 0,
+) -> None:
+    """Journal-scale storyboard with one row per comparison item.
+
+    Unlike the compact storyboard, this comparison figure never overlays multiple
+    rollouts in an arena panel. Every row follows one architecture, context set,
+    or layer setting through its own approach, commitment, wall event, and final
+    state, so differing crossing times remain visually honest.
+    """
+    import matplotlib
+    try:
+        matplotlib.use("Agg")
+    except Exception:
+        pass
+    from matplotlib import pyplot as plt
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import FancyBboxPatch, Patch
+
+    selected = _comparison_storyboard_modes(
+        variant_order, test_metrics, args=args,
+    )
+    if len(selected) < 2:
+        return
+
+    if getattr(args, "ablate_context", False):
+        comparison_title = "Context ablation"
+        output_stem = "context_ablation_storyboard"
+    elif getattr(args, "ablate_layers", False):
+        comparison_title = "SSM depth comparison"
+        output_stem = "layer_comparison_storyboard"
+    else:
+        comparison_title = "Architecture comparison"
+        output_stem = "architecture_comparison_storyboard"
+    gate_title = "continuous moving gate" if is_continuous_gate(args) else "switching gate"
+
+    setup_plot_style(plt)
+    colors = variant_colors()
+    modes = [mode for mode, _ in selected]
+    chosen, selection_reason, outcomes = _pick_comparison_storyboard_episode(
+        args=args, test_batch=test_batch, test_metrics=test_metrics,
+        modes=modes, sample_idx=sample_idx,
+    )
+
+    horizon = int(test_batch.gate_y.shape[1])
+    gate = test_batch.gate_y[chosen].numpy()
+    start = test_batch.start[chosen, :2].numpy()
+    half_width = float(args.gate_half_width)
+    corridor = float(args.corridor_limit)
+    wall_x = float(args.wall_x)
+    x_min = -0.15
+    x_max = max(float(args.start_x_max), float(start[0])) * 1.08
+    y_lim = corridor * 1.08
+    legend_columns = min(5, len(selected) + 1)
+    legend_rows = int(np.ceil((len(selected) + 1) / legend_columns))
+    fig_height = 2.0 + 4.25 * len(selected) + 0.55 * (legend_rows - 1)
+    top_margin_inches = 3.0 + 0.55 * (legend_rows - 1)
+    grid_top = 1.0 - top_margin_inches / fig_height
+    grid_bottom = 0.85 / fig_height
+    fig = plt.figure(figsize=(22.5, fig_height))
+    gs = GridSpec(
+        len(selected), 4, figure=fig,
+        height_ratios=[1.0] * len(selected),
+        hspace=0.56, wspace=0.14,
+    )
+    legend_handles = []
+    for mode, label in selected:
+        legend_handles.append(Line2D(
+            [0], [0], color=colors[mode], lw=3.5,
+            label=label,
+        ))
+    legend_handles.append(Patch(facecolor="#bbf7d0", alpha=0.70, label="Gate opening"))
+    fig.legend(
+        handles=legend_handles, loc="upper center",
+        bbox_to_anchor=(0.5, 1.0 - 1.20 / fig_height),
+        ncol=legend_columns, fontsize=15, handlelength=2.8,
+        columnspacing=1.8, borderpad=0.85,
+        frameon=True, framealpha=0.94, facecolor="white", edgecolor="#d1d5db",
+    )
+
+    def draw_status_badge(
+        ax, *, y: float, icon: str, label: str, color: str,
+    ) -> None:
+        """Draw a high-contrast vector outcome icon and label."""
+        x = -0.88
+        ax.scatter(
+            [x], [y], transform=ax.transAxes, clip_on=False,
+            marker="o", s=420, facecolor=color, edgecolor="white",
+            linewidth=1.8, zorder=11,
+        )
+        if icon == "check":
+            ax.plot(
+                [x - 0.017, x - 0.004, x + 0.020],
+                [y, y - 0.016, y + 0.021],
+                transform=ax.transAxes, clip_on=False,
+                color="white", lw=2.7, solid_capstyle="round", zorder=12,
+            )
+        elif icon == "cross":
+            ax.plot(
+                [x - 0.016, x + 0.016], [y - 0.022, y + 0.022],
+                transform=ax.transAxes, clip_on=False,
+                color="white", lw=2.5, solid_capstyle="round", zorder=12,
+            )
+            ax.plot(
+                [x - 0.016, x + 0.016], [y + 0.022, y - 0.022],
+                transform=ax.transAxes, clip_on=False,
+                color="white", lw=2.5, solid_capstyle="round", zorder=12,
+            )
+        elif icon == "target":
+            ax.scatter(
+                [x], [y], transform=ax.transAxes, clip_on=False,
+                marker="o", s=112, facecolor="none", edgecolor="white",
+                linewidth=1.8, zorder=12,
+            )
+            ax.scatter(
+                [x], [y], transform=ax.transAxes, clip_on=False,
+                marker="o", s=22, facecolor="white", edgecolor="none", zorder=13,
+            )
+        ax.text(
+            x + 0.085, y, label, transform=ax.transAxes,
+            ha="left", va="center", fontsize=15.5, color=color,
+            fontweight="bold", clip_on=False, zorder=12,
+        )
+
+    def draw_controller_status(
+        ax, *, label: str, mode_color: str, crashed: bool, goal_reached: bool,
+    ) -> None:
+        """Group controller name and the two independent rollout outcomes."""
+        panel = FancyBboxPatch(
+            (-1.00, 0.18), 0.58, 0.62,
+            boxstyle="round,pad=0.025,rounding_size=0.025",
+            transform=ax.transAxes, clip_on=False,
+            facecolor="#f8fafc", edgecolor=mode_color,
+            linewidth=1.5, alpha=0.98, zorder=8,
+        )
+        ax.add_patch(panel)
+        ax.text(
+            -0.47, 0.69, label, transform=ax.transAxes,
+            ha="right", va="center",
+            fontsize=max(13.5, 19.0 - 0.30 * max(0, len(label) - 16)),
+            color=mode_color,
+            fontweight="bold", clip_on=False, zorder=12,
+        )
+        draw_status_badge(
+            ax, y=0.48,
+            icon="cross" if crashed else "check",
+            label="Wall crash" if crashed else "Gate passed",
+            color="#dc2626" if crashed else "#16a34a",
+        )
+        draw_status_badge(
+            ax, y=0.31,
+            icon="target" if goal_reached else "cross",
+            label="Goal reached" if goal_reached else "Goal missed",
+            color="#0f766e" if goal_reached else "#d97706",
+        )
+
+    def row_snapshot_steps(cross_idx: int) -> list[int]:
+        cross_idx = int(np.clip(cross_idx, 1, horizon - 1))
+        approach = max(1, int(round(0.35 * cross_idx)))
+        commit = max(approach + 1, int(round(0.75 * cross_idx)))
+        commit = min(commit, max(1, cross_idx - 1))
+        return [approach, commit, cross_idx, horizon - 1]
+
+    phase_names = ("approach", "commit", "wall event", "end")
+    first_row_axes = []
+    for row, (mode, label) in enumerate(selected):
+        trajectory = np.vstack([
+            start,
+            test_metrics[mode]["rollout"]["x_seq"][chosen, :, :2].numpy(),
+        ])
+        outcome = outcomes[mode]
+        wall_clear = bool(outcome["wall_clear"])
+        crashed = not wall_clear
+        goal_reached = bool(outcome["goal_reached"])
+
+        for col, (phase, t_snap) in enumerate(zip(phase_names, row_snapshot_steps(int(outcome["cross_idx"])))):
+            ax = fig.add_subplot(gs[row, col])
+            if row == 0:
+                first_row_axes.append(ax)
+            gate_center = float(gate[t_snap])
+            ax.axhspan(corridor, y_lim, color="#e5e7eb", alpha=0.82, zorder=0)
+            ax.axhspan(-y_lim, -corridor, color="#e5e7eb", alpha=0.82, zorder=0)
+            ax.axhline(corridor, color="#64748b", lw=1.25, zorder=1)
+            ax.axhline(-corridor, color="#64748b", lw=1.25, zorder=1)
+            ax.fill_betweenx(
+                [-y_lim, gate_center - half_width], wall_x - 0.018, wall_x + 0.018,
+                color="#94a3b8", zorder=2,
+            )
+            ax.fill_betweenx(
+                [gate_center + half_width, y_lim], wall_x - 0.018, wall_x + 0.018,
+                color="#94a3b8", zorder=2,
+            )
+            ax.fill_betweenx(
+                [gate_center - half_width, gate_center + half_width], wall_x - 0.018, wall_x + 0.018,
+                color="#bbf7d0", alpha=0.92, zorder=2,
+            )
+
+            ax.plot(trajectory[:, 0], trajectory[:, 1], color=colors[mode], lw=1.8, alpha=0.16, zorder=1)
+            trail = trajectory[: t_snap + 2]
+            ax.plot(trail[:, 0], trail[:, 1], color=colors[mode], lw=3.4, zorder=4)
+            at_wall_event = col == 2
+            marker = "o" if (not at_wall_event or wall_clear) else "X"
+            ax.scatter(
+                trail[-1, 0], trail[-1, 1], marker=marker,
+                color=colors[mode], s=110 if marker == "o" else 145,
+                edgecolors="white", linewidths=1.4, zorder=6,
+            )
+            ax.scatter(start[0], start[1], color="#475569", s=46, edgecolors="white", linewidths=0.8, zorder=5)
+            ax.scatter(0.0, 0.0, color="#111827", marker="*", s=135, zorder=7)
+
+            ax.set_title(f"$t={t_snap}$", fontsize=16, pad=10, color="#1f2937")
+            ax.set_xlim(x_max, x_min)
+            ax.set_ylim(-y_lim, y_lim)
+            ax.set_xlabel("Longitudinal position $x$", fontsize=17)
+            if col == 0:
+                ax.set_ylabel("Lateral position $y$", fontsize=17, labelpad=11)
+                draw_controller_status(
+                    ax, label=label, mode_color=colors[mode],
+                    crashed=crashed, goal_reached=goal_reached,
+                )
+            else:
+                ax.set_yticklabels([])
+            ax.tick_params(labelsize=14)
+
+    fig.suptitle(
+        f"{comparison_title} - {gate_title}",
+        fontsize=25, fontweight="bold", y=1.0 - 0.10 / fig_height,
+    )
+    fig.text(0.5, 1.0 - 0.55 / fig_height,
+             f"Episode #{chosen}. Same gate realization and initial condition for every row.",
+             ha="center", va="top", fontsize=16, color="#334155")
+    fig.subplots_adjust(left=0.19, right=0.988, top=grid_top, bottom=grid_bottom)
+    for phase, ax in zip(phase_names, first_row_axes):
+        bounds = ax.get_position()
+        header_y = bounds.y1 + 0.68 / fig_height
+        fig.text(
+            0.5 * (bounds.x0 + bounds.x1), header_y,
+            phase.title(), ha="center", va="bottom",
+            fontsize=20, fontweight="bold", color="#0f172a",
+        )
+        fig.add_artist(Line2D(
+            [bounds.x0 + 0.012, bounds.x1 - 0.012],
+            [header_y - 0.15 / fig_height, header_y - 0.15 / fig_height],
+            transform=fig.transFigure, color="#94a3b8",
+            lw=2.0, solid_capstyle="round",
+        ))
+
+    selection_payload = {
+        "episode_idx": int(chosen),
+        "selection_rule": selection_reason,
+        "modes_shown": modes,
+        "outcomes": outcomes,
+    }
+    save_json(run_dir / f"{output_stem}_selection.json", selection_payload)
+    pdf_out = run_dir / f"{output_stem}.pdf"
+    png_out = run_dir / f"{output_stem}.png"
+    fig.savefig(str(pdf_out), bbox_inches="tight")
+    fig.savefig(str(png_out), dpi=300, bbox_inches="tight")
+    print(f"Saved {comparison_title.lower()} storyboard -> {pdf_out}")
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_unified_architecture_comparison(
+    *,
+    args: argparse.Namespace,
+    run_dir: Path,
+    variant_order: list[tuple[str, str]],
+    test_batch: ScenarioBatch,
+    test_metrics: dict[str, dict],
+    show_plots: bool = False,
+    sample_idx: int = 0,
+) -> None:
+    """Compact paper figure combining spatial paths and event-aligned gate error."""
+    if getattr(args, "ablate_context", False) or getattr(args, "ablate_layers", False):
+        return
+
+    import matplotlib
+    try:
+        matplotlib.use("Agg")
+    except Exception:
+        pass
+    from matplotlib import patheffects as path_effects
+    from matplotlib import pyplot as plt
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.lines import Line2D
+
+    selected = _comparison_storyboard_modes(
+        variant_order, test_metrics, args=args,
+    )
+    if len(selected) < 2:
+        return
+
+    setup_plot_style(plt)
+    colors = variant_colors()
+    modes = [mode for mode, _ in selected]
+    chosen, selection_reason, outcomes = _pick_comparison_storyboard_episode(
+        args=args, test_batch=test_batch, test_metrics=test_metrics,
+        modes=modes, sample_idx=sample_idx,
+    )
+
+    horizon = int(test_batch.gate_y.shape[1])
+    gate = test_batch.gate_y[chosen].numpy()
+    start = test_batch.start[chosen, :2].numpy()
+    half_width = float(args.gate_half_width)
+    corridor = float(args.corridor_limit)
+    wall_x = float(args.wall_x)
+    x_min = -0.15
+    x_max = max(float(args.start_x_max), float(start[0])) * 1.08
+    y_lim = corridor * 1.08
+
+    fig = plt.figure(figsize=(18.8, 12.4))
+    gs = GridSpec(2, 1, figure=fig, height_ratios=[2.05, 1.0], hspace=0.34)
+    ax_xy = fig.add_subplot(gs[0])
+    ax_error = fig.add_subplot(gs[1])
+
+    # The wall is shared, but the opening is time-dependent. Draw the wall once
+    # and place a narrow color-coded aperture bracket for each controller at its
+    # own crossing time instead of implying one common gate snapshot.
+    ax_xy.axhspan(corridor, y_lim, color="#e5e7eb", alpha=0.80, zorder=0)
+    ax_xy.axhspan(-y_lim, -corridor, color="#e5e7eb", alpha=0.80, zorder=0)
+    ax_xy.axhline(corridor, color="#64748b", lw=1.4, zorder=1)
+    ax_xy.axhline(-corridor, color="#64748b", lw=1.4, zorder=1)
+    ax_xy.axvline(wall_x, color="#94a3b8", lw=4.0, alpha=0.72, zorder=1)
+    ax_xy.text(
+        wall_x, y_lim * 0.97, "moving wall", rotation=90,
+        ha="right", va="top", fontsize=11.5, color="#64748b",
+    )
+
+    bracket_offsets = np.linspace(-0.050, 0.050, len(selected))
+    bracket_cap = 0.018
+    for (mode, _label), offset in zip(selected, bracket_offsets):
+        cross_idx = int(outcomes[mode]["cross_idx"])
+        center = float(gate[cross_idx])
+        lower, upper = center - half_width, center + half_width
+        bracket_x = wall_x + float(offset)
+        ax_xy.plot([bracket_x, bracket_x], [lower, upper],
+                   color=colors[mode], lw=4.2, zorder=4, solid_capstyle="round")
+        ax_xy.plot([bracket_x - bracket_cap, bracket_x + bracket_cap], [lower, lower],
+                   color=colors[mode], lw=2.4, zorder=4)
+        ax_xy.plot([bracket_x - bracket_cap, bracket_x + bracket_cap], [upper, upper],
+                   color=colors[mode], lw=2.4, zorder=4)
+
+    # Draw the preferred architecture last so coincident sections remain visible.
+    for mode, label in reversed(selected):
+        xy = test_metrics[mode]["rollout"]["x_seq"][chosen, :, :2].numpy()
+        trajectory = np.vstack([start, xy])
+        line, = ax_xy.plot(
+            trajectory[:, 0], trajectory[:, 1],
+            color=colors[mode], lw=3.4, alpha=0.97, zorder=5,
+        )
+        line.set_path_effects([
+            path_effects.Stroke(linewidth=5.8, foreground="white", alpha=0.90),
+            path_effects.Normal(),
+        ])
+        cross_idx = int(outcomes[mode]["cross_idx"])
+        wall_clear = bool(outcomes[mode]["wall_clear"])
+        ax_xy.scatter(
+            xy[cross_idx, 0], xy[cross_idx, 1],
+            marker="o" if wall_clear else "X",
+            s=120 if wall_clear else 155,
+            color=colors[mode], edgecolors="white", linewidths=1.5,
+            zorder=8,
+        )
+
+    ax_xy.scatter(
+        start[0], start[1], marker="o", s=90,
+        color="#475569", edgecolors="white", linewidths=1.1,
+        zorder=9,
+    )
+    ax_xy.scatter(0.0, 0.0, marker="*", s=210, color="#111827", zorder=9)
+    ax_xy.annotate(
+        "start", xy=(start[0], start[1]), xytext=(8, -16),
+        textcoords="offset points", fontsize=11.5, color="#475569",
+    )
+    ax_xy.annotate(
+        "goal", xy=(0.0, 0.0), xytext=(-8, 14),
+        textcoords="offset points", ha="right", fontsize=11.5, color="#111827",
+    )
+    ax_xy.set_xlim(x_max, x_min)
+    ax_xy.set_ylim(-y_lim, y_lim)
+    ax_xy.set_xlabel("Longitudinal position $x$", fontsize=16)
+    ax_xy.set_ylabel("Lateral position $y$", fontsize=16)
+    ax_xy.set_title(
+        "Unified spatial trajectories and controller-specific gate openings",
+        fontsize=17, pad=10,
+    )
+    ax_xy.tick_params(labelsize=12.5)
+
+    # Align each gate-error trace to that controller's own crossing event. This
+    # makes pass/fail directly comparable even though absolute crossing times differ.
+    pre_steps, post_steps = 30, 12
+    max_abs_error = half_width
+    for mode, _label in selected:
+        xy = test_metrics[mode]["rollout"]["x_seq"][chosen, :, :2].numpy()
+        cross_idx = int(outcomes[mode]["cross_idx"])
+        lo = max(0, cross_idx - pre_steps)
+        hi = min(horizon, cross_idx + post_steps + 1)
+        tau = np.arange(lo - cross_idx, hi - cross_idx)
+        error = xy[lo:hi, 1] - gate[lo:hi]
+        max_abs_error = max(max_abs_error, float(np.max(np.abs(error))))
+        line, = ax_error.plot(tau, error, color=colors[mode], lw=3.0, zorder=4)
+        line.set_path_effects([
+            path_effects.Stroke(linewidth=5.0, foreground="white", alpha=0.88),
+            path_effects.Normal(),
+        ])
+        wall_clear = bool(outcomes[mode]["wall_clear"])
+        cross_error_signed = float(xy[cross_idx, 1] - gate[cross_idx])
+        ax_error.scatter(
+            [0], [cross_error_signed], marker="o" if wall_clear else "X",
+            s=100 if wall_clear else 135, color=colors[mode],
+            edgecolors="white", linewidths=1.4, zorder=7,
+        )
+
+    ax_error.axhspan(-half_width, half_width, color="#bbf7d0", alpha=0.55, zorder=0)
+    ax_error.axhline(half_width, color="#16a34a", lw=1.3, ls="--", alpha=0.75, zorder=1)
+    ax_error.axhline(-half_width, color="#16a34a", lw=1.3, ls="--", alpha=0.75, zorder=1)
+    ax_error.axvline(0, color="#64748b", lw=2.0, ls=":", zorder=2)
+    ax_error.text(
+        -pre_steps + 1.0, half_width * 0.72, "safe gate band",
+        fontsize=11.5, color="#15803d", va="center",
+    )
+    error_lim = min(corridor * 1.05, max(half_width * 1.8, 1.08 * max_abs_error))
+    ax_error.set_xlim(-pre_steps, post_steps)
+    ax_error.set_ylim(-error_lim, error_lim)
+    ax_error.set_xlabel("Steps relative to each controller's wall crossing $\\tau$", fontsize=15)
+    ax_error.set_ylabel("Signed gate error $y_t-g_t$", fontsize=15)
+    ax_error.set_title(
+        "Gate-tracking error aligned to the controller-specific wall event",
+        fontsize=16, pad=9,
+    )
+    ax_error.tick_params(labelsize=12)
+
+    legend_handles = []
+    for mode, label in selected:
+        wall_clear = bool(outcomes[mode]["wall_clear"])
+        cross_idx = int(outcomes[mode]["cross_idx"])
+        legend_handles.append(Line2D(
+            [0], [0], color=colors[mode], lw=3.2,
+            marker="o" if wall_clear else "X", markersize=9.5,
+            markerfacecolor=colors[mode], markeredgecolor="white",
+            label=f"{label}: {'passed' if wall_clear else 'crashed'}, $t^*={cross_idx}$",
+        ))
+    legend_handles.append(Line2D(
+        [0], [0], color="#64748b", lw=4.0, marker="|", markersize=14,
+        label="gate opening at each controller's crossing",
+    ))
+    fig.legend(
+        handles=legend_handles, loc="upper center", bbox_to_anchor=(0.5, 0.930),
+        ncol=3, fontsize=12.5, handlelength=2.7, columnspacing=1.7,
+        frameon=True, framealpha=0.96, facecolor="white", edgecolor="#d1d5db",
+    )
+    gate_title = "continuous moving gate" if is_continuous_gate(args) else "switching gate"
+    fig.suptitle(
+        f"Unified architecture comparison - {gate_title}",
+        fontsize=22, fontweight="bold", y=0.992,
+    )
+    fig.text(
+        0.5, 0.958,
+        f"Episode #{chosen}. Same gate realization and initial condition; "
+        "each marker and aperture bracket uses that controller's own crossing time.",
+        ha="center", va="top", fontsize=12.5, color="#334155",
+    )
+    fig.subplots_adjust(left=0.09, right=0.985, top=0.825, bottom=0.075)
+
+    selection_payload = {
+        "episode_idx": int(chosen),
+        "selection_rule": selection_reason,
+        "modes_shown": modes,
+        "outcomes": outcomes,
+        "event_window": {"pre_steps": pre_steps, "post_steps": post_steps},
+    }
+    save_json(run_dir / "architecture_unified_comparison_selection.json", selection_payload)
+    pdf_out = run_dir / "architecture_unified_comparison.pdf"
+    png_out = run_dir / "architecture_unified_comparison.png"
+    fig.savefig(str(pdf_out), bbox_inches="tight")
+    fig.savefig(str(png_out), dpi=300, bbox_inches="tight")
+    print(f"Saved unified architecture comparison -> {pdf_out}")
+    if show_plots:
+        plt.show()
+    plt.close(fig)
 
 
 def plot_trajectory_storyboard(
@@ -3855,15 +4657,15 @@ def build_interpretation(test_metrics: dict[str, dict]) -> str:
     if "context" in test_metrics:
         lines.append(f"Factorized M_b x M_p: success rate {test_metrics['context']['success_rate']:.3f}")
     if "mad_context" in test_metrics:
-        lines.append(f"MAD s=1: {test_metrics['mad_context']['success_rate']:.3f}")
+        lines.append(f"MAD: {test_metrics['mad_context']['success_rate']:.3f}")
     if "rpb_context" in test_metrics:
-        lines.append(f"rPB diagonal mixer: {test_metrics['rpb_context']['success_rate']:.3f}")
+        lines.append(f"rPB: {test_metrics['rpb_context']['success_rate']:.3f}")
     if "mp_only_context" in test_metrics:
         lines.append(f"M_p-only (matched params): {test_metrics['mp_only_context']['success_rate']:.3f}")
     if "contextual_ssm" in test_metrics:
-        lines.append(f"ContextualDeepSSM: {test_metrics['contextual_ssm']['success_rate']:.3f}")
+        lines.append(f"C. Factorization: {test_metrics['contextual_ssm']['success_rate']:.3f}")
     if "disturbance_only" in test_metrics:
-        lines.append(f"Disturbance-only PB+SSM: {test_metrics['disturbance_only']['success_rate']:.3f}")
+        lines.append(f"Context-agnostic: {test_metrics['disturbance_only']['success_rate']:.3f}")
     if "nominal" in test_metrics:
         lines.append(f"Nominal pre-stabilization: {test_metrics['nominal']['success_rate']:.3f}")
     lines.append("Success requires clearing the moving wall opening and ending near the origin.")
@@ -4375,6 +5177,21 @@ def run_plot_only(args: argparse.Namespace, device: torch.device) -> None:
 
     expected_cross_index = estimate_expected_cross_index(args)
     specs = variant_specs(args)
+    # A launcher submission can save a narrow --variants value in config.json
+    # while the run directory contains every checkpoint from the comparison.
+    # The checkpoints are the source of truth for plot-only recovery: otherwise
+    # a paper comparison silently degenerates into one architecture on replot.
+    recovered_modes = [
+        mode for mode in ALL_VARIANTS
+        if (run_dir / f"{mode}_controller.pt").exists()
+    ]
+    if len(recovered_modes) > 1:
+        specs = [
+            (mode, contextual_label(args) if mode == "contextual_ssm" else ALL_VARIANTS[mode])
+            for mode in recovered_modes
+        ]
+        print("[plot_only] Recovered comparison variants from checkpoints: "
+              + ", ".join(recovered_modes))
 
     test_batch = sample_batch(
         args=args,
@@ -4395,7 +5212,7 @@ def run_plot_only(args: argparse.Namespace, device: torch.device) -> None:
     )
 
     controllers: dict[str, PBController | None] = {}
-    plants: dict[str, DoubleIntegratorTrue | None] = {}
+    plants: dict[str, NavigationTruePlant | None] = {}
     val_metrics: dict[str, dict] = {}
     test_metrics: dict[str, dict] = {}
     histories: dict[str, list[dict]] = {}
@@ -4403,19 +5220,34 @@ def run_plot_only(args: argparse.Namespace, device: torch.device) -> None:
     for mode, label in specs:
         pt_path = run_dir / f"{mode}_controller.pt"
         use_mp_only = (mode == "mp_only_context")
+        use_no_lift = (mode == "context_no_lift")
         use_mad = (mode == "mad_context")
         use_rpb = (mode == "rpb_context")
         use_contextual = (mode == "contextual_ssm")
+        saved_state = torch.load(pt_path, map_location=device) if pt_path.exists() else None
+        # Parameter-matched comparisons can train every factorized architecture
+        # with a different d_model. Older config.json files only store the base
+        # width, so recover the actual width from the checkpoint's encoder.
+        checkpoint_d_model = None
+        if saved_state is not None and not use_contextual:
+            encoder_weight = saved_state.get("operator.mp.core.encoder.weight")
+            if encoder_weight is not None:
+                checkpoint_d_model = int(encoder_weight.shape[0])
+                if checkpoint_d_model != int(args.ssm_d_model):
+                    print(f"[plot_only] {mode}: recovered ssm_d_model="
+                          f"{checkpoint_d_model} from checkpoint.")
         controller, plant_true = build_controller(
             device,
             args,
             mp_only=use_mp_only,
+            force_no_lift=use_no_lift,
             factor_rank_override=1 if use_mad else None,
             diagonal_mixer=use_rpb,
+            ssm_d_model_override=checkpoint_d_model,
             contextual=use_contextual,
         )
-        if pt_path.exists():
-            controller.load_state_dict(torch.load(pt_path, map_location=device))
+        if saved_state is not None:
+            controller.load_state_dict(saved_state)
             print(f"[plot_only] Loaded {pt_path.name}")
         else:
             print(f"[plot_only] Warning: {pt_path.name} not found — using random weights for {mode}.")
@@ -4544,7 +5376,7 @@ def main() -> None:
 
     specs = variant_specs(args)
     controllers: dict[str, PBController | None] = {}
-    plants: dict[str, DoubleIntegratorTrue | None] = {}
+    plants: dict[str, NavigationTruePlant | None] = {}
     histories: dict[str, list[dict]] = {}
     val_metrics: dict[str, dict] = {}
     test_metrics: dict[str, dict] = {}
@@ -4827,38 +5659,8 @@ def _run_all_plots(
         test_metrics=test_metrics,
         show_plots=show_plots,
     )
-    animate_rollout(
-        args=args,
-        run_dir=run_dir,
-        variant_order=specs,
-        test_batch=test_batch,
-        test_metrics=test_metrics,
-        show_plots=show_plots,
-    )
-    if not is_continuous_gate(args):
-        animate_adversarial_sample(
-            args=args,
-            run_dir=run_dir,
-            variant_order=specs,
-            test_batch=test_batch,
-            test_metrics=test_metrics,
-            show_plots=show_plots,
-        )
-        plot_waiting_behavior(
-            args=args,
-            run_dir=run_dir,
-            test_batch=test_batch,
-            test_metrics=test_metrics,
-            show_plots=show_plots,
-        )
-        plot_adversarial_switching(
-            args=args,
-            run_dir=run_dir,
-            variant_order=specs,
-            test_batch=test_batch,
-            test_metrics=test_metrics,
-            show_plots=show_plots,
-        )
+    # Paper figures come before animations. GIFs are comparatively slow and can
+    # fail on synchronized filesystems; a GIF failure must never suppress PDFs.
     plot_sample_trajectory(
         args=args,
         run_dir=run_dir,
@@ -4888,6 +5690,62 @@ def _run_all_plots(
             expected_cross_index=expected_cross_index,
             show_plots=show_plots,
         )
+    if getattr(args, "use_unified_comparison", True):
+        plot_unified_architecture_comparison(
+            args=args,
+            run_dir=run_dir,
+            variant_order=specs,
+            test_batch=test_batch,
+            test_metrics=test_metrics,
+            show_plots=show_plots,
+        )
+    if getattr(args, "use_comparison_storyboard", True):
+        plot_architecture_comparison_storyboard(
+            args=args,
+            run_dir=run_dir,
+            variant_order=specs,
+            test_batch=test_batch,
+            test_metrics=test_metrics,
+            show_plots=show_plots,
+        )
+    if not is_continuous_gate(args):
+        plot_waiting_behavior(
+            args=args,
+            run_dir=run_dir,
+            test_batch=test_batch,
+            test_metrics=test_metrics,
+            show_plots=show_plots,
+        )
+        plot_adversarial_switching(
+            args=args,
+            run_dir=run_dir,
+            variant_order=specs,
+            test_batch=test_batch,
+            test_metrics=test_metrics,
+            show_plots=show_plots,
+        )
+
+    if getattr(args, "use_animations", True):
+        try:
+            animate_rollout(
+                args=args,
+                run_dir=run_dir,
+                variant_order=specs,
+                test_batch=test_batch,
+                test_metrics=test_metrics,
+                show_plots=show_plots,
+            )
+            if not is_continuous_gate(args):
+                animate_adversarial_sample(
+                    args=args,
+                    run_dir=run_dir,
+                    variant_order=specs,
+                    test_batch=test_batch,
+                    test_metrics=test_metrics,
+                    show_plots=show_plots,
+                )
+        except Exception as exc:
+            print(f"Warning: animation rendering failed ({exc}); static figures were saved.")
 
     save_json(run_dir / "metrics.json", {mode: strip_rollout(test_metrics[mode]) for mode, _ in specs})
     save_json(run_dir / "val_metrics.json", {mode: strip_rollout(val_metrics[mode]) for mode, _ in specs})
