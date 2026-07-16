@@ -67,6 +67,10 @@ SKIP_DESTS = {
     "no_show_plots", "plot_only", "help", "ablation_only_label",
     "variants", "simple_comparison", "mad_comparison",
     "contextual_comparison", "lift_comparison",
+    # Managed by the run-mode controls rather than the generic parameter form.
+    "ablate_context", "ablation_variant", "ablation_configs",
+    "ablate_layers", "ablation_layers",
+    "ablate_mixer_s", "ablation_mixer_s",
     # Handled by the custom Experiment selector + Context-signal checkboxes.
     "gate_motion", "context_features", "context_mode",
     # Managed by the launcher itself (RCP submissions / per-variant fan-out).
@@ -723,7 +727,7 @@ def main():
                         key="rcp_fanout",
                         help="Submit independent work as multiple Run:AI workloads sharing "
                              "one run ID/directory: one job per selected variant, context "
-                             "ablation config, or layer count. Each job saves its checkpoint "
+                             "ablation config, layer count, or mixer width s. Each job saves its checkpoint "
                              "and metrics; when ALL jobs are done, Sync once and use Re-plot "
                              "in Browse runs to build the combined figures.")
                     if st.button("🗑 Delete all COMPLETED workloads in the project",
@@ -831,14 +835,20 @@ def main():
             # Run mode + ablation controls live OUTSIDE the form so toggling them
             # re-renders ① immediately (forms don't rerun on widget change).
             run_mode = st.radio(
-                "⚙️ Run mode", ["Single run", "Context ablation", "Layer comparison"],
+                "⚙️ Run mode", [
+                    "Single run", "Context ablation", "Layer comparison",
+                    "Mixer-width ablation",
+                ],
                 horizontal=True, key="run_mode_radio",
                 help="Single run = train the ticked variants once. Context ablation = one arch, "
                      "sweep context subsets. Layer comparison = one arch + same context, sweep "
-                     "SSM depth. Both sweeps share data/seeds and produce one comparison plot.",
+                     "SSM depth. Mixer-width ablation = C. Factorization + same context/core, "
+                     "sweep the factorization dimension s. Sweeps share data/seeds and produce "
+                     "one comparison plot.",
             )
             is_ablation = (run_mode == "Context ablation")
             is_layers = (run_mode == "Layer comparison")
+            is_mixer_s = (run_mode == "Mixer-width ablation")
             abl_arch_opts = [(k, lab) for k, lab in get_variant_options()
                              if k in ("context", "mad_context", "rpb_context", "mp_only_context", "contextual_ssm")]
             abl_type = None
@@ -891,6 +901,18 @@ def main():
                                   value="", key="layers_list", placeholder="3,6,9,12")
                     st.caption("Same architecture + same context (②) trained at each depth. "
                                "Blank = a sweep around the SSM n_layers value in ③; overrides it.")
+                elif is_mixer_s:
+                    st.markdown("#### ① Factorization mixer-width comparison")
+                    st.text_input(
+                        "Mixer dimensions s to compare (comma-separated)",
+                        value="", key="mixer_s_list", placeholder="4,8,16,32",
+                    )
+                    st.caption(
+                        "Architecture is fixed to C. Factorization. Here s is `ctx_d_features`: "
+                        "the latent feature width acted on by the bounded mixer. The context, "
+                        "SSM core, data, and seeds stay fixed. Blank = half/current/double the "
+                        "C. Factorization mixer width selected in ③."
+                    )
                 else:
                     st.markdown("#### ① Variants to run")
                     st.caption("Tick the controllers to train & compare in this run.")
@@ -914,6 +936,9 @@ def main():
                                    "Causal gate-motion signals are fair; schedule/noncausal stay privileged.")
                     elif is_layers:
                         st.caption("This is the **fixed context** used at every SSM depth. "
+                                   "Causal gate-motion signals are fair; schedule/noncausal stay privileged.")
+                    elif is_mixer_s:
+                        st.caption("This is the **fixed context** used at every mixer width s. "
                                    "Causal gate-motion signals are fair; schedule/noncausal stay privileged.")
                     else:
                         st.caption("Pick what information the controller receives. Causal gate-motion "
@@ -1181,6 +1206,94 @@ def main():
                             argv, run_id,
                             f"{exp_label}; arch=`{arch}`; layers=[{layers_str or 'auto'}]",
                             fanout_items=fanout_items)
+                elif is_mixer_s:
+                    ctx_selected = [
+                        k for k in ctx_feats
+                        if st.session_state.get(ctx_widget_key(k))
+                    ]
+                    widths_str = (st.session_state.get("mixer_s_list") or "").strip()
+                    width_values: list[int] = []
+                    width_err = None
+                    if widths_str:
+                        try:
+                            for token in widths_str.split(","):
+                                token = token.strip()
+                                if not token:
+                                    continue
+                                width = int(token)
+                                if width < 1:
+                                    raise ValueError
+                                if width not in width_values:
+                                    width_values.append(width)
+                        except ValueError:
+                            width_err = (
+                                "Mixer dimensions s must be positive integers, "
+                                "e.g. 4,8,16,32."
+                            )
+                    else:
+                        try:
+                            base_width = int(
+                                widget_vals.get("ctx_d_features")
+                                or values["ctx_d_features"]["default"]
+                            )
+                        except Exception:
+                            base_width = int(values["ctx_d_features"]["default"])
+                        width_values = sorted({
+                            max(1, base_width // 2), base_width, base_width * 2,
+                        })
+                    ctx_modes = {
+                        mode.strip().lower()
+                        for mode in str(
+                            widget_vals.get("ctx_modes")
+                            or values["ctx_modes"]["default"]
+                        ).split(",")
+                        if mode.strip()
+                    }
+                    if not ctx_selected:
+                        st.error("Select at least one context feature under ② above.")
+                    elif "mixer" not in ctx_modes:
+                        st.error(
+                            "Mixer-width ablation requires the `mixer` context port. "
+                            "Add `mixer` under Parameters → C. Factorization → Context modes."
+                        )
+                    elif width_err:
+                        st.error(width_err)
+                    elif len(width_values) < 2:
+                        st.error(
+                            "Give at least 2 mixer dimensions s to compare "
+                            "(or leave blank for an automatic sweep)."
+                        )
+                    else:
+                        argv, warns = build_argv(
+                            active_order, bools, values, widget_vals, run_id,
+                        )
+                        argv += [
+                            "--gate_motion", exp_key,
+                            "--context_features", ",".join(ctx_selected),
+                            "--ablate_mixer_s",
+                        ]
+                        if widths_str:
+                            argv += ["--ablation_mixer_s", widths_str]
+                        for warning in warns:
+                            st.warning(warning)
+                        fanout = (
+                            execution_target == "EPFL RCP"
+                            and bool(st.session_state.get("rcp_fanout"))
+                            and len(width_values) >= 2
+                        )
+                        fanout_items = [
+                            (
+                                f"s={width}",
+                                [f"--ablation_only_label=s={width}", "--skip_plots"],
+                            )
+                            for width in width_values
+                        ] if fanout else None
+                        launch_selected(
+                            argv, run_id,
+                            f"{exp_label}; arch=`contextual_ssm`; "
+                            f"mixer s=[{widths_str or 'auto'}]",
+                            fanout_items=fanout_items,
+                        )
                 else:
                     selected = [k for k, _ in get_variant_options() if st.session_state.get(f"var_{k}")]
                     ctx_selected = [

@@ -369,7 +369,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "one global freeze at the mean start's crossing. Recommended "
                              "whenever the start x range is wide.")
     parser.add_argument("--wall_x", type=float, default=0.55)
-    parser.add_argument("--gate_half_width", type=float, default=0.20)
+    parser.add_argument("--gate_half_width", type=float, default=0.20,
+                        help="Half-width of the gate opening. Default 0.20; for "
+                             "robot_model=nonlinear with gate_motion=continuous the "
+                             "feasibility-tuned default 0.25 is applied unless this flag "
+                             "is passed explicitly (see NONLINEAR_CONTINUOUS_GATE_DEFAULTS).")
     parser.add_argument("--gate_amplitude", type=float, default=0.95)
     parser.add_argument("--goal_tol", type=float, default=0.18)
     parser.add_argument("--corridor_limit", type=float, default=1.6)
@@ -387,11 +391,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gate_corr_time", type=float, default=40.0,
                         help="continuous only: gate-motion smoothness as an OU correlation "
                              "time in steps. LARGER = slower, smoother drift; smaller = "
-                             "faster, jerkier (theta = 1 - exp(-1/corr_time)).")
+                             "faster, jerkier (theta = 1 - exp(-1/corr_time)). For the "
+                             "nonlinear robot the feasibility default 180 applies unless "
+                             "passed explicitly.")
     parser.add_argument("--gate_range", type=float, default=0.50,
                         help="continuous only: within-episode roaming amplitude (OU "
                              "stationary std), same units as the gate center, clamped to "
-                             "+/- gate_amplitude. Independent of --gate_corr_time.")
+                             "+/- gate_amplitude. Independent of --gate_corr_time. For the "
+                             "nonlinear robot the feasibility default 0.25 applies unless "
+                             "passed explicitly.")
     parser.add_argument("--gate_center_range", type=float, default=0.35,
                         help="continuous only: per-episode random reversion center, as a "
                              "fraction of gate_amplitude. 0 = every episode centered on the "
@@ -580,6 +588,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ablation_layers", type=str, default="",
                         help="Comma-separated SSM layer counts to compare, e.g. '3,6,9,12'. "
                              "Empty = sweep around --ssm_layers (base//2, base, base*2).")
+    parser.add_argument("--ablate_mixer_s", action="store_true",
+                        help="Run a C. Factorization mixer-width ablation: keep the context, "
+                             "SSM core, data, and seeds fixed while sweeping --ctx_d_features "
+                             "(the factorization hyperparameter s).")
+    parser.add_argument("--ablation_mixer_s", type=str, default="",
+                        help="Comma-separated C. Factorization mixer widths s, e.g. "
+                             "'4,8,16,32'. Empty = sweep around --ctx_d_features "
+                             "(base//2, base, base*2).")
     parser.add_argument("--mp_context_lift", dest="mp_context_lift", action="store_true")
     parser.add_argument("--no_mp_context_lift", dest="mp_context_lift", action="store_false")
     parser.set_defaults(mp_context_lift=True)
@@ -663,8 +679,48 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Feasibility-tuned OU-gate defaults for the nonholonomic bicycle (oracle study,
+# 2026-07-16): with the legacy gate (corr_time 40-60, range 0.50, half 0.20) even
+# a clairvoyant pursuit controller threads only ~0.40 of episodes on this plant,
+# so success rates mostly measure gate luck. At these values a well-tuned oracle
+# reaches ~0.91 -- hard but feasible. Explicit CLI flags always take precedence,
+# and saved run configs replay with their own stored values.
+NONLINEAR_CONTINUOUS_GATE_DEFAULTS = {
+    "gate_corr_time": 180.0,
+    "gate_range": 0.25,
+    "gate_half_width": 0.25,
+}
+
+
+def resolve_model_dependent_defaults(args: argparse.Namespace, cli_tokens: set[str]) -> None:
+    if not (nonlinear_robot_enabled(args) and is_continuous_gate(args)):
+        return
+    applied = {
+        dest: value
+        for dest, value in NONLINEAR_CONTINUOUS_GATE_DEFAULTS.items()
+        if not cli_has_override(cli_tokens, dest)
+    }
+    for dest, value in applied.items():
+        setattr(args, dest, value)
+    if applied:
+        print("[gate] nonlinear-continuous feasibility defaults: "
+              + ", ".join(f"{k}={v:g}" for k, v in applied.items()))
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    return build_parser().parse_args(argv)
+    args = build_parser().parse_args(argv)
+    tokens = set(sys.argv[1:] if argv is None else argv)
+    resolve_model_dependent_defaults(args, tokens)
+    return args
+
+
+def ablation_sweep_enabled(args: argparse.Namespace) -> bool:
+    """Whether this invocation compares configurations of one architecture."""
+    return any((
+        bool(getattr(args, "ablate_context", False)),
+        bool(getattr(args, "ablate_layers", False)),
+        bool(getattr(args, "ablate_mixer_s", False)),
+    ))
 
 
 NavigationNominalPlant = DoubleIntegratorNominal | NonlinearRobotNominal
@@ -4624,9 +4680,7 @@ def _comparison_storyboard_modes(
 ) -> list[tuple[str, str]]:
     """Pick the most informative rows for a journal comparison figure."""
     available = [(mode, label) for mode, label in variant_order if mode in test_metrics]
-    if args is not None and (
-        getattr(args, "ablate_context", False) or getattr(args, "ablate_layers", False)
-    ):
+    if args is not None and ablation_sweep_enabled(args):
         return available
     preferred = (
         "contextual_ssm", "mad_context", "rpb_context", "disturbance_only",
@@ -4654,9 +4708,7 @@ def _pick_comparison_storyboard_episode(
     smaller comparisons, and the decision is written next to the figure.
     """
     n_episodes = int(test_batch.gate_y.shape[0])
-    is_ablation = bool(
-        getattr(args, "ablate_context", False) or getattr(args, "ablate_layers", False)
-    )
+    is_ablation = ablation_sweep_enabled(args)
     if is_ablation:
         primary = max(
             modes,
@@ -4843,6 +4895,9 @@ def plot_architecture_comparison_storyboard(
     elif getattr(args, "ablate_layers", False):
         comparison_title = "SSM depth comparison"
         output_stem = "layer_comparison_storyboard"
+    elif getattr(args, "ablate_mixer_s", False):
+        comparison_title = "Factorization mixer-width ablation"
+        output_stem = "mixer_width_comparison_storyboard"
     else:
         comparison_title = "Architecture comparison"
         output_stem = "architecture_comparison_storyboard"
@@ -5155,7 +5210,7 @@ def plot_unified_architecture_comparison(
     sample_idx: int = 0,
 ) -> None:
     """Compact paper figure combining spatial paths and event-aligned gate error."""
-    if getattr(args, "ablate_context", False) or getattr(args, "ablate_layers", False):
+    if ablation_sweep_enabled(args):
         return
 
     import matplotlib
@@ -6002,7 +6057,10 @@ def _run_ablation_sweep(args: argparse.Namespace, device: torch.device, *,
     for label, mutate in items:
         mutate(args)
         labels.append(label)
-        print(f"\n[{run_prefix}] '{label}'  (context_dim={context_dim(args)}, ssm_layers={args.ssm_layers})")
+        print(
+            f"\n[{run_prefix}] '{label}'  (context_dim={context_dim(args)}, "
+            f"ssm_layers={args.ssm_layers}, mixer_s={args.ctx_d_features})"
+        )
 
         # Resume: reuse a config's checkpoint from a previous (e.g. preempted)
         # run of the same run_id instead of retraining. --fresh forces retrain.
@@ -6167,6 +6225,71 @@ def run_layers_ablation(args: argparse.Namespace, device: torch.device) -> None:
         args, device, items=items, run_prefix="layers",
         title=f"SSM depth comparison — {args.ablation_variant}",
         extra_config={"ablation_layers": layers},
+    )
+
+
+def parse_ablation_mixer_s(args: argparse.Namespace) -> list[int]:
+    """Parse mixer widths for the C. Factorization hyperparameter ``s``.
+
+    ``ctx_d_features`` is the feature dimension acted on by the bounded mixer,
+    and therefore corresponds to the paper's factorization width ``s``. An empty
+    sweep uses half/current/double widths around the selected value.
+    """
+    raw_value = getattr(args, "ablation_mixer_s", "") or ""
+    if isinstance(raw_value, (list, tuple)):
+        values = raw_value
+    else:
+        raw = str(raw_value).strip()
+        if not raw:
+            base = max(1, int(args.ctx_d_features))
+            return sorted({max(1, base // 2), base, base * 2})
+        values = raw.split(",")
+
+    out: list[int] = []
+    for value in values:
+        token = str(value).strip()
+        if not token:
+            continue
+        try:
+            width = int(token)
+        except ValueError as exc:
+            raise ValueError(
+                "--ablation_mixer_s must contain comma-separated positive integers "
+                f"(got {token!r})."
+            ) from exc
+        if width < 1:
+            raise ValueError(
+                f"--ablation_mixer_s entries must be >= 1 (got {width})."
+            )
+        if width not in out:
+            out.append(width)
+    if not out:
+        raise ValueError("No valid mixer widths parsed from --ablation_mixer_s.")
+    return out
+
+
+def run_mixer_s_ablation(args: argparse.Namespace, device: torch.device) -> None:
+    """Sweep C. Factorization mixer width ``s`` with every other setting fixed."""
+    modes = {mode.strip().lower() for mode in str(args.ctx_modes).split(",") if mode.strip()}
+    if "mixer" not in modes:
+        raise ValueError(
+            "The mixer-width ablation requires the C. Factorization 'mixer' port. "
+            "Add 'mixer' to --ctx_modes before sweeping s."
+        )
+    widths = parse_ablation_mixer_s(args)
+    args.ablation_variant = "contextual_ssm"
+
+    def _mk(width):
+        return lambda a: setattr(a, "ctx_d_features", int(width))
+
+    items = [(f"s={width}", _mk(width)) for width in widths]
+    _run_ablation_sweep(
+        args, device, items=items, run_prefix="mixer_s",
+        title="C. Factorization mixer-width ablation",
+        extra_config={
+            "ablation_mixer_s": widths,
+            "factorization_s_parameter": "ctx_d_features",
+        },
     )
 
 
@@ -6411,15 +6534,17 @@ def run_plot_only(args: argparse.Namespace, device: torch.device) -> None:
     # Ablation replot is the fan-out combine step: load every saved checkpoint,
     # evaluate on the shared validation/test batches, then draw the comparison
     # figures. Explicitly disable retraining and per-worker filtering.
-    if getattr(args, "ablate_context", False) or getattr(args, "ablate_layers", False):
+    if ablation_sweep_enabled(args):
         args.fresh = False
         args.skip_plots = False
         args.ablation_only_label = ""
         print("[plot_only] Combining ablation fan-out results from saved checkpoints.")
         if getattr(args, "ablate_context", False):
             run_context_ablation(args, device)
-        else:
+        elif getattr(args, "ablate_layers", False):
             run_layers_ablation(args, device)
+        else:
+            run_mixer_s_ablation(args, device)
         return
 
     expected_cross_index = estimate_expected_cross_index(args)
@@ -6525,6 +6650,16 @@ def run_plot_only(args: argparse.Namespace, device: torch.device) -> None:
 
 def main() -> None:
     args = parse_args()
+    active_sweeps = sum((
+        bool(getattr(args, "ablate_context", False)),
+        bool(getattr(args, "ablate_layers", False)),
+        bool(getattr(args, "ablate_mixer_s", False)),
+    ))
+    if active_sweeps > 1:
+        raise ValueError(
+            "Choose only one ablation mode: --ablate_context, --ablate_layers, "
+            "or --ablate_mixer_s."
+        )
     set_seeds(int(args.seed))
     # Respect the cluster CPU allocation: on a K8s node torch defaults its
     # thread pool to the NODE's core count, not the cgroup request, causing
@@ -6581,6 +6716,11 @@ def main() -> None:
     # ── SSM-depth comparison mode ─────────────────────────────────────────────
     if getattr(args, "ablate_layers", False):
         run_layers_ablation(args, device)
+        return
+
+    # ── Factorization mixer-width comparison mode ────────────────────────────
+    if getattr(args, "ablate_mixer_s", False):
+        run_mixer_s_ablation(args, device)
         return
 
     # ─────────────────────────────────────────────────────────────────────────
