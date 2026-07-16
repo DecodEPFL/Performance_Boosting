@@ -100,7 +100,7 @@ GROUPS = [
         "wall_x", "gate_half_width", "gate_amplitude", "goal_tol", "corridor_limit",
         "wall_focus_sigma", "gate_settle_steps"}, False),
     ("Nonlinear robot package (active only when toggle is ON)",
-     lambda d: d.startswith("nonlinear_"), False),
+     lambda d: d.startswith("nonlinear_") or d in {"wrench_shaping", "wrench_gain"}, False),
     ("Gate schedule / motion", lambda d: d.startswith("gate_dwell") or d in {
         "gate_corr_time", "gate_range", "gate_center_range", "freeze_per_episode"}, False),
     ("Disturbance process", lambda d: d.startswith("noise_") or d.startswith("gust_"), False),
@@ -249,11 +249,12 @@ EXPERIMENTS = {
 SWITCH_ONLY_DESTS = {"gate_dwell_min", "gate_dwell_max", "gate_settle_steps", "freeze_per_episode"}
 CONTINUOUS_ONLY_DESTS = {
     "gate_corr_time", "gate_range", "gate_center_range", "gate_margin_train",
-    "robot_model",
+    "robot_model", "wrench_shaping", "wrench_gain",
 }
 # These parameters belong exclusively to the untouched four-state legacy
 # plant.  The rigid-body model has its own explicitly prefixed gains.
 LEGACY_MODEL_DESTS = {"pre_kp", "pre_kd", "drag_coeff"}
+NONLINEAR_MODEL_DESTS = {"wrench_shaping", "wrench_gain"}
 
 
 @st.cache_resource(show_spinner=False)
@@ -283,6 +284,8 @@ def param_applies(dest: str, exp_key: str) -> bool:
 def model_param_applies(dest: str, nonlinear_enabled: bool) -> bool:
     """Whether one parser option belongs to the selected robot-model package."""
     if dest.startswith("nonlinear_"):
+        return nonlinear_enabled
+    if dest in NONLINEAR_MODEL_DESTS:
         return nonlinear_enabled
     if dest in LEGACY_MODEL_DESTS:
         return not nonlinear_enabled
@@ -329,10 +332,16 @@ WIDGET_LABELS = {
     "nonlinear_inertia": "Yaw moment of inertia",
     "nonlinear_body_length": "Rigid-body length",
     "nonlinear_body_width": "Rigid-body width",
+    "nonlinear_wheelbase": "Wheelbase",
+    "nonlinear_cg_to_front": "CG to front axle",
+    "nonlinear_cg_height": "CG height",
+    "nonlinear_gravity": "Gravity",
     "nonlinear_yaw_pre_kp": "Yaw restoring gain",
     "nonlinear_yaw_pre_kd": "Yaw pre-stabilizer damping",
     "nonlinear_cubic_stiffness": "Translation cubic stiffness",
     "nonlinear_yaw_cubic_stiffness": "Yaw nonlinear stiffness",
+    "nonlinear_parking_lateral_gain": "Parking lateral steering gain",
+    "nonlinear_parking_lateral_cubic": "Parking lateral cubic gain",
     "nonlinear_longitudinal_drag": "Longitudinal linear resistance",
     "nonlinear_lateral_drag": "Lateral linear resistance",
     "nonlinear_quadratic_drag": "Longitudinal quadratic drag",
@@ -344,25 +353,31 @@ WIDGET_LABELS = {
     "nonlinear_angular_coulomb_friction": "Angular Coulomb friction",
     "nonlinear_angular_friction_velocity": "Angular-friction smoothing rate",
     "nonlinear_actuator_limit": "Longitudinal force limit",
-    "nonlinear_lateral_force_limit": "Lateral force limit",
-    "nonlinear_torque_limit": "Yaw torque limit",
     "nonlinear_actuator_deadzone": "Force-command dead zone",
-    "nonlinear_torque_deadzone": "Torque-command dead zone",
+    "nonlinear_steering_limit": "Steering-angle limit (rad)",
+    "nonlinear_steering_deadzone": "Steering-command dead zone (rad)",
+    "nonlinear_steering_time_constant": "Steering time constant",
+    "nonlinear_steering_rate_limit": "Steering rate limit (rad/s)",
+    "nonlinear_cornering_stiffness_front": "Front cornering stiffness",
+    "nonlinear_cornering_stiffness_rear": "Rear cornering stiffness",
+    "nonlinear_tire_friction": "Tire friction coefficient",
+    "nonlinear_slip_speed_floor": "Low-speed slip regularizer",
+    "nonlinear_low_speed_steering_grip": "Low-speed tire-scrub grip",
     "nonlinear_speed_loss": "High-speed authority loss",
-    "nonlinear_lateral_slip": "Combined-slip traction loss",
-    "nonlinear_traction_velocity": "Traction velocity scale",
-    "nonlinear_load_transfer": "Yaw/slip load-transfer coupling",
-    "nonlinear_tire_saturation": "Tire saturation strength",
-    "nonlinear_actuator_offset_x": "Lateral-force application offset",
+    "wrench_shaping": "Drive/steering command shaping",
+    "wrench_gain": "Command-shaping gain",
     "nonlinear_yaw_goal_weight": "Yaw goal-loss weight",
     "nonlinear_goal_yaw_tol": "Yaw success tolerance (rad)",
     "nonlinear_goal_speed_tol": "Terminal speed success tolerance",
     "nonlinear_goal_yaw_rate_tol": "Terminal yaw-rate success tolerance",
+    "nonlinear_goal_steering_tol": "Terminal steering success tolerance",
     "nonlinear_velocity_scale": "Velocity loss-normalization scale",
     "nonlinear_yaw_rate_scale": "Yaw-rate loss-normalization scale",
+    "nonlinear_steering_scale": "Steering loss-normalization scale",
     "nonlinear_physics_substeps": "Physics substeps per control step",
     "nonlinear_noise_yaw_sigma": "Yaw process-noise std",
     "nonlinear_noise_yaw_rate_sigma": "Yaw-rate process-noise std",
+    "nonlinear_noise_steering_sigma": "Steering-angle process-noise std",
 }
 
 
@@ -394,9 +409,9 @@ def render_widget(dest, bools, values, override=_NO_OVERRIDE):
             label,
             value=robot_model_is_nonlinear(current),
             help=(
-                "ON: six-state rigid-body dynamics, three-axis body wrench, "
-                "oriented-body losses/collisions/metrics, physical rendering, "
-                "and rigid-body context. OFF: the original four-state legacy "
+                "ON: seven-state dynamic-bicycle dynamics, drive plus steering "
+                "commands, tire slip/load transfer, oriented-body losses and "
+                "physical rendering. OFF: the original four-state legacy "
                 "point-mass model, bit-for-bit. " + helptext
             ),
             key=f"w_{dest}",
@@ -406,7 +421,7 @@ def render_widget(dest, bools, values, override=_NO_OVERRIDE):
         # a stale mode while the user flips the switch.
         st.caption(
             "OFF — original legacy model (bit-for-bit)  ·  "
-            "ON — complete nonlinear rigid-body package"
+            "ON — complete nonlinear dynamic-bicycle package"
         )
         return enabled
     if dest == "device" and not choices:
@@ -442,7 +457,7 @@ def build_argv(order, bools, values, widget_vals, run_id):
     for dest in order:
         if dest == "run_id":
             continue
-        if dest.startswith("nonlinear_") and not nonlinear_enabled:
+        if (dest.startswith("nonlinear_") or dest in NONLINEAR_MODEL_DESTS) and not nonlinear_enabled:
             # Keep legacy launch commands—and therefore legacy behavior—free
             # from every parameter belonging to the opt-in nonlinear package.
             continue
@@ -768,14 +783,15 @@ def main():
                     value=robot_model_is_nonlinear(saved_model),
                     key="w_robot_model",
                     help=(
-                        "ON: six-state rigid-body dynamics, three-axis body wrench, "
-                        "oriented finite-body collisions/losses/metrics/rendering, and "
-                        "rigid-body context. OFF: original four-state legacy model."
+                        "ON: seven-state dynamic bicycle with drive + steering, "
+                        "front/rear tire slip, load transfer, steering dynamics, "
+                        "oriented-body metrics/rendering, and rigid-body context. "
+                        "OFF: original four-state legacy model."
                     ),
                 )
                 st.caption(
                     "OFF — original legacy model (bit-for-bit)  ·  "
-                    "ON — complete nonlinear rigid-body package"
+                    "ON — complete nonlinear dynamic-bicycle package"
                 )
             else:
                 nonlinear_ui = False
@@ -798,7 +814,9 @@ def main():
 
             ctx_order, ctx_meta, fair_default, nonlinear_context_default = get_context_meta()
             ctx_feats = [k for k in ctx_order if exp_key in ctx_meta[k][2]]
-            rigid_context = {"heading_sin", "heading_cos", "yaw_rate"}
+            rigid_context = {
+                "heading_sin", "heading_cos", "yaw_rate", "steering_angle",
+            }
             if not nonlinear_ui:
                 ctx_feats = [k for k in ctx_feats if k not in rigid_context]
 

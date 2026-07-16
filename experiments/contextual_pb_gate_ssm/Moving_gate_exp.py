@@ -224,8 +224,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["legacy", "nonlinear"],
         help="Robot dynamics used consistently for scheduling, training, evaluation, "
              "and plots. 'legacy' preserves the original pre-stabilized double "
-             "integrator bit-for-bit. 'nonlinear' activates the six-state planar "
-             "rigid body and every nonlinear/body-aware experiment modification.",
+             "integrator bit-for-bit. 'nonlinear' activates the seven-state dynamic "
+             "bicycle/Ackermann body and every nonlinear/body-aware modification.",
     )
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--pre_kp", type=float, default=0.32)
@@ -246,22 +246,33 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Nonlinear model only: oriented rigid-body length (> 0).")
     parser.add_argument("--nonlinear_body_width", type=float, default=0.10,
                         help="Nonlinear model only: oriented rigid-body width (> 0).")
+    parser.add_argument("--nonlinear_wheelbase", type=float, default=0.12,
+                        help="Nonlinear model only: axle separation (0 < wheelbase <= body length).")
+    parser.add_argument("--nonlinear_cg_to_front", type=float, default=0.062,
+                        help="Nonlinear model only: centre-of-mass distance to front axle.")
+    parser.add_argument("--nonlinear_cg_height", type=float, default=0.028,
+                        help="Nonlinear model only: centre-of-mass height for load transfer.")
+    parser.add_argument("--nonlinear_gravity", type=float, default=9.81,
+                        help="Nonlinear model only: gravitational acceleration used for tire loads.")
     parser.add_argument("--nonlinear_yaw_pre_kp", type=float, default=0.22,
-                        help="Nonlinear model only: origin yaw pre-stabilizer stiffness.")
+                        help="Nonlinear model only: final-heading feedback into parking steering.")
     parser.add_argument("--nonlinear_yaw_pre_kd", type=float, default=0.16,
                         help="Nonlinear model only: origin yaw pre-stabilizer damping.")
     parser.add_argument("--nonlinear_cubic_stiffness", type=float, default=0.10,
-                        help="Nonlinear model only: radial Duffing restoring-force "
-                             "coefficient multiplying ||position||^2 position.")
+                        help="Nonlinear model only: cubic distance gain in parking drive force.")
     parser.add_argument("--nonlinear_yaw_cubic_stiffness", type=float, default=0.06,
-                        help="Nonlinear model only: nonlinear yaw restoring stiffness.")
+                        help="Nonlinear model only: nonlinear heading term in parking steering.")
+    parser.add_argument("--nonlinear_parking_lateral_gain", type=float, default=1.35,
+                        help="Nonlinear model only: path-heading error feedback into steering.")
+    parser.add_argument("--nonlinear_parking_lateral_cubic", type=float, default=0.18,
+                        help="Nonlinear model only: cubic lateral parking-steering gain.")
     parser.add_argument("--nonlinear_longitudinal_drag", type=float, default=0.15,
                         help="Nonlinear model only: body-longitudinal linear resistance.")
-    parser.add_argument("--nonlinear_lateral_drag", type=float, default=0.85,
-                        help="Nonlinear model only: larger lateral tire/traction resistance.")
+    parser.add_argument("--nonlinear_lateral_drag", type=float, default=0.18,
+                        help="Nonlinear model only: linear lateral tire-carcass resistance.")
     parser.add_argument("--nonlinear_quadratic_drag", type=float, default=0.28,
                         help="Nonlinear model only: longitudinal quadratic drag.")
-    parser.add_argument("--nonlinear_lateral_quadratic_drag", type=float, default=0.55,
+    parser.add_argument("--nonlinear_lateral_quadratic_drag", type=float, default=0.24,
                         help="Nonlinear model only: lateral quadratic tire resistance.")
     parser.add_argument("--nonlinear_coulomb_friction", type=float, default=0.05,
                         help="Nonlinear model only: smooth rolling/Coulomb friction magnitude.")
@@ -276,38 +287,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nonlinear_angular_friction_velocity", type=float, default=0.18,
                         help="Nonlinear model only: smoothing scale for angular friction.")
     parser.add_argument("--nonlinear_actuator_limit", type=float, default=2.5,
-                        help="Nonlinear model only: longitudinal actuator force limit.")
-    parser.add_argument("--nonlinear_lateral_force_limit", type=float, default=1.7,
-                        help="Nonlinear model only: lateral actuator force limit.")
-    parser.add_argument("--nonlinear_torque_limit", type=float, default=0.18,
-                        help="Nonlinear model only: yaw torque limit.")
+                        help="Nonlinear model only: rear-axle drive-force limit.")
     parser.add_argument("--nonlinear_actuator_deadzone", type=float, default=0.06,
-                        help="Nonlinear model only: smooth low-command actuator dead-zone.")
-    parser.add_argument("--nonlinear_torque_deadzone", type=float, default=0.008,
-                        help="Nonlinear model only: smooth yaw-torque dead-zone.")
-    parser.add_argument("--wrench_shaping", type=str, default="auto",
+                        help="Nonlinear model only: smooth drive-command dead-zone.")
+    parser.add_argument("--nonlinear_steering_limit", type=float, default=0.60,
+                        help="Nonlinear model only: absolute road-wheel steering limit (rad).")
+    parser.add_argument("--nonlinear_steering_deadzone", type=float, default=0.012,
+                        help="Nonlinear model only: smooth steering-command dead-zone (rad).")
+    parser.add_argument("--nonlinear_steering_time_constant", type=float, default=0.12,
+                        help="Nonlinear model only: first-order steering actuator time constant.")
+    parser.add_argument("--nonlinear_steering_rate_limit", type=float, default=2.5,
+                        help="Nonlinear model only: smooth steering slew-rate limit (rad/s).")
+    parser.add_argument("--nonlinear_cornering_stiffness_front", type=float, default=4.0,
+                        help="Nonlinear model only: front tire cornering stiffness.")
+    parser.add_argument("--nonlinear_cornering_stiffness_rear", type=float, default=4.5,
+                        help="Nonlinear model only: rear tire cornering stiffness.")
+    parser.add_argument("--nonlinear_tire_friction", type=float, default=0.90,
+                        help="Nonlinear model only: tire/ground friction coefficient.")
+    parser.add_argument("--nonlinear_slip_speed_floor", type=float, default=0.12,
+                        help="Nonlinear model only: low-speed regularizer for tire slip angles.")
+    parser.add_argument("--nonlinear_low_speed_steering_grip", type=float, default=0.18,
+                        help="Nonlinear model only: finite tire-scrub fraction used while parking.")
+    parser.add_argument("--wrench_shaping", type=str, default="off",
                         choices=["auto", "on", "off"],
-                        help="Nonlinear model only: wrap every learned operator's output with "
-                             "per-channel wrench normalization diag(F,F_lat,tau limits)*gain "
-                             "plus a smooth dead-zone-inversion feedforward. Static and "
-                             "Lipschitz, so L_p stability is untouched. 'auto' = on for the "
-                             "rigid body, off for legacy. Old rigid6 checkpoints (configs "
-                             "without this key) replay with shaping off automatically.")
+                        help="Nonlinear model only: scale learned outputs to the drive-force and "
+                             "steering ranges and add smooth dead-zone-inversion feedforward. "
+                             "Static and Lipschitz, so L_p stability is untouched. 'auto'/'on' "
+                             "enable it for the bicycle (legacy never wraps); off is the default.")
     parser.add_argument("--wrench_gain", type=float, default=1.0,
-                        help="Wrench-shaping only: scale factor on the per-channel limits.")
+                        help="Command-shaping only: scale factor on the per-channel limits.")
     parser.add_argument("--nonlinear_speed_loss", type=float, default=0.12,
                         help="Nonlinear model only: actuator-authority loss proportional "
                              "to squared speed.")
-    parser.add_argument("--nonlinear_lateral_slip", type=float, default=0.35,
-                        help="Nonlinear model only: lateral-speed-dependent traction loss.")
-    parser.add_argument("--nonlinear_traction_velocity", type=float, default=0.35,
-                        help="Nonlinear model only: combined-slip velocity scale.")
-    parser.add_argument("--nonlinear_load_transfer", type=float, default=0.12,
-                        help="Nonlinear model only: yaw/slip load-transfer coupling.")
-    parser.add_argument("--nonlinear_tire_saturation", type=float, default=0.25,
-                        help="Nonlinear model only: combined tire-force saturation strength.")
-    parser.add_argument("--nonlinear_actuator_offset_x", type=float, default=0.025,
-                        help="Nonlinear model only: longitudinal offset of applied lateral force.")
     parser.add_argument("--nonlinear_yaw_goal_weight", type=float, default=0.15,
                         help="Nonlinear model only: relative yaw error weight in goal losses.")
     parser.add_argument("--nonlinear_goal_yaw_tol", type=float, default=0.35,
@@ -316,12 +327,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Nonlinear model only: terminal linear-speed success tolerance.")
     parser.add_argument("--nonlinear_goal_yaw_rate_tol", type=float, default=0.25,
                         help="Nonlinear model only: terminal absolute yaw-rate success tolerance.")
+    parser.add_argument("--nonlinear_goal_steering_tol", type=float, default=0.15,
+                        help="Nonlinear model only: terminal absolute steering-angle tolerance.")
     parser.add_argument("--nonlinear_velocity_scale", type=float, default=1.0,
                         help="Nonlinear model only: reference linear speed used to "
                              "nondimensionalize velocity penalties (> 0).")
     parser.add_argument("--nonlinear_yaw_rate_scale", type=float, default=2.0,
                         help="Nonlinear model only: reference yaw rate used to "
                              "nondimensionalize velocity penalties (> 0).")
+    parser.add_argument("--nonlinear_steering_scale", type=float, default=0.60,
+                        help="Nonlinear model only: steering angle used to normalize settling penalties.")
     parser.add_argument("--nonlinear_physics_substeps", type=int, default=4,
                         help="Nonlinear model only: semi-implicit physics substeps per dt.")
     parser.add_argument("--start_x_min", type=float, default=1.7)
@@ -404,6 +419,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Nonlinear model only: per-step yaw process-noise std.")
     parser.add_argument("--nonlinear_noise_yaw_rate_sigma", type=float, default=8e-4,
                         help="Nonlinear model only: per-step yaw-rate process-noise std.")
+    parser.add_argument("--nonlinear_noise_steering_sigma", type=float, default=2e-4,
+                        help="Nonlinear model only: per-step steering-angle process-noise std.")
     parser.add_argument("--gust_count_min", type=int, default=2)
     parser.add_argument("--gust_count_max", type=int, default=4)
     parser.add_argument("--gust_duration_min", type=int, default=4)
@@ -661,7 +678,7 @@ def nonlinear_robot_enabled(args: argparse.Namespace) -> bool:
 
 def navigation_dimensions(args: argparse.Namespace) -> tuple[int, int]:
     """Return ``(state_dim, control_dim)`` without changing the legacy ABI."""
-    return (6, 3) if nonlinear_robot_enabled(args) else (4, 2)
+    return (7, 2) if nonlinear_robot_enabled(args) else (4, 2)
 
 
 def linear_velocity(state: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
@@ -733,8 +750,10 @@ def validate_robot_body_geometry(args: argparse.Namespace) -> None:
         "nonlinear_goal_yaw_tol": float(args.nonlinear_goal_yaw_tol),
         "nonlinear_goal_speed_tol": float(args.nonlinear_goal_speed_tol),
         "nonlinear_goal_yaw_rate_tol": float(args.nonlinear_goal_yaw_rate_tol),
+        "nonlinear_goal_steering_tol": float(args.nonlinear_goal_steering_tol),
         "nonlinear_velocity_scale": float(args.nonlinear_velocity_scale),
         "nonlinear_yaw_rate_scale": float(args.nonlinear_yaw_rate_scale),
+        "nonlinear_steering_scale": float(args.nonlinear_steering_scale),
     }
     for name, value in positive.items():
         if not np.isfinite(value) or value <= 0.0:
@@ -745,6 +764,7 @@ def validate_robot_body_geometry(args: argparse.Namespace) -> None:
         "nonlinear_yaw_goal_weight": float(args.nonlinear_yaw_goal_weight),
         "nonlinear_noise_yaw_sigma": float(args.nonlinear_noise_yaw_sigma),
         "nonlinear_noise_yaw_rate_sigma": float(args.nonlinear_noise_yaw_rate_sigma),
+        "nonlinear_noise_steering_sigma": float(args.nonlinear_noise_steering_sigma),
     }
     for name, value in nonnegative.items():
         if not np.isfinite(value) or value < 0.0:
@@ -774,13 +794,23 @@ def nonlinear_robot_config_from_args(args: argparse.Namespace) -> NonlinearRobot
         inertia=float(getattr(args, "nonlinear_inertia", 0.012)),
         body_length=body_length,
         body_width=body_width,
+        wheelbase=float(getattr(args, "nonlinear_wheelbase", 0.12)),
+        cg_to_front=float(getattr(args, "nonlinear_cg_to_front", 0.062)),
+        cg_height=float(getattr(args, "nonlinear_cg_height", 0.028)),
+        gravity=float(getattr(args, "nonlinear_gravity", 9.81)),
         cubic_stiffness=float(getattr(args, "nonlinear_cubic_stiffness", 0.10)),
         yaw_cubic_stiffness=float(getattr(args, "nonlinear_yaw_cubic_stiffness", 0.06)),
+        parking_lateral_gain=float(
+            getattr(args, "nonlinear_parking_lateral_gain", 1.35)
+        ),
+        parking_lateral_cubic=float(
+            getattr(args, "nonlinear_parking_lateral_cubic", 0.18)
+        ),
         longitudinal_drag=float(getattr(args, "nonlinear_longitudinal_drag", 0.15)),
-        lateral_drag=float(getattr(args, "nonlinear_lateral_drag", 0.85)),
+        lateral_drag=float(getattr(args, "nonlinear_lateral_drag", 0.18)),
         quadratic_drag=float(getattr(args, "nonlinear_quadratic_drag", 0.28)),
         lateral_quadratic_drag=float(
-            getattr(args, "nonlinear_lateral_quadratic_drag", 0.55)
+            getattr(args, "nonlinear_lateral_quadratic_drag", 0.24)
         ),
         coulomb_friction=float(getattr(args, "nonlinear_coulomb_friction", 0.05)),
         friction_velocity=float(getattr(args, "nonlinear_friction_velocity", 0.12)),
@@ -795,16 +825,27 @@ def nonlinear_robot_config_from_args(args: argparse.Namespace) -> NonlinearRobot
             getattr(args, "nonlinear_angular_friction_velocity", 0.18)
         ),
         actuator_limit=float(getattr(args, "nonlinear_actuator_limit", 2.5)),
-        lateral_force_limit=float(getattr(args, "nonlinear_lateral_force_limit", 1.7)),
-        torque_limit=float(getattr(args, "nonlinear_torque_limit", 0.18)),
         actuator_deadzone=float(getattr(args, "nonlinear_actuator_deadzone", 0.06)),
-        torque_deadzone=float(getattr(args, "nonlinear_torque_deadzone", 0.008)),
+        steering_limit=float(getattr(args, "nonlinear_steering_limit", 0.60)),
+        steering_deadzone=float(getattr(args, "nonlinear_steering_deadzone", 0.012)),
+        steering_time_constant=float(
+            getattr(args, "nonlinear_steering_time_constant", 0.12)
+        ),
+        steering_rate_limit=float(
+            getattr(args, "nonlinear_steering_rate_limit", 2.5)
+        ),
+        cornering_stiffness_front=float(
+            getattr(args, "nonlinear_cornering_stiffness_front", 4.0)
+        ),
+        cornering_stiffness_rear=float(
+            getattr(args, "nonlinear_cornering_stiffness_rear", 4.5)
+        ),
+        tire_friction=float(getattr(args, "nonlinear_tire_friction", 0.90)),
+        slip_speed_floor=float(getattr(args, "nonlinear_slip_speed_floor", 0.12)),
+        low_speed_steering_grip=float(
+            getattr(args, "nonlinear_low_speed_steering_grip", 0.18)
+        ),
         speed_loss=float(getattr(args, "nonlinear_speed_loss", 0.12)),
-        lateral_slip=float(getattr(args, "nonlinear_lateral_slip", 0.35)),
-        traction_velocity=float(getattr(args, "nonlinear_traction_velocity", 0.35)),
-        load_transfer=float(getattr(args, "nonlinear_load_transfer", 0.12)),
-        tire_saturation=float(getattr(args, "nonlinear_tire_saturation", 0.25)),
-        actuator_offset_x=float(getattr(args, "nonlinear_actuator_offset_x", 0.025)),
         physics_substeps=int(getattr(args, "nonlinear_physics_substeps", 4)),
     )
 
@@ -1092,7 +1133,7 @@ def variant_specs(args=None) -> list[tuple[str, str]]:
 CONTEXT_FEATURE_ORDER = [
     "gate_obs", "gate_vel", "gate_ema", "gate_slow_ema", "gate_error",
     "rel_wall_x", "goal_dx", "goal_dy", "approach", "switch_age", "time_to_wall",
-    "vel_x", "vel_y", "heading_sin", "heading_cos", "yaw_rate",
+    "vel_x", "vel_y", "heading_sin", "heading_cos", "yaw_rate", "steering_angle",
 ]
 # key -> (group, human label, experiments-it-applies-to). 'fair' = observation +
 # own state + known geometry; 'privileged' = gate dynamics / schedule ("cheating").
@@ -1113,6 +1154,7 @@ CONTEXT_FEATURE_META = {
     "heading_sin":   ("fair",       "Body heading sin(yaw)",                 ("continuous",)),
     "heading_cos":   ("fair",       "Body heading cos(yaw)",                 ("continuous",)),
     "yaw_rate":      ("fair",       "Body yaw rate",                         ("continuous",)),
+    "steering_angle": ("fair",      "Road-wheel steering angle",             ("continuous",)),
 }
 # Default fair set for the continuous experiment: observation, causal gate-motion
 # history, own state, and known geometry.
@@ -1121,9 +1163,11 @@ FAIR_CONTEXT_DEFAULT = [
     "rel_wall_x", "goal_dx", "goal_dy", "approach",
 ]
 NONLINEAR_CONTEXT_DEFAULT = FAIR_CONTEXT_DEFAULT + [
-    "vel_x", "vel_y", "heading_sin", "heading_cos", "yaw_rate",
+    "vel_x", "vel_y", "heading_sin", "heading_cos", "yaw_rate", "steering_angle",
 ]
-RIGID_BODY_CONTEXT_FEATURES = {"heading_sin", "heading_cos", "yaw_rate"}
+RIGID_BODY_CONTEXT_FEATURES = {
+    "heading_sin", "heading_cos", "yaw_rate", "steering_angle",
+}
 # Legacy --context_mode 'full' stays the ORIGINAL 11 features (frozen so old
 # runs/checkpoints keep their context_dim); opt into velocity via
 # --context_features / the launcher checkboxes instead.
@@ -1175,6 +1219,7 @@ def resolve_context_features(args=None) -> list[str]:
         # state; only the frozen legacy full layout stays at eleven features.
         return list(_FULL_FEATURES) + [
             "vel_x", "vel_y", "heading_sin", "heading_cos", "yaw_rate",
+            "steering_angle",
         ]
     return list(_FULL_FEATURES)
 
@@ -1223,9 +1268,10 @@ def estimate_expected_cross_index(args: argparse.Namespace) -> int:
     _, plant = build_navigation_plants(args)
     start_x = 0.5 * (float(args.start_x_min) + float(args.start_x_max))
     if nonlinear_robot_enabled(args):
-        x = torch.zeros(1, 1, 6, dtype=torch.float32)
+        nx, nu = navigation_dimensions(args)
+        x = torch.zeros(1, 1, nx, dtype=torch.float32)
         x[..., 0] = start_x
-        u = torch.zeros(1, 1, 3, dtype=torch.float32)
+        u = torch.zeros(1, 1, nu, dtype=torch.float32)
     else:
         # Literal legacy construction: preserve dtype, layout, and trajectory.
         x = torch.tensor([[[start_x, 0.0, 0.0, 0.0]]], dtype=torch.float32)
@@ -1444,6 +1490,9 @@ def sample_paired_process_noise(
             seq[:, 5] += rng.normal(
                 scale=float(args.nonlinear_noise_yaw_rate_sigma), size=horizon,
             ).astype(np.float32)
+            seq[:, 6] += rng.normal(
+                scale=float(args.nonlinear_noise_steering_sigma), size=horizon,
+            ).astype(np.float32)
             vx_idx, vy_idx = 3, 4
         else:
             # Keep the original RNG draw count/order and state indices exactly.
@@ -1573,11 +1622,13 @@ def make_x0(
         # Literal original implementation for legacy checkpoint/replay parity.
         vel0 = torch.zeros(batch.start.shape[0], 2, device=device, dtype=batch.start.dtype)
         return torch.cat([batch.start.to(device), vel0], dim=-1).unsqueeze(1)
-    rigid_tail = torch.zeros(
-        batch.start.shape[0], 4, device=device, dtype=batch.start.dtype,
+    state_dim, _ = navigation_dimensions(args)
+    bicycle_tail = torch.zeros(
+        batch.start.shape[0], state_dim - 2,
+        device=device, dtype=batch.start.dtype,
     )
-    # [x, y] + [yaw=0, vx=0, vy=0, yaw_rate=0]
-    return torch.cat([batch.start.to(device), rigid_tail], dim=-1).unsqueeze(1)
+    # [x, y] + [yaw=0, vx=0, vy=0, yaw_rate=0, steering=0]
+    return torch.cat([batch.start.to(device), bicycle_tail], dim=-1).unsqueeze(1)
 
 
 def build_context(
@@ -1599,6 +1650,10 @@ def build_context(
     heading = body_heading(state, args)
     yaw_rate = (
         state[..., 5]
+        if nonlinear_robot_enabled(args) else torch.zeros_like(x_pos)
+    )
+    steering_angle = (
+        state[..., 6]
         if nonlinear_robot_enabled(args) else torch.zeros_like(x_pos)
     )
 
@@ -1641,6 +1696,7 @@ def build_context(
         "heading_sin": torch.sin(heading),
         "heading_cos": torch.cos(heading),
         "yaw_rate": yaw_rate,
+        "steering_angle": steering_angle,
     }
     feats = resolve_context_features(args)
     z_t = float(args.z_scale) * torch.cat([feat_map[k] for k in feats], dim=-1)
@@ -1674,12 +1730,11 @@ class ContextRescale(torch.nn.Module):
 
 
 class WrenchShaping(OperatorBase):
-    """Per-channel command conditioning for the rigid-body wrench.
+    """Per-channel command conditioning for the nonlinear vehicle.
 
     ``u = D y + d ⊙ tanh(D y / d)`` where ``y`` is the wrapped operator's output,
-    ``D = diag(F_limit, F_lat_limit, τ_limit) * wrench_gain`` normalizes the three
-    control channels to their physical ranges (the raw channels differ by ~14x,
-    which an isotropic operator/mixer bound cannot express at init), and the
+    ``D = diag(F_drive_limit, steering_limit) * wrench_gain`` normalizes the two
+    control channels to their physical ranges, and the
     ``d``-term is a smooth dead-zone-inversion feedforward (first-order exact
     against the plant's ``c - d tanh(c/d)`` dead-zone, whose local gain at zero
     command is exactly 0 — without compensation, freshly initialized operators
@@ -1705,7 +1760,7 @@ class WrenchShaping(OperatorBase):
 
 
 def wrench_shaping_enabled(args: argparse.Namespace) -> bool:
-    mode = str(getattr(args, "wrench_shaping", "auto")).strip().lower()
+    mode = str(getattr(args, "wrench_shaping", "off")).strip().lower()
     if mode == "on":
         return True
     if mode == "off":
@@ -1719,13 +1774,11 @@ def maybe_wrap_wrench_shaping(operator: OperatorBase, args: argparse.Namespace) 
     gain = float(getattr(args, "wrench_gain", 1.0))
     scales = [
         gain * float(args.nonlinear_actuator_limit),
-        gain * float(args.nonlinear_lateral_force_limit),
-        gain * float(args.nonlinear_torque_limit),
+        gain * float(args.nonlinear_steering_limit),
     ]
     deadzones = [
         float(args.nonlinear_actuator_deadzone),
-        float(args.nonlinear_actuator_deadzone),
-        float(args.nonlinear_torque_deadzone),
+        float(args.nonlinear_steering_deadzone),
     ]
     return WrenchShaping(operator, scales, deadzones)
 
@@ -1759,12 +1812,12 @@ def apply_saved_config(args: argparse.Namespace, saved_cfg: dict, cli_overrides:
         schema = saved_cfg.get("model_schema")
         state_dim = saved_cfg.get("state_dim")
         control_dim = saved_cfg.get("control_dim")
-        if (schema, state_dim, control_dim) != ("rigid6-v1", 6, 3):
+        if (schema, state_dim, control_dim) != ("bicycle7-v1", 7, 2):
             raise RuntimeError(
-                f"[{log_prefix}] This nonlinear checkpoint predates the rigid-body "
-                "model (required model_schema='rigid6-v1', state_dim=6, "
-                "control_dim=3). Old four-state nonlinear checkpoints are "
-                "intentionally incompatible; retrain with the new nonlinear toggle."
+                f"[{log_prefix}] This nonlinear checkpoint predates the dynamic-bicycle "
+                "model (required model_schema='bicycle7-v1', state_dim=7, "
+                "control_dim=2). Earlier nonlinear checkpoints are intentionally "
+                "incompatible; retrain with a new run_id."
             )
     for k, v in saved_cfg.items():
         if not cli_has_override(cli_overrides, k) and hasattr(args, k):
@@ -1798,9 +1851,9 @@ def config_payload_for_args(args: argparse.Namespace) -> dict:
     payload = dict(vars(args))
     if nonlinear_robot_enabled(args):
         payload.update({
-            "model_schema": "rigid6-v1",
-            "state_dim": 6,
-            "control_dim": 3,
+            "model_schema": "bicycle7-v1",
+            "state_dim": 7,
+            "control_dim": 2,
         })
     return payload
 
@@ -1812,9 +1865,9 @@ def validate_existing_run_model(
     requested_model = "nonlinear" if nonlinear_robot_enabled(args) else "legacy"
     requested_abi = {
         "robot_model": requested_model,
-        "model_schema": "rigid6-v1" if requested_model == "nonlinear" else "legacy4-v1",
-        "state_dim": 6 if requested_model == "nonlinear" else 4,
-        "control_dim": 3 if requested_model == "nonlinear" else 2,
+        "model_schema": "bicycle7-v1" if requested_model == "nonlinear" else "legacy4-v1",
+        "state_dim": 7 if requested_model == "nonlinear" else 4,
+        "control_dim": 2,
     }
 
     def ensure_atomic_abi_marker() -> None:
@@ -1903,11 +1956,12 @@ def validate_existing_run_model(
         saved_cfg.get("model_schema"),
         saved_cfg.get("state_dim"),
         saved_cfg.get("control_dim"),
-    ) != ("rigid6-v1", 6, 3):
+    ) != ("bicycle7-v1", 7, 2):
         raise RuntimeError(
             f"[{log_prefix}] Run {run_dir.name!r} contains an old nonlinear "
-            "checkpoint ABI. The new rigid body requires model_schema='rigid6-v1', "
-            "state_dim=6, control_dim=3; choose a new run_id and retrain."
+            "checkpoint ABI. The dynamic bicycle requires "
+            "model_schema='bicycle7-v1', state_dim=7, control_dim=2; choose a "
+            "new run_id and retrain."
         )
     ensure_atomic_abi_marker()
 
@@ -2259,19 +2313,18 @@ def loss_gate_half_width(args: argparse.Namespace, training: bool) -> float:
     return max(1e-4, effective_gate_half_width(args, training=training))
 
 
-def nonlinear_control_scales(args: argparse.Namespace) -> tuple[float, float, float]:
-    """Physical wrench limits used to nondimensionalize nonlinear controls."""
+def nonlinear_control_scales(args: argparse.Namespace) -> tuple[float, float]:
+    """Drive-force and steering limits used to nondimensionalize controls."""
     return (
         max(float(args.nonlinear_actuator_limit), 1e-6),
-        max(float(args.nonlinear_lateral_force_limit), 1e-6),
-        max(float(args.nonlinear_torque_limit), 1e-6),
+        max(float(args.nonlinear_steering_limit), 1e-6),
     )
 
 
 def normalized_control_tensor(
     args: argparse.Namespace, control: torch.Tensor,
 ) -> torch.Tensor:
-    """Dimensionless nonlinear wrench; literal identity for legacy controls."""
+    """Dimensionless nonlinear commands; literal identity for legacy controls."""
     if not nonlinear_robot_enabled(args):
         return control
     return control / control.new_tensor(nonlinear_control_scales(args))
@@ -2347,10 +2400,12 @@ def _raw_loss_terms(
         if nonlinear_robot_enabled(args):
             velocity_scale = max(float(args.nonlinear_velocity_scale), 1e-6)
             yaw_rate_scale = max(float(args.nonlinear_yaw_rate_scale), 1e-6)
+            steering_scale = max(float(args.nonlinear_steering_scale), 1e-6)
             terminal_vel = (
                 rollout.x_seq[:, -1, 3:5].square().sum(dim=-1)
                 / (velocity_scale ** 2)
                 + rollout.x_seq[:, -1, 5].square() / (yaw_rate_scale ** 2)
+                + rollout.x_seq[:, -1, 6].square() / (steering_scale ** 2)
             )
         else:
             terminal_vel = torch.sum(rollout.x_seq[:, -1, 2:].square(), dim=-1)
@@ -2364,9 +2419,11 @@ def _raw_loss_terms(
     if nonlinear_robot_enabled(args):
         velocity_scale = max(float(args.nonlinear_velocity_scale), 1e-6)
         yaw_rate_scale = max(float(args.nonlinear_yaw_rate_scale), 1e-6)
+        steering_scale = max(float(args.nonlinear_steering_scale), 1e-6)
         vel_sq = (
             rollout.x_seq[..., 3:5].square().sum(dim=-1) / (velocity_scale ** 2)
             + rollout.x_seq[..., 5].square() / (yaw_rate_scale ** 2)
+            + rollout.x_seq[..., 6].square() / (steering_scale ** 2)
         )
         control_cost = (
             normalized_control_tensor(args, rollout.u_seq)
@@ -2517,10 +2574,10 @@ def physical_wall_collision(
         # path, but keeping point semantics here makes it safe for direct use.
         clearance = float(args.gate_half_width) - cross_error.abs()
         return clearance < 0.0, clearance
-    if state_seq.shape[-1] != 6:
+    if state_seq.shape[-1] != 7:
         raise ValueError(
-            "The nonlinear wall-collision check expects state (..., 6) = "
-            "[x, y, yaw, vx, vy, yaw_rate]."
+            "The nonlinear wall-collision check expects state (..., 7) = "
+            "[x, y, yaw, vx, vy, yaw_rate, steering_angle]."
         )
 
     def slice_clearance(
@@ -2647,8 +2704,8 @@ def physical_corridor_collision(
     """Return oriented full-footprint side-wall collision and clearance."""
     y_pos = state_seq[..., 1]
     if nonlinear_robot_enabled(args):
-        if state_seq.shape[-1] != 6:
-            raise ValueError("The nonlinear corridor check expects six-state poses.")
+        if state_seq.shape[-1] != 7:
+            raise ValueError("The nonlinear corridor check expects seven-state poses.")
         vertical_extent = body_vertical_half_extent(args, state_seq[..., 2])
         corridor_clearance = (
             float(args.corridor_limit) - y_pos.abs() - vertical_extent
@@ -2761,14 +2818,19 @@ def evaluate_variant(
             metric_state[:, -1, 3:5], dim=-1,
         )
         terminal_yaw_rate = metric_state[:, -1, 5].abs()
+        terminal_steering = metric_state[:, -1, 6].abs()
         position_success = terminal_dist < float(args.goal_tol)
         yaw_success = terminal_yaw_error < float(args.nonlinear_goal_yaw_tol)
         speed_success = terminal_speed < float(args.nonlinear_goal_speed_tol)
         yaw_rate_success = (
             terminal_yaw_rate < float(args.nonlinear_goal_yaw_rate_tol)
         )
+        steering_success = (
+            terminal_steering < float(args.nonlinear_goal_steering_tol)
+        )
         goal_success = (
             position_success & yaw_success & speed_success & yaw_rate_success
+            & steering_success
         )
         success = (~collided) & goal_success
 
@@ -2782,6 +2844,7 @@ def evaluate_variant(
             "yaw_success_rate": yaw_success.float().mean(),
             "speed_success_rate": speed_success.float().mean(),
             "yaw_rate_success_rate": yaw_rate_success.float().mean(),
+            "steering_success_rate": steering_success.float().mean(),
             "collision_rate": collided.float().mean(),
             "wall_collision_rate": wall_collided.float().mean(),
             "corridor_collision_rate": corridor_collided.float().mean(),
@@ -2792,6 +2855,7 @@ def evaluate_variant(
             "avg_abs_terminal_yaw_error": terminal_yaw_error.mean(),
             "avg_terminal_speed": terminal_speed.mean(),
             "avg_abs_terminal_yaw_rate": terminal_yaw_rate.mean(),
+            "avg_abs_terminal_steering": terminal_steering.mean(),
             "avg_control_energy": torch.sum(
                 normalized_control_tensor(args, rollout.u_seq.float()).square(), dim=-1,
             ).mean(),
@@ -3703,7 +3767,7 @@ def _animate_one_sample(
         xy = state[:, :2]
         trajs[mode] = np.vstack([start_np, xy])
         if finite_body:
-            start_state = np.zeros(6, dtype=state.dtype)
+            start_state = np.zeros(navigation_dimensions(args)[0], dtype=state.dtype)
             start_state[:2] = start_np
             state_trajs[mode] = np.vstack([start_state, state])
 
@@ -3727,11 +3791,13 @@ def _animate_one_sample(
             yaw_error = abs(float(np.arctan2(np.sin(terminal_yaw), np.cos(terminal_yaw))))
             terminal_speed = float(np.linalg.norm(state_trajs[mode][-1, 3:5]))
             terminal_yaw_rate = abs(float(state_trajs[mode][-1, 5]))
+            terminal_steering = abs(float(state_trajs[mode][-1, 6]))
             goal_ok = (
                 goal_ok
                 and yaw_error < float(args.nonlinear_goal_yaw_tol)
                 and terminal_speed < float(args.nonlinear_goal_speed_tol)
                 and terminal_yaw_rate < float(args.nonlinear_goal_yaw_rate_tol)
+                and terminal_steering < float(args.nonlinear_goal_steering_tol)
             )
         corridor_collided = roll.get("corridor_collided")
         corridor_ok = (
@@ -4516,11 +4582,15 @@ def _storyboard_episode_outcome(
     terminal_yaw_rate = abs(float(
         rollout["x_seq"][episode_idx, -1, 5].item()
     ))
+    terminal_steering = abs(float(
+        rollout["x_seq"][episode_idx, -1, 6].item()
+    ))
     goal_reached = (
         terminal_distance <= float(args.goal_tol)
         and terminal_yaw_error <= float(args.nonlinear_goal_yaw_tol)
         and terminal_speed <= float(args.nonlinear_goal_speed_tol)
         and terminal_yaw_rate <= float(args.nonlinear_goal_yaw_rate_tol)
+        and terminal_steering <= float(args.nonlinear_goal_steering_tol)
     )
     min_gate_clearance = rollout.get("min_gate_clearance")
     gate_clearance = (
@@ -4536,6 +4606,7 @@ def _storyboard_episode_outcome(
         "terminal_yaw_error": terminal_yaw_error,
         "terminal_speed": terminal_speed,
         "terminal_yaw_rate": terminal_yaw_rate,
+        "terminal_steering": terminal_steering,
         "wall_clear": wall_clear,
         "corridor_clear": corridor_clear,
         "body_clear": wall_clear and corridor_clear,
@@ -4946,7 +5017,9 @@ def plot_architecture_comparison_storyboard(
             state_sequence[:, :2],
         ])
         if nonlinear_robot_enabled(args):
-            start_state = np.zeros(6, dtype=state_sequence.dtype)
+            start_state = np.zeros(
+                navigation_dimensions(args)[0], dtype=state_sequence.dtype,
+            )
             start_state[:2] = start
             state_trajectory = np.vstack([start_state, state_sequence])
         outcome = outcomes[mode]
@@ -5399,7 +5472,7 @@ def plot_trajectory_storyboard(
         xy = state[:, :2]
         trajs[mode] = np.vstack([start_np[:2], xy])
         if nonlinear_robot_enabled(args):
-            start_state = np.zeros(6, dtype=state.dtype)
+            start_state = np.zeros(navigation_dimensions(args)[0], dtype=state.dtype)
             start_state[:2] = start_np[:2]
             state_trajs[mode] = np.vstack([start_state, state])
 
@@ -5623,7 +5696,7 @@ def plot_trajectory_storyboard_compact(
         xy = state[:, :2]
         trajs[mode] = np.vstack([start_np[:2], xy])
         if nonlinear_robot_enabled(args):
-            start_state = np.zeros(6, dtype=state.dtype)
+            start_state = np.zeros(navigation_dimensions(args)[0], dtype=state.dtype)
             start_state[:2] = start_np[:2]
             state_trajs[mode] = np.vstack([start_state, state])
 
