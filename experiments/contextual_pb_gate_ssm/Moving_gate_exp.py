@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -3966,26 +3967,47 @@ def _animate_one_sample(
     )
 
     # ── time-series panel ─────────────────────────────────────────────────────
-    t_ax = np.arange(horizon)
-    ax_time.step(t_ax, gate_traj, where="post",
-                 color="#94a3b8", lw=1.8, alpha=0.7, label="Gate $g_t$")
-    ax_time.fill_between(t_ax, gate_traj - half_w, gate_traj + half_w,
-                         step="post", color="#94a3b8", alpha=0.12)
-    ax_time.axhline(0, color="#475569", lw=0.8, alpha=0.5)
+    # Plot this episode's actual command at the current animation time. The
+    # nonlinear channels have different physical units, so follow the static
+    # control plot and normalize them by their actuator limits before taking
+    # the Euclidean norm.
+    dt = float(args.dt)
+    t_ax = np.arange(horizon, dtype=float) * dt
+    control_magnitudes: dict[str, np.ndarray] = {}
+    for mode, _ in variant_order:
+        u_seq = test_metrics[mode]["rollout"]["u_seq"][sample_idx].numpy()
+        if finite_body:
+            u_seq = u_seq / np.asarray(
+                nonlinear_control_scales(args), dtype=u_seq.dtype,
+            )
+        control_magnitudes[mode] = np.linalg.norm(u_seq, axis=-1)
 
-    y_lines: dict[str, tuple] = {}
+    finite_peaks = [
+        float(np.nanmax(u_mag))
+        for u_mag in control_magnitudes.values()
+        if u_mag.size and np.any(np.isfinite(u_mag))
+    ]
+    peak = max(finite_peaks, default=0.0)
+    control_ylim = 1.0 if peak <= 1e-9 else 1.08 * peak
+
+    control_lines: dict[str, tuple] = {}
     for mode, lbl in variant_order:
-        y_seq = trajs[mode][1:, 1]
         lw = 2.4 if mode in ("context", "mad_context", "rpb_context", "mp_only_context", "contextual_ssm") else 1.6
         ln, = ax_time.plot([], [], color=colors[mode], lw=lw, label=lbl)
-        y_lines[mode] = (ln, y_seq)
+        marker, = ax_time.plot(
+            [], [], "o", color=colors[mode], ms=5.5,
+            markeredgecolor="#f8fafc", markeredgewidth=0.7, zorder=5,
+        )
+        control_lines[mode] = (ln, marker, control_magnitudes[mode])
 
-    vline = ax_time.axvline(0, color="#f8fafc", lw=1.2, alpha=0.7, linestyle="--")
-    ax_time.set_xlim(0, horizon - 1)
-    ax_time.set_ylim(-corr - 0.1, corr + 0.1)
-    ax_time.set_xlabel("time step")
-    ax_time.set_ylabel("y / gate center")
-    ax_time.set_title("Lateral position over time", fontsize=11, fontweight="bold")
+    vline = ax_time.axvline(0.0, color="#f8fafc", lw=1.2, alpha=0.7, linestyle="--")
+    ax_time.set_xlim(0.0, max(dt, float(t_ax[-1])))
+    ax_time.set_ylim(0.0, control_ylim)
+    ax_time.set_xlabel("time [s]")
+    ax_time.set_ylabel(
+        r"$\|u_t/u_{\max}\|_2$" if finite_body else r"$\|u_t\|_2$"
+    )
+    ax_time.set_title("Real-time control magnitude", fontsize=11, fontweight="bold")
     ax_time.legend(loc="best", fontsize=8, facecolor="#1e293b",
                    edgecolor="#475569", labelcolor="#e2e8f0", framealpha=0.85)
 
@@ -4009,14 +4031,18 @@ def _animate_one_sample(
             else:
                 body.set_data([xy[-1, 0]], [xy[-1, 1]])
 
-        step_text.set_text(f"step {frame:03d}/{horizon - 1:03d}")
-        vline.set_xdata([frame, frame])
-        for mode, (ln, y_seq) in y_lines.items():
-            ln.set_data(t_ax[:frame + 1], y_seq[:frame + 1])
+        step_text.set_text(
+            f"step {frame:03d}/{horizon - 1:03d}   t={t_ax[frame]:.2f} s"
+        )
+        vline.set_xdata([t_ax[frame], t_ax[frame]])
+        for mode, (ln, marker, u_mag) in control_lines.items():
+            ln.set_data(t_ax[:frame + 1], u_mag[:frame + 1])
+            marker.set_data([t_ax[frame]], [u_mag[frame]])
 
         return (rect_upper, rect_lower, gate_patch, step_text, vline,
                 *trail_lines.values(), *bodies.values(),
-                *[ln for ln, _ in y_lines.values()])
+                *[artist for ln, marker, _ in control_lines.values()
+                  for artist in (ln, marker)])
 
     frames      = list(range(0, horizon, 2))
     interval_ms = 60
@@ -4026,8 +4052,19 @@ def _animate_one_sample(
     anim = FuncAnimation(fig, _update, frames=frames,
                          interval=interval_ms, blit=False)
 
+    # Render on the local filesystem first. Writing every animation frame
+    # directly into a cloud-synchronized run directory can time out and leave a
+    # zero-byte GIF. Publish the completed file with a single staged copy.
     gif_path = run_dir / f"rollout_animation_{file_tag}.gif"
-    anim.save(str(gif_path), writer=PillowWriter(fps=1000 // interval_ms))
+    with tempfile.TemporaryDirectory(prefix="gate_rollout_animation_") as tmp:
+        local_gif = Path(tmp) / gif_path.name
+        anim.save(str(local_gif), writer=PillowWriter(fps=1000 // interval_ms))
+        staged_gif = gif_path.with_name(f".{gif_path.name}.tmp{os.getpid()}")
+        try:
+            shutil.copyfile(local_gif, staged_gif)
+            os.replace(staged_gif, gif_path)
+        finally:
+            staged_gif.unlink(missing_ok=True)
     print(f"  Animation saved -> {gif_path}")
 
     try:
@@ -4070,17 +4107,22 @@ def animate_rollout(
     print(f"\nRendering {len(idxs)} rollout animations…")
     for rank, sample_idx in enumerate(idxs):
         print(f"  [{rank + 1}/{len(idxs)}] sample #{sample_idx}")
-        _animate_one_sample(
-            plt=plt,
-            args=args,
-            run_dir=run_dir,
-            variant_order=variant_order,
-            test_batch=test_batch,
-            test_metrics=test_metrics,
-            sample_idx=sample_idx,
-            file_tag=f"{rank + 1:02d}_idx{sample_idx}",
-            show_plots=show_plots,
-        )
+        try:
+            _animate_one_sample(
+                plt=plt,
+                args=args,
+                run_dir=run_dir,
+                variant_order=variant_order,
+                test_batch=test_batch,
+                test_metrics=test_metrics,
+                sample_idx=sample_idx,
+                file_tag=f"{rank + 1:02d}_idx{sample_idx}",
+                show_plots=show_plots,
+            )
+        except Exception as exc:
+            # A transient publish failure for one sample must not suppress all
+            # of the remaining animations.
+            print(f"  Warning: sample #{sample_idx} animation failed ({exc}); continuing.")
 
 
 def animate_adversarial_sample(
