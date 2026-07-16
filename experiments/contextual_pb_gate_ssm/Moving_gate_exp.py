@@ -33,7 +33,7 @@ from nav_plants import (
     NonlinearRobotNominal,
     NonlinearRobotTrue,
 )
-from pb_core import PBController, as_bt, rollout_pb, validate_component_compatibility, WIntegralAugmenter
+from pb_core import OperatorBase, PBController, as_bt, rollout_pb, validate_component_compatibility, WIntegralAugmenter
 from pb_core.factories import build_factorized_controller
 from ssm_operators import MpDeepSSM, MpContextualSSM
 
@@ -285,6 +285,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Nonlinear model only: smooth low-command actuator dead-zone.")
     parser.add_argument("--nonlinear_torque_deadzone", type=float, default=0.008,
                         help="Nonlinear model only: smooth yaw-torque dead-zone.")
+    parser.add_argument("--wrench_shaping", type=str, default="auto",
+                        choices=["auto", "on", "off"],
+                        help="Nonlinear model only: wrap every learned operator's output with "
+                             "per-channel wrench normalization diag(F,F_lat,tau limits)*gain "
+                             "plus a smooth dead-zone-inversion feedforward. Static and "
+                             "Lipschitz, so L_p stability is untouched. 'auto' = on for the "
+                             "rigid body, off for legacy. Old rigid6 checkpoints (configs "
+                             "without this key) replay with shaping off automatically.")
+    parser.add_argument("--wrench_gain", type=float, default=1.0,
+                        help="Wrench-shaping only: scale factor on the per-channel limits.")
     parser.add_argument("--nonlinear_speed_loss", type=float, default=0.12,
                         help="Nonlinear model only: actuator-authority loss proportional "
                              "to squared speed.")
@@ -1663,6 +1673,63 @@ class ContextRescale(torch.nn.Module):
         return z * self.factor
 
 
+class WrenchShaping(OperatorBase):
+    """Per-channel command conditioning for the rigid-body wrench.
+
+    ``u = D y + d ⊙ tanh(D y / d)`` where ``y`` is the wrapped operator's output,
+    ``D = diag(F_limit, F_lat_limit, τ_limit) * wrench_gain`` normalizes the three
+    control channels to their physical ranges (the raw channels differ by ~14x,
+    which an isotropic operator/mixer bound cannot express at init), and the
+    ``d``-term is a smooth dead-zone-inversion feedforward (first-order exact
+    against the plant's ``c - d tanh(c/d)`` dead-zone, whose local gain at zero
+    command is exactly 0 — without compensation, freshly initialized operators
+    emit |u| ~ 3e-3 against a 6e-2 dead-zone and train gradient-dead).
+
+    Static, memoryless, globally Lipschitz, and zero at zero, so composing it
+    with an L_p-stable operator preserves the closed-loop L_p guarantee.
+    """
+
+    def __init__(self, base: OperatorBase, scales: list[float], deadzones: list[float]):
+        super().__init__()
+        self.base = base
+        self.register_buffer("scale", torch.tensor(scales, dtype=torch.float32))
+        self.register_buffer("dz", torch.tensor(deadzones, dtype=torch.float32))
+
+    def reset(self) -> None:
+        self.base.reset()
+
+    def forward(self, w: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
+        y = self.base(w, z)
+        u = y * self.scale
+        return u + self.dz * torch.tanh(u / self.dz.clamp_min(1e-9))
+
+
+def wrench_shaping_enabled(args: argparse.Namespace) -> bool:
+    mode = str(getattr(args, "wrench_shaping", "auto")).strip().lower()
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    return nonlinear_robot_enabled(args)  # auto
+
+
+def maybe_wrap_wrench_shaping(operator: OperatorBase, args: argparse.Namespace) -> OperatorBase:
+    if not wrench_shaping_enabled(args) or not nonlinear_robot_enabled(args):
+        return operator
+    gain = float(getattr(args, "wrench_gain", 1.0))
+    scales = [
+        gain * float(args.nonlinear_actuator_limit),
+        gain * float(args.nonlinear_lateral_force_limit),
+        gain * float(args.nonlinear_torque_limit),
+    ]
+    deadzones = [
+        float(args.nonlinear_actuator_deadzone),
+        float(args.nonlinear_actuator_deadzone),
+        float(args.nonlinear_torque_deadzone),
+    ]
+    return WrenchShaping(operator, scales, deadzones)
+
+
 def cli_has_override(cli_overrides: set[str], dest: str) -> bool:
     flag = f"--{dest}"
     negative_flags = {f"--no_{dest}"}
@@ -1713,6 +1780,17 @@ def apply_saved_config(args: argparse.Namespace, saved_cfg: dict, cli_overrides:
         args.ctx_z_scale = float(args.z_scale)
         print(f"[{log_prefix}] Legacy config has no ctx_z_scale; using "
               f"ctx_z_scale=z_scale ({float(args.ctx_z_scale):g}).")
+    if (
+        "wrench_shaping" not in saved_cfg
+        and not cli_has_override(cli_overrides, "wrench_shaping")
+        and hasattr(args, "wrench_shaping")
+    ):
+        # Checkpoints trained before the wrench-shaping stage have unwrapped
+        # operator state dicts; replay them without the shaping shell.
+        args.wrench_shaping = "off"
+        if nonlinear_robot_enabled(args):
+            print(f"[{log_prefix}] Config predates wrench_shaping; replaying with "
+                  "shaping off to match the saved operator.")
 
 
 def config_payload_for_args(args: argparse.Namespace) -> dict:
@@ -1903,6 +1981,7 @@ def build_contextual_controller(
         bcd_nonlinearity=args.ssm_bcd_nonlinearity,
         gamma=gamma,
     ).to(device)
+    operator = maybe_wrap_wrench_shaping(operator, args).to(device)
 
     controller = PBController(
         plant=nominal_plant,
@@ -2043,6 +2122,7 @@ def build_controller(
         mp_only=mp_only,
         w_augmenter=w_augmenter,
     ).to(device)
+    controller.operator = maybe_wrap_wrench_shaping(controller.operator, args).to(device)
 
     x_probe = torch.zeros(4, 1, nx, device=device)
     z_probe = torch.zeros(4, 1, z_dim, device=device)
@@ -2845,6 +2925,8 @@ def train_controller(
     #   MpContextualSSM      -> SSM core is operator.core.core (DeepSSM inside
     #                           ContextualDeepSSM); mixer/gate heads get half lr.
     op = controller.operator
+    while isinstance(op, WrenchShaping):  # shaping is a parameter-free shell
+        op = op.base
     if hasattr(op, "mp") and getattr(op, "mp") is not None:
         ssm_core = op.mp
     elif hasattr(op, "core"):
@@ -3743,8 +3825,19 @@ def _animate_one_sample(
         path_effects=[pe.withStroke(linewidth=2, foreground="#0f172a")],
     )
 
-    ax_arena.legend(loc="best", fontsize=8.5, facecolor="#1e293b",
-                    edgecolor="#475569", labelcolor="#e2e8f0", framealpha=0.85)
+    if finite_body:
+        # Equal data aspect makes the rigid-body arena intentionally narrow.
+        # Use the surrounding horizontal space for the longer body-contact
+        # outcomes instead of covering the step counter and moving bodies.
+        ax_arena.legend(
+            loc="upper left", bbox_to_anchor=(1.03, 1.0), borderaxespad=0.0,
+            fontsize=8.5, facecolor="#1e293b", edgecolor="#475569",
+            labelcolor="#e2e8f0", framealpha=0.85,
+        )
+    else:
+        # Frozen legacy placement.
+        ax_arena.legend(loc="best", fontsize=8.5, facecolor="#1e293b",
+                        edgecolor="#475569", labelcolor="#e2e8f0", framealpha=0.85)
     ax_arena.set_title(
         f"Gate-Crossing Navigation — Sample #{sample_idx}",
         fontsize=13, fontweight="bold", pad=8,
@@ -3805,8 +3898,11 @@ def _animate_one_sample(
 
     frames      = list(range(0, horizon, 2))
     interval_ms = 60
+    # Pillow's GIF writer may encode blitted frames with transparent/black
+    # untouched regions, producing visible background flashes in some viewers.
+    # Full-frame rendering is slower but stable and portable.
     anim = FuncAnimation(fig, _update, frames=frames,
-                         interval=interval_ms, blit=True)
+                         interval=interval_ms, blit=False)
 
     gif_path = run_dir / f"rollout_animation_{file_tag}.gif"
     anim.save(str(gif_path), writer=PillowWriter(fps=1000 // interval_ms))
@@ -4704,12 +4800,26 @@ def plot_architecture_comparison_storyboard(
     top_margin_inches = 3.0 + 0.55 * (legend_rows - 1)
     grid_top = 1.0 - top_margin_inches / fig_height
     grid_bottom = 0.85 / fig_height
-    fig = plt.figure(figsize=(22.5, fig_height))
-    gs = GridSpec(
-        len(selected), 4, figure=fig,
-        height_ratios=[1.0] * len(selected),
-        hspace=0.56, wspace=0.14,
-    )
+    finite_body = nonlinear_robot_enabled(args)
+    # Equal data aspect is essential for an honest rigid-body footprint, but it
+    # makes each arena panel narrower than the historical point-model axes. Give
+    # nonlinear status badges their own column so longer body-contact labels do
+    # not collide with the first arena's y-axis label. The legacy layout remains
+    # byte-for-byte on its original four-column path.
+    fig = plt.figure(figsize=((24.5 if finite_body else 22.5), fig_height))
+    if finite_body:
+        gs = GridSpec(
+            len(selected), 5, figure=fig,
+            width_ratios=[1.35, 2.6, 2.6, 2.6, 2.6],
+            height_ratios=[1.0] * len(selected),
+            hspace=0.56, wspace=0.18,
+        )
+    else:
+        gs = GridSpec(
+            len(selected), 4, figure=fig,
+            height_ratios=[1.0] * len(selected),
+            hspace=0.56, wspace=0.14,
+        )
     legend_handles = []
     for mode, label in selected:
         legend_handles.append(Line2D(
@@ -4727,9 +4837,10 @@ def plot_architecture_comparison_storyboard(
 
     def draw_status_badge(
         ax, *, y: float, icon: str, label: str, color: str,
+        standalone: bool = False,
     ) -> None:
         """Draw a high-contrast vector outcome icon and label."""
-        x = -0.88
+        x = 0.15 if standalone else -0.88
         ax.scatter(
             [x], [y], transform=ax.transAxes, clip_on=False,
             marker="o", s=420, facecolor=color, edgecolor="white",
@@ -4765,16 +4876,23 @@ def plot_architecture_comparison_storyboard(
             )
         ax.text(
             x + 0.085, y, label, transform=ax.transAxes,
-            ha="left", va="center", fontsize=15.5, color=color,
+            ha="left", va="center",
+            fontsize=13.5 if standalone else 15.5, color=color,
             fontweight="bold", clip_on=False, zorder=12,
         )
 
     def draw_controller_status(
         ax, *, label: str, mode_color: str, crashed: bool, goal_reached: bool,
+        standalone: bool = False,
     ) -> None:
         """Group controller name and the two independent rollout outcomes."""
+        panel_bounds = (
+            (0.02, 0.18, 0.96, 0.62)
+            if standalone else
+            (-1.00, 0.18, 0.58, 0.62)
+        )
         panel = FancyBboxPatch(
-            (-1.00, 0.18), 0.58, 0.62,
+            panel_bounds[:2], panel_bounds[2], panel_bounds[3],
             boxstyle="round,pad=0.025,rounding_size=0.025",
             transform=ax.transAxes, clip_on=False,
             facecolor="#f8fafc", edgecolor=mode_color,
@@ -4782,9 +4900,14 @@ def plot_architecture_comparison_storyboard(
         )
         ax.add_patch(panel)
         ax.text(
-            -0.47, 0.69, label, transform=ax.transAxes,
-            ha="right", va="center",
-            fontsize=max(13.5, 19.0 - 0.30 * max(0, len(label) - 16)),
+            0.50 if standalone else -0.47, 0.69, label,
+            transform=ax.transAxes,
+            ha="center" if standalone else "right", va="center",
+            fontsize=(
+                max(12.5, 16.5 - 0.28 * max(0, len(label) - 16))
+                if standalone else
+                max(13.5, 19.0 - 0.30 * max(0, len(label) - 16))
+            ),
             color=mode_color,
             fontweight="bold", clip_on=False, zorder=12,
         )
@@ -4797,12 +4920,14 @@ def plot_architecture_comparison_storyboard(
                 ("Wall crash" if crashed else "Gate passed")
             ),
             color="#dc2626" if crashed else "#16a34a",
+            standalone=standalone,
         )
         draw_status_badge(
             ax, y=0.31,
             icon="target" if goal_reached else "cross",
             label="Goal reached" if goal_reached else "Goal missed",
             color="#0f766e" if goal_reached else "#d97706",
+            standalone=standalone,
         )
 
     def row_snapshot_steps(cross_idx: int) -> list[int]:
@@ -4829,8 +4954,17 @@ def plot_architecture_comparison_storyboard(
         crashed = not bool(outcome.get("body_clear", outcome["wall_clear"]))
         goal_reached = bool(outcome["goal_reached"])
 
+        if finite_body:
+            status_ax = fig.add_subplot(gs[row, 0])
+            status_ax.set_axis_off()
+            draw_controller_status(
+                status_ax, label=label, mode_color=colors[mode],
+                crashed=crashed, goal_reached=goal_reached,
+                standalone=True,
+            )
+
         for col, (phase, t_snap) in enumerate(zip(phase_names, row_snapshot_steps(int(outcome["cross_idx"])))):
-            ax = fig.add_subplot(gs[row, col])
+            ax = fig.add_subplot(gs[row, col + (1 if finite_body else 0)])
             if row == 0:
                 first_row_axes.append(ax)
             gate_center = float(gate[t_snap])
@@ -4884,10 +5018,11 @@ def plot_architecture_comparison_storyboard(
             ax.set_xlabel("Longitudinal position $x$", fontsize=17)
             if col == 0:
                 ax.set_ylabel("Lateral position $y$", fontsize=17, labelpad=11)
-                draw_controller_status(
-                    ax, label=label, mode_color=colors[mode],
-                    crashed=crashed, goal_reached=goal_reached,
-                )
+                if not finite_body:
+                    draw_controller_status(
+                        ax, label=label, mode_color=colors[mode],
+                        crashed=crashed, goal_reached=goal_reached,
+                    )
             else:
                 ax.set_yticklabels([])
             ax.tick_params(labelsize=14)
@@ -4899,7 +5034,11 @@ def plot_architecture_comparison_storyboard(
     fig.text(0.5, 1.0 - 0.55 / fig_height,
              f"Episode #{chosen}. Same gate realization and initial condition for every row.",
              ha="center", va="top", fontsize=16, color="#334155")
-    fig.subplots_adjust(left=0.19, right=0.988, top=grid_top, bottom=grid_bottom)
+    fig.subplots_adjust(
+        left=0.025 if finite_body else 0.19,
+        right=0.992 if finite_body else 0.988,
+        top=grid_top, bottom=grid_bottom,
+    )
     for phase, ax in zip(phase_names, first_row_axes):
         bounds = ax.get_position()
         header_y = bounds.y1 + 0.68 / fig_height
