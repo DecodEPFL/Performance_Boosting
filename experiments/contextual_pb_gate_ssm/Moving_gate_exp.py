@@ -6667,7 +6667,7 @@ def run_plot_only(args: argparse.Namespace, device: torch.device) -> None:
             print(f"[plot_only] Warning: {pt_path.name} not found — using random weights for {mode}.")
         controllers[mode] = controller
         plants[mode] = plant_true
-        histories[mode] = []
+        histories[mode] = load_saved_history(run_dir, mode)
         val_metrics[mode] = evaluate_variant(
             args=args, batch=val_batch, device=device, mode=mode,
             controller=controller, plant_true=plant_true,
